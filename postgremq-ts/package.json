@@ -1,0 +1,16 @@
+{
+  "name": "postgremq",
+  "version": "0.1.0",
+  "description": "",
+  "main": "index.js",
+  "keywords": [],
+  "author": "Slava Koltovich",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/slavakl/postgremq.git"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}
