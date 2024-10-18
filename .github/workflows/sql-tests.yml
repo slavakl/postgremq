@@ -1,0 +1,43 @@
+name: SQL Tests
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'mq/**'
+      - '.github/workflows/sql-tests.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'mq/**'
+      - '.github/workflows/sql-tests.yml'
+
+jobs:
+  test:
+    name: Test SQL Implementation
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'pip'
+        cache-dependency-path: mq/tests/requirements.txt
+
+    - name: Install dependencies
+      working-directory: ./mq
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r tests/requirements.txt
+
+    - name: Run tests
+      working-directory: ./mq
+      run: pytest tests/tests.py -v --tb=short

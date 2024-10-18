@@ -1,25 +1,108 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
 *.so
-*.dylib
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Test binary, built with `go test -c`
+# Virtual Environment
+venv/
+ENV/
+env/
+.env
+.venv
+env.bak/
+venv.bak/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.project
+.pydevproject
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Distribution / packaging
+.Python
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Logs
+*.log
+logs/
+log/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# node js
+node_modules/
+
+# Test credentials and local settings
+.env*
+!.env.example
+.env.test.local
+.env.local
+postgremq-go/.env.test
+postgremq-ts/.env.test
+**/test-credentials.*
+**/credentials.*
+**/*credentials*
+**/*secret*
+**/*password*
+
+# Go test artifacts
+postgremq-go/coverage.out
 *.test
-
-# Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# Claude Code and AI assistant files
+CLAUDE.md
+.claude/
+*.claude
 
-# Go workspace file
-go.work
-go.work.sum
+# TypeScript build and coverage
+postgremq-ts/dist/
+postgremq-ts/coverage/
 
-# env file
-.env
+# Temporary files
+*.tmp
+*.temp
+.scratch/

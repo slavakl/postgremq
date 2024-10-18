@@ -1,0 +1,39 @@
+{
+  "name": "postgremq",
+  "version": "0.1.0",
+  "description": "TypeScript client for PostgreMQ message queue system",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "keywords": [
+    "postgres",
+    "message-queue",
+    "mq",
+    "postgresql",
+    "queue"
+  ],
+  "author": "Slava Koltovich",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/slavakl/postgremq.git"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.10.11",
+    "typescript": "^5.6.3"
+  },
+  "dependencies": {
+    "@datastructures-js/priority-queue": "^6.3.2",
+    "pg": "^8.11.3"
+  },
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "prebuild": "npm run clean",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prepare": "npm run build"
+  },
+  "bugs": {
+    "url": "https://github.com/slavakl/postgremq/issues"
+  },
+  "homepage": "https://github.com/slavakl/postgremq#readme"
+}
