@@ -5,6 +5,18 @@
  * Functions include message consumption, acknowledgment, negative acknowledgment (nack),
  * lock extension, and moving messages to a dead letter queue (DLQ).
  *
+ * Table Relationships and Cascade Behavior:
+ * - topics: The root table containing topic names
+ * - queues: References topics.name with ON DELETE CASCADE
+ * - messages: References topics.name with ON DELETE CASCADE
+ * - queue_messages: References both queues.name and messages.id with ON DELETE CASCADE
+ * - dead_letter_queue: References both queues.name and messages.id with ON DELETE CASCADE
+ *
+ * This cascade behavior ensures that:
+ * 1. When a topic is deleted, all related queues, messages, and queue entries are automatically removed
+ * 2. When a message is deleted (e.g., via clean_up_topic), all related queue entries are automatically removed
+ * 3. When a queue is deleted, all its message entries are automatically removed
+ *
  * Functions:
  *   - consume_message: Retrieve and lock pending messages, incrementing delivery attempts.
  *   - ack_message: Acknowledge a message as completed.
@@ -30,28 +42,29 @@ CREATE TABLE topics (
 CREATE TABLE queues (
   name VARCHAR(255) PRIMARY KEY,
   topic_name VARCHAR(255) REFERENCES topics(name) ON DELETE CASCADE,
-  max_delivery_attempts INT DEFAULT 0,  -- 0 means unlimited attempts
-  durable BOOLEAN DEFAULT true,
-  keep_alive_until TIMESTAMPTZ  -- For non-durable queues; e.g., NOW() + interval '10 minutes'
+  max_delivery_attempts INT NOT NULL DEFAULT 0,
+  exclusive BOOLEAN NOT NULL DEFAULT false,  -- Changed from durable
+  keep_alive_until TIMESTAMPTZ
 );
 
 -- Messages table: payload stored as JSONB.
 CREATE TABLE messages (
   id SERIAL PRIMARY KEY,
-  topic_name VARCHAR(255) REFERENCES topics(name),
+  topic_name VARCHAR(255) REFERENCES topics(name) ON DELETE CASCADE,
   payload JSONB NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  published_at TIMESTAMPTZ DEFAULT NOW(),
+  deliver_after TIMESTAMPTZ DEFAULT NOW()  -- New column with default NOW()
 );
 
 -- Queue Messages table.
 -- Composite primary key: (queue_name, message_id).
 CREATE TABLE queue_messages (
-  queue_name VARCHAR(255) NOT NULL,
-  message_id INT NOT NULL,  -- References messages(id)
+  queue_name VARCHAR(255) REFERENCES queues(name) ON DELETE CASCADE,
+  message_id INT REFERENCES messages(id) ON DELETE CASCADE,
   status VARCHAR(16) DEFAULT 'pending',  -- Allowed: 'pending', 'processing', 'completed'
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  locked_until TIMESTAMPTZ,
-  delivery_attempts INT DEFAULT 0,  -- Changed from retry_count to delivery_attempts (default 0)
+  published_at TIMESTAMPTZ DEFAULT NOW(),
+  vt TIMESTAMPTZ NOT NULL DEFAULT NOW(),  -- Renamed from locked_until
+  delivery_attempts INT DEFAULT 0,
   consumer_token VARCHAR(64),
   processed_at TIMESTAMPTZ,
   PRIMARY KEY (queue_name, message_id)
@@ -60,33 +73,34 @@ CREATE TABLE queue_messages (
 -- Dead Letter Queue table.
 -- Composite primary key: (queue_name, message_id).
 CREATE TABLE dead_letter_queue (
-  queue_name VARCHAR(255) NOT NULL,
-  message_id INT NOT NULL,
+  queue_name VARCHAR(255) REFERENCES queues(name) ON DELETE CASCADE,
+  message_id INT REFERENCES messages(id) ON DELETE CASCADE,
   retry_count INT,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
+  published_at TIMESTAMPTZ DEFAULT NOW(),
   PRIMARY KEY (queue_name, message_id)
 );
 
----------------------------
--- Trigger for Message Distribution
----------------------------
 CREATE OR REPLACE FUNCTION distribute_message() 
 RETURNS trigger AS $$
 DECLARE
    published_queues TEXT[];
 BEGIN
    WITH ins AS (
-     INSERT INTO queue_messages(queue_name, message_id)
-     SELECT q.name, NEW.id
+     INSERT INTO queue_messages(queue_name, message_id, vt)
+     SELECT q.name, NEW.id, NEW.deliver_after
      FROM queues q
      WHERE q.topic_name = NEW.topic_name
-       AND (q.durable OR q.keep_alive_until > NOW())
+       AND (NOT q.exclusive OR q.keep_alive_until > NOW())
      RETURNING queue_name
    )
    SELECT array_agg(queue_name) INTO published_queues FROM ins;
    
    PERFORM pg_notify('postgremq_events', 
-      json_build_object('event','message_published','queues', published_queues)::text);
+      json_build_object(
+         'event', 'message_published',
+         'queues', published_queues,
+         'vt', NEW.deliver_after
+      )::text);
       
    RETURN NEW;
 END;
@@ -111,44 +125,78 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Create a queue.
+/* Function: create_queue
+ *
+ * Description:
+ *   Creates a new queue that subscribes to a topic. If the queue is exclusive,
+ *   it will be automatically deleted when its keep_alive_until timestamp expires.
+ *   Only one exclusive queue with a given name can exist at a time.
+ *
+ * Parameters:
+ *   - p_queue_name (VARCHAR): Name of the queue to create.
+ *   - p_topic_name (VARCHAR): Name of the topic to subscribe to.
+ *   - p_max_attempts (INTEGER): Maximum delivery attempts before moving to DLQ.
+ *   - p_exclusive (BOOLEAN): If true, queue will be deleted when keep_alive expires.
+ *   - p_keep_alive_sec (INTEGER): Seconds to keep the queue alive (only used for exclusive queues,
+ *                                defaults to 30 seconds).
+ *
+ * Returns: VOID.
+ *
+ * Raises:
+ *   - Exception if attempting to create a duplicate exclusive queue.
+ */
 CREATE OR REPLACE FUNCTION create_queue(
-  p_queue VARCHAR(255), 
-  p_topic VARCHAR(255),
-  p_max_delivery_attempts INT DEFAULT 0,  -- Changed from max_retries
-  p_durable BOOLEAN DEFAULT true,
-  p_keep_alive_interval INTERVAL DEFAULT interval '10 minutes'
-)
-RETURNS VARCHAR(255) AS $$
+    p_queue_name VARCHAR(255),
+    p_topic_name VARCHAR(255),
+    p_max_attempts INTEGER DEFAULT 0,  -- Changed to 0 for unlimited retries
+    p_exclusive BOOLEAN DEFAULT false,
+    p_keep_alive_sec INTEGER DEFAULT 30
+) RETURNS VOID AS $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM topics WHERE name = p_topic) THEN
-    RAISE EXCEPTION 'Topic "%" does not exist', p_topic;
-  END IF;
-  
-  INSERT INTO queues(name, topic_name, max_delivery_attempts, durable, keep_alive_until)
-  VALUES (p_queue, p_topic, p_max_delivery_attempts, p_durable,
-          CASE WHEN p_durable THEN NULL ELSE NOW() + p_keep_alive_interval END)
-  ON CONFLICT (name) DO UPDATE
-       SET topic_name = EXCLUDED.topic_name,
-           max_delivery_attempts = EXCLUDED.max_delivery_attempts,
-           durable = EXCLUDED.durable,
-           keep_alive_until = CASE 
-                               WHEN EXCLUDED.durable THEN NULL 
-                               ELSE NOW() + p_keep_alive_interval 
-                             END;
-  RETURN p_queue;
+    INSERT INTO queues (
+        name,
+        topic_name,
+        max_delivery_attempts,
+        exclusive,
+        keep_alive_until
+    ) VALUES (
+        p_queue_name,
+        p_topic_name,
+        p_max_attempts,
+        p_exclusive,
+        CASE 
+            WHEN p_exclusive THEN NOW() + make_interval(secs => p_keep_alive_sec)
+            ELSE NULL
+        END
+    );
+EXCEPTION
+    WHEN unique_violation THEN
+        IF p_exclusive THEN
+            RAISE EXCEPTION 'An exclusive queue with name "%" already exists', p_queue_name;
+        ELSE
+            RAISE;
+        END IF;
 END;
 $$ LANGUAGE plpgsql;
 
 -- Publish a message.
-CREATE OR REPLACE FUNCTION publish_message(p_topic VARCHAR(255), p_payload JSONB)
-RETURNS VOID AS $$
+CREATE OR REPLACE FUNCTION publish_message(
+    p_topic VARCHAR(255), 
+    p_payload JSONB,
+    p_deliver_after TIMESTAMPTZ DEFAULT NOW()
+) RETURNS INT AS $$
+DECLARE
+    v_message_id INT;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM topics WHERE name = p_topic) THEN
-    RAISE EXCEPTION 'Topic "%" does not exist', p_topic;
-  END IF;
-  INSERT INTO messages(topic_name, payload)
-  VALUES (p_topic, p_payload);  
+    IF NOT EXISTS (SELECT 1 FROM topics WHERE name = p_topic) THEN
+        RAISE EXCEPTION 'Topic "%" does not exist', p_topic;
+    END IF;
+    
+    INSERT INTO messages(topic_name, payload, deliver_after)
+    VALUES (p_topic, p_payload, p_deliver_after)
+    RETURNING id INTO v_message_id;
+    
+    RETURN v_message_id;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -161,62 +209,64 @@ $$ LANGUAGE plpgsql;
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue.
- *   - p_lock_timeout (INTERVAL): The duration for which the message is locked.
+ *   - p_vt (INTEGER): The duration for which the message is locked in seconds.
  *   - p_limit (INT DEFAULT 1): Maximum number of messages to retrieve.
  *
  * Returns:
  *   A table of records with fields: queue_name, message_id, payload, consumer_token, delivery_attempts.
  */
 CREATE OR REPLACE FUNCTION consume_message(
-  p_queue_name VARCHAR(255),
-  p_lock_timeout INTERVAL,
-  p_limit INT DEFAULT 1
-)
-RETURNS TABLE(
-  queue_name VARCHAR(255), 
-  message_id INT, 
-  payload JSONB, 
-  consumer_token VARCHAR(64),
-  delivery_attempts INT
+    p_queue_name VARCHAR(255),
+    p_vt INTEGER,
+    p_limit INT DEFAULT 1
+) RETURNS TABLE(
+    queue_name VARCHAR(255), 
+    message_id INT,
+    payload JSONB, 
+    consumer_token VARCHAR(64),
+    delivery_attempts INT,
+    vt TIMESTAMPTZ,
+    published_at TIMESTAMPTZ
 ) AS $$
 BEGIN
-  RETURN QUERY
-  WITH target_queue AS (
-    SELECT name, max_delivery_attempts
-    FROM queues
-    WHERE name = p_queue_name
-      AND (durable OR keep_alive_until > NOW())
-  ),
-  next_msg AS (
-    SELECT qm.queue_name,
-           qm.message_id,
-           qm.status,
-           qm.delivery_attempts,
-           qm.created_at
-    FROM queue_messages qm
-    CROSS JOIN target_queue tq
-    WHERE qm.queue_name = tq.name
-      /* Allow consumption if max_delivery_attempts is 0 (unlimited) or not exceeded */
-      AND (tq.max_delivery_attempts = 0 OR qm.delivery_attempts < tq.max_delivery_attempts)
-      /* Message must be pending or processing with an expired lock */
-      AND (qm.status = 'pending' OR (qm.status = 'processing' AND qm.locked_until < NOW()))
-    ORDER BY qm.created_at
-    FOR UPDATE SKIP LOCKED
-    LIMIT p_limit
-  )
-  UPDATE queue_messages
-  SET status = 'processing',
-      locked_until = NOW() + p_lock_timeout,
-      delivery_attempts = qm.delivery_attempts + 1,
-      consumer_token = to_char(NOW(), 'YYYYMMDDHH24MISS.MS') || '-' || substr(md5(random()::text), 1, 6)
-  FROM next_msg qm
-  WHERE queue_messages.queue_name = qm.queue_name
-    AND queue_messages.message_id = qm.message_id
-  RETURNING queue_messages.queue_name,
-            queue_messages.message_id,
-            (SELECT m.payload FROM messages m WHERE m.id = queue_messages.message_id) AS payload,
-            queue_messages.consumer_token,
-            queue_messages.delivery_attempts;
+    RETURN QUERY
+    WITH target_queue AS (
+        SELECT name, max_delivery_attempts
+        FROM queues
+        WHERE name = p_queue_name
+            AND (NOT exclusive OR keep_alive_until > NOW())
+    ),
+    next_msg AS (
+        SELECT qm.queue_name,
+               qm.message_id,
+               qm.status,
+               qm.delivery_attempts,
+               qm.published_at
+        FROM queue_messages qm
+        CROSS JOIN target_queue tq
+        WHERE qm.queue_name = tq.name
+            AND (tq.max_delivery_attempts = 0 OR qm.delivery_attempts < tq.max_delivery_attempts)
+            AND (qm.status = 'pending' OR qm.status = 'processing' )
+            AND qm.vt <= NOW()
+        ORDER BY qm.published_at
+        FOR UPDATE SKIP LOCKED
+        LIMIT p_limit
+    )
+    UPDATE queue_messages
+    SET status = 'processing',
+        vt = NOW() + make_interval(secs => p_vt),
+        delivery_attempts = qm.delivery_attempts + 1,
+        consumer_token = to_char(NOW(), 'YYYYMMDDHH24MISS.MS') || '-' || substr(md5(random()::text), 1, 6)
+    FROM next_msg qm
+    WHERE queue_messages.queue_name = qm.queue_name
+        AND queue_messages.message_id = qm.message_id
+    RETURNING queue_messages.queue_name,
+              queue_messages.message_id,
+              (SELECT m.payload FROM messages m WHERE m.id = queue_messages.message_id) AS payload,
+              queue_messages.consumer_token,
+              queue_messages.delivery_attempts,
+              queue_messages.vt,
+              queue_messages.published_at;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -263,42 +313,93 @@ $$ LANGUAGE plpgsql;
  *   - p_queue_name (VARCHAR): Name of the queue.
  *   - p_message_id (INT): Identifier of the message.
  *   - p_consumer_token (VARCHAR): The consumer token to verify the consumer.
+ *   - p_delay_until (TIMESTAMPTZ): The timestamp until which the message should be delayed for redelivery.
  *
  * Returns: VOID.
  */
 CREATE OR REPLACE FUNCTION nack_message(
-  p_queue_name VARCHAR(255),
-  p_message_id INT,
-  p_consumer_token VARCHAR(64)
-)
-RETURNS VOID AS $$
+    p_queue_name VARCHAR(255),
+    p_message_id INT,
+    p_consumer_token VARCHAR(64),
+    p_delay_until TIMESTAMPTZ DEFAULT NOW()
+) RETURNS VOID AS $$
 DECLARE
-  published_queues TEXT[];
+    published_queues TEXT[];
 BEGIN
-  UPDATE queue_messages
-  SET status = 'pending',
-      locked_until = NULL,
-      consumer_token = NULL
-  WHERE queue_name = p_queue_name
-    AND message_id = p_message_id
-    AND status = 'processing'
-    AND consumer_token = p_consumer_token;
+    UPDATE queue_messages
+    SET status = 'pending',
+        vt = p_delay_until,
+        consumer_token = NULL
+    WHERE queue_name = p_queue_name
+        AND message_id = p_message_id
+        AND status = 'processing'
+        AND consumer_token = p_consumer_token;
+        
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Nack failed: message not in processing state or token mismatch';
+    END IF;
     
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'Nack failed: message not in processing state or token mismatch';
-  END IF;
-  
-  -- Since the nack is only applied to a single queue, use that queue name.
-  published_queues := ARRAY[p_queue_name];
-
-  PERFORM pg_notify('postgremq_events',
-     json_build_object('event', 'message_nacked', 'queues', published_queues)::text);
-     
-  RETURN;
+    published_queues := ARRAY[p_queue_name];
+    
+    PERFORM pg_notify('postgremq_events',
+        json_build_object(
+            'event', 'message_nacked',
+            'queues', published_queues,
+            'vt', p_delay_until
+        )::text);
+        
+    RETURN;
 END;
 $$ LANGUAGE plpgsql;
 
-/* Function: extend_lock_time
+/* Function: release_message
+ *
+ * Description:
+ *   Releases the message back for delivery without increasing retry count. Should be used when client fetched the
+ *   message but didn't make an attempt to process it, like for example buffered consumption.
+ *   The function resets the message status
+ *   to 'pending', clears the lock and consumer token, and sends a notification event.
+ *
+ * Parameters:
+ *   - p_queue_name (VARCHAR): Name of the queue.
+ *   - p_message_id (INT): Identifier of the message.
+ *   - p_consumer_token (VARCHAR): The consumer token to verify the consumer.
+ *
+ * Returns: VOID.
+ */
+CREATE OR REPLACE FUNCTION release_message(
+    p_queue_name VARCHAR(255),
+    p_message_id INT,
+    p_consumer_token VARCHAR(64)
+)
+    RETURNS VOID AS $$
+DECLARE
+    published_queues TEXT[];
+BEGIN
+    UPDATE queue_messages
+    SET status = 'pending',
+        vt = NOW(),  -- Renamed from locked_until
+        consumer_token = NULL,
+        delivery_attempts = delivery_attempts - 1
+    WHERE queue_name = p_queue_name
+      AND message_id = p_message_id
+      AND status = 'processing'
+      AND consumer_token = p_consumer_token;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Release message failed: message not in processing state or token mismatch';
+    END IF;
+
+    published_queues := ARRAY[p_queue_name];
+
+    PERFORM pg_notify('postgremq_events',
+                      json_build_object('event', 'message_released', 'queues', published_queues)::text);
+
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+/* Function: set_vt
  *
  * Description:
  *   Extends the lock time on a particular message, giving the consumer more time to process it.
@@ -306,20 +407,35 @@ $$ LANGUAGE plpgsql;
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue.
  *   - p_message_id (INT): Identifier of the message.
- *   - p_extra_seconds (INT): Additional seconds to add to the current lock duration.
+ *   - p_consumer_token (VARCHAR): The consumer token to verify the consumer.
+ *   - p_vt (INT): Additional seconds to add to the current lock duration.
  *
  * Returns:
- *   BOOLEAN indicating if the lock was successfully extended.
+ *   TIMESTAMPTZ indicating new lock time.
  */
-CREATE OR REPLACE FUNCTION extend_lock_time(p_queue_name VARCHAR(255), p_message_id INT, p_extra_seconds INT)
-RETURNS BOOLEAN AS $$
+CREATE OR REPLACE FUNCTION set_vt(
+    p_queue_name VARCHAR(255),
+    p_message_id INTEGER,
+    p_consumer_token VARCHAR(64),
+    p_vt INTEGER
+) RETURNS TIMESTAMPTZ AS $$
+DECLARE
+    v_vt TIMESTAMPTZ;
 BEGIN
-  UPDATE queue_messages
-  SET locked_until = locked_until + make_interval(secs => p_extra_seconds)
-  WHERE queue_name = p_queue_name
-    AND message_id = p_message_id
-    AND locked_until > NOW();
-  RETURN FOUND;
+    UPDATE queue_messages
+    SET vt = NOW() + make_interval(secs => p_vt)
+    WHERE queue_name = p_queue_name
+      AND message_id = p_message_id
+      AND consumer_token = p_consumer_token
+      AND status = 'processing'
+      AND vt > NOW()
+    RETURNING vt INTO v_vt;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Extend lock failed: message not in processing state or token mismatch';
+    END IF;
+
+    RETURN v_vt;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -359,7 +475,7 @@ $$ LANGUAGE plpgsql;
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue.
- *   - p_extension (INTERVAL): The interval to add to NOW() for the new keep-alive timestamp.
+ *   - p_interval (INTERVAL): The interval to add to NOW() for the new keep-alive timestamp.
  *
  * Returns:
  *   BOOLEAN indicating whether the update was successful.
@@ -367,18 +483,17 @@ $$ LANGUAGE plpgsql;
  * Note:
  *   Negative or zero intervals are not allowed.
  */
-CREATE OR REPLACE FUNCTION extend_queue_keep_alive(p_queue_name VARCHAR(255), p_extension INTERVAL)
-RETURNS BOOLEAN AS $$
+CREATE OR REPLACE FUNCTION extend_queue_keep_alive(
+    p_queue_name VARCHAR(255),
+    p_interval INTERVAL
+) RETURNS BOOLEAN AS $$
 BEGIN
-   IF p_extension <= interval '0' THEN
-     RAISE EXCEPTION 'Negative or zero interval not allowed.';
-   END IF;
-
-   UPDATE queues 
-   SET keep_alive_until = NOW() + p_extension
-   WHERE name = p_queue_name AND durable = FALSE;
-
-   RETURN FOUND;
+    UPDATE queues
+    SET keep_alive_until = NOW() + p_interval
+    WHERE name = p_queue_name
+      AND exclusive = true;  -- Changed from NOT durable
+    
+    RETURN FOUND;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -434,7 +549,7 @@ RETURNS TABLE(
   queue_name VARCHAR(255),
   topic_name VARCHAR(255),
   max_delivery_attempts INT,
-  durable BOOLEAN,
+  exclusive BOOLEAN,  -- Changed from durable
   keep_alive_until TIMESTAMPTZ
 ) AS $$
 BEGIN
@@ -443,7 +558,7 @@ BEGIN
       queues.name AS queue_name,
       queues.topic_name,
       queues.max_delivery_attempts,
-      queues.durable,
+      queues.exclusive,  -- Changed from durable
       queues.keep_alive_until
     FROM queues
     ORDER BY queues.name;
@@ -494,44 +609,45 @@ $$ LANGUAGE plpgsql;
  *     - queue_name (VARCHAR): Name of the queue from which the message was moved.
  *     - message_id (INT): Identifier of the message.
  *     - retry_count (INT): Number of delivery attempts made (as stored in DLQ).
- *     - created_at (TIMESTAMPTZ): Timestamp when the message was moved into the DLQ.
+ *     - published_at (TIMESTAMPTZ): Timestamp when the message was moved into the DLQ.
  */
 CREATE OR REPLACE FUNCTION list_dlq_messages()
 RETURNS TABLE(
   queue_name VARCHAR(255),
   message_id INT,
   retry_count INT,
-  created_at TIMESTAMPTZ
+  published_at TIMESTAMPTZ
 ) AS $$
 BEGIN
   RETURN QUERY
-    SELECT dl.queue_name, dl.message_id, dl.retry_count, dl.created_at
+    SELECT dl.queue_name, dl.message_id, dl.retry_count, dl.published_at
     FROM dead_letter_queue dl
-    ORDER BY dl.created_at;
+    ORDER BY dl.published_at;
 END;
 $$ LANGUAGE plpgsql;
 
 /* Function: requeue_dlq_messages
  *
  * Description:
- *   Requeues messages from the Dead Letter Queue back to their active queues
- *   (i.e., marks them as 'pending') and then removes them from the DLQ.
+ *   Moves messages from the dead letter queue back to their original queues.
+ *   The delivery_attempts counter is reset to 0 for these messages.
  *
  * Parameters:
- *   - p_queue (VARCHAR, optional): Limit the requeue operation to a specific queue.
+ *   - p_queue_name (VARCHAR): Name of the queue to requeue messages for.
  *
  * Returns: VOID.
  */
-CREATE OR REPLACE FUNCTION requeue_dlq_messages(p_queue VARCHAR(255) DEFAULT NULL)
+CREATE OR REPLACE FUNCTION requeue_dlq_messages(p_queue_name VARCHAR(255))
 RETURNS VOID AS $$
 BEGIN
-  INSERT INTO queue_messages(queue_name, message_id, status, created_at, retry_count)
-  SELECT queue_name, message_id, 'pending', NOW(), retry_count
-  FROM dead_letter_queue
-  WHERE (p_queue IS NULL OR queue_name = p_queue);
-  
-  DELETE FROM dead_letter_queue
-  WHERE (p_queue IS NULL OR queue_name = p_queue);
+  WITH moved_messages AS (
+    DELETE FROM dead_letter_queue dlq
+    WHERE dlq.queue_name = p_queue_name
+    RETURNING dlq.queue_name, dlq.message_id
+  )
+  INSERT INTO queue_messages(queue_name, message_id, status, delivery_attempts)
+  SELECT queue_name, message_id, 'pending', 0
+  FROM moved_messages;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -561,6 +677,7 @@ CREATE OR REPLACE FUNCTION purge_all_messages()
 RETURNS VOID AS $$
 BEGIN
   DELETE FROM dead_letter_queue;
+  DELETE FROM queue_messages;
   DELETE FROM messages;
 END;
 $$ LANGUAGE plpgsql;
@@ -672,10 +789,123 @@ CREATE OR REPLACE FUNCTION delete_inactive_queues()
 RETURNS VOID AS $$
 BEGIN
   DELETE FROM queues
-  WHERE durable = false AND (keep_alive_until IS NULL OR keep_alive_until <= NOW());
+  WHERE exclusive = true  -- Changed from durable = false
+    AND (keep_alive_until IS NULL OR keep_alive_until <= NOW());
 END;
 $$ LANGUAGE plpgsql;
 
 ---------------------------
 -- End of Implementation Script
 -- ============================================================
+
+CREATE OR REPLACE FUNCTION set_vt_batch(
+    p_queue_name VARCHAR(255),
+    p_message_ids INTEGER[],
+    p_consumer_tokens VARCHAR[],
+    p_vt INTEGER
+) RETURNS TABLE (message_id INTEGER, vt TIMESTAMPTZ) AS $$
+BEGIN
+    RETURN QUERY
+    UPDATE queue_messages qm
+    SET vt = NOW() + make_interval(secs => p_vt)
+    WHERE qm.queue_name = p_queue_name
+      AND (qm.message_id, qm.consumer_token) = ANY (
+          SELECT unnest(p_message_ids), unnest(p_consumer_tokens)
+      )
+      AND qm.status = 'processing'
+      AND qm.vt > NOW()
+    RETURNING qm.message_id, qm.vt;
+END;
+$$ LANGUAGE plpgsql;
+
+/* Function: list_messages
+ *
+ * Description:
+ *   Lists all messages in a queue without consuming them.
+ *
+ * Parameters:
+ *   - p_queue_name (VARCHAR): Name of the queue.
+ *
+ * Returns:
+ *   A TABLE with message details (excluding payload).
+ */
+CREATE OR REPLACE FUNCTION list_messages(p_queue_name VARCHAR(255))
+RETURNS TABLE(
+    message_id INT,
+    status VARCHAR(16),
+    published_at TIMESTAMPTZ,
+    delivery_attempts INT,
+    vt TIMESTAMPTZ,
+    processed_at TIMESTAMPTZ
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        qm.message_id,
+        qm.status,
+        qm.published_at,
+        qm.delivery_attempts,
+        qm.vt,
+        qm.processed_at
+    FROM queue_messages qm
+    WHERE qm.queue_name = p_queue_name
+    ORDER BY qm.published_at;
+END;
+$$ LANGUAGE plpgsql;
+
+/* Function: get_message
+ *
+ * Description:
+ *   Retrieves a single message by ID, including its payload.
+ *
+ * Parameters:
+ *   - p_message_id (INT): ID of the message.
+ *
+ * Returns:
+ *   A TABLE with message details and payload.
+ */
+CREATE OR REPLACE FUNCTION get_message(p_message_id INT)
+RETURNS TABLE(
+    message_id INT,
+    topic_name VARCHAR(255),
+    payload JSONB,
+    published_at TIMESTAMPTZ
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        m.id,
+        m.topic_name,
+        m.payload,
+        m.published_at
+    FROM messages m
+    WHERE m.id = p_message_id;
+END;
+$$ LANGUAGE plpgsql;
+
+/* Function: get_next_visible_time
+ *
+ * Description:
+ *   Returns the timestamp when the next message will become visible for delivery
+ *   in the specified queue. Only considers messages in 'pending' or 'processing' state
+ *   that haven't exceeded their max delivery attempts.
+ *
+ * Parameters:
+ *   - p_queue_name (VARCHAR): Name of the queue.
+ *
+ * Returns:
+ *   TIMESTAMPTZ indicating when the next message will be visible, or NULL if no messages.
+ */
+CREATE OR REPLACE FUNCTION get_next_visible_time(p_queue_name VARCHAR(255))
+RETURNS TIMESTAMPTZ AS $$
+BEGIN
+    RETURN (
+        SELECT MIN(qm.vt)
+        FROM queue_messages qm
+        JOIN queues q ON q.name = qm.queue_name
+        WHERE qm.queue_name = p_queue_name
+          AND (qm.status = 'pending' OR qm.status = 'processing')
+          AND (q.max_delivery_attempts = 0 OR qm.delivery_attempts < q.max_delivery_attempts)
+    );
+END;
+$$ LANGUAGE plpgsql;
