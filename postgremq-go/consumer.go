@@ -149,9 +149,11 @@ func (c *Consumer) startMessageLoop() {
 		// wait for all in-flight messages to be completed
 		<-c.inFlightFlag
 
-		// let the auto-extend loop know that no more updates are coming
-		close(c.vtMessageUpdates)
+		// Close channels to signal auto-extend and tracking loops to exit
+		// It's safe to close now because inFlightFlag is closed, meaning no more
+		// messages will call handleMessageComplete
 		close(c.messageUpdates)
+		close(c.vtMessageUpdates)
 	}()
 }
 

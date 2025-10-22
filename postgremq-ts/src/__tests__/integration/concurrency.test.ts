@@ -390,6 +390,10 @@ describe('Concurrency', () => {
 
       await consumer.stop();
 
+      // Give a small delay for database transactions to fully commit
+      // This is especially important on Node.js 22 where async timing differs
+      await sleep(100);
+
       // Wait for all messages to return to pending state
       await waitFor(async () => {
         const stats = await connection.getQueueStatistics('concurrent-nack-queue');

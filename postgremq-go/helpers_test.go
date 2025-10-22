@@ -67,6 +67,10 @@ func newPostgresContainer(ctx context.Context) (*postgresContainer, error) {
 			"POSTGRES_PASSWORD": "postgres",
 			"POSTGRES_DB":       "postgres",
 		},
+		Cmd: []string{
+			"postgres",
+			"-c", "max_connections=200", // Increase max connections for parallel tests
+		},
 		WaitingFor: wait.ForAll(
 			// First, we wait for the container to log readiness twice.
 			// This is because it will restart itself after the first startup.
@@ -104,6 +108,10 @@ func newPostgresContainer(ctx context.Context) (*postgresContainer, error) {
 		_ = container.Terminate(ctx)
 		return nil, fmt.Errorf("failed to parse connection config: %w", err)
 	}
+	// Increase pool size for concurrent test scenarios
+	// Admin pool needs many connections since all tests try to create databases in parallel
+	config.MaxConns = 100
+	config.MinConns = 10
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		_ = container.Terminate(ctx)
@@ -145,6 +153,9 @@ func createTestDatabase(t *testing.T, ctx context.Context) (*pgxpool.Pool, strin
 	// Update the connection config to point to the new database
 	testConfig := sharedContainer.config.Copy()
 	testConfig.ConnConfig.Database = dbName
+	// Increase pool size for concurrent test scenarios
+	testConfig.MaxConns = 50
+	testConfig.MinConns = 5
 
 	// Connect to the new test database
 	testPool, err := pgxpool.NewWithConfig(ctx, testConfig)
