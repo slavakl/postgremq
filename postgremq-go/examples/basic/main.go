@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
 	"github.com/jackc/pgx/v5/pgxpool"
+	postgremq "github.com/slavakl/postgremq/postgremq-go"
 )
 
 func main() {

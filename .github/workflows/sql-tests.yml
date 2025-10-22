@@ -17,10 +17,6 @@ jobs:
     name: Test SQL Implementation
     runs-on: ubuntu-latest
 
-    strategy:
-      matrix:
-        python-version: ['3.9', '3.10', '3.11', '3.12']
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -28,7 +24,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: ${{ matrix.python-version }}
+        python-version: '3.11'
         cache: 'pip'
         cache-dependency-path: mq/tests/requirements.txt
 

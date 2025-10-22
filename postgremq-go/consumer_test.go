@@ -53,13 +53,13 @@ func TestConsumerStartAndReceive(t *testing.T) {
 	// conn.Consume automatically starts the consumer.
 	consumer, err := conn.Consume(ctx, queueName,
 		postgremq.WithBatchSize(2),
-		postgremq.WithVT(30),
+		postgremq.WithVT(5),
 	)
 	require.NoError(t, err, "Consume failed")
 	defer consumer.Stop()
 
 	received := 0
-	timeout := time.After(10 * time.Second)
+	timeout := time.After(5 * time.Second)
 	for received < 5 {
 		select {
 		case msg := <-consumer.Messages():
@@ -103,11 +103,11 @@ func TestConsumerMessageRetryAfterNack(t *testing.T) {
 	defer consumer.Stop()
 
 	// Wait briefly until a message is received.
-	var msg postgremq.Message
+	var msg *postgremq.Message
 	select {
 	case m := <-consumer.Messages():
-		msg = *m
-	case <-time.After(5 * time.Second):
+		msg = m
+	case <-time.After(2 * time.Second):
 		t.Fatal("Timed out waiting for message")
 	}
 
@@ -122,7 +122,7 @@ func TestConsumerMessageRetryAfterNack(t *testing.T) {
 		assert.Equal(t, 2, m.DeliveryAttempt, "Expected delivery attempt to be 2")
 		err = m.Ack(ctx)
 		require.NoError(t, err, "Failed to ack message")
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Error("Timed out waiting for re-delivery")
 	}
 }
@@ -185,7 +185,7 @@ func TestConsumerMultipleDistribution(t *testing.T) {
 				if receivedCount >= 10 {
 					return
 				}
-			case <-time.After(5 * time.Second):
+			case <-time.After(2 * time.Second):
 				return
 			}
 		}
@@ -233,7 +233,7 @@ func TestConsumerVisibilityTimeoutExtension(t *testing.T) {
 	msg := <-consumer.Messages()
 
 	// Wait to allow auto-extension to occur.
-	time.Sleep(2 * time.Second)
+	time.Sleep(1 * time.Second)
 
 	// Check that the visibility timeout has been extended.
 	messages, err := conn.ListMessages(ctx, queueName)
@@ -243,7 +243,7 @@ func TestConsumerVisibilityTimeoutExtension(t *testing.T) {
 	err = msg.Ack(ctx)
 	require.NoError(t, err, "Ack failed")
 
-	assert.True(t, updatedVT.After(msg.VT), "Visibility timeout should be extended automatically. Logs: \n\t%s", strings.Join(logger.Messages, "\n\t"))
+	assert.True(t, updatedVT.After(msg.GetVT()), "Visibility timeout should be extended automatically. Logs: \n\t%s", strings.Join(logger.GetMessages(), "\n\t"))
 }
 
 // TestConsumerBufferedMessagesReleased verifies that buffered messages
@@ -274,7 +274,7 @@ func TestConsumerBufferedMessagesReleased(t *testing.T) {
 	}
 
 	// Create a consumer with a BatchSize of 5.
-	consumer, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(5), postgremq.WithVT(120))
+	consumer, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(5), postgremq.WithVT(10))
 	require.NoError(t, err, "Consume failed")
 
 	nackedMessages := make(map[int]struct{})
@@ -464,9 +464,9 @@ func TestWithNoAutoExtension(t *testing.T) {
 	// Receive the message
 	select {
 	case receivedMsg := <-consumer.Messages():
-		defer receivedMsg.Nack(ctx)
+		defer func() { _ = receivedMsg.Nack(ctx) }()
 		require.Equal(t, msgID, receivedMsg.ID, "Message ID mismatch")
-	case <-time.After(3 * time.Second):
+	case <-time.After(1500 * time.Millisecond):
 		require.Fail(t, "Timeout waiting for message")
 	}
 
@@ -477,10 +477,10 @@ func TestWithNoAutoExtension(t *testing.T) {
 	// Receive the message again
 	select {
 	case receivedMsg := <-consumer.Messages():
-		defer receivedMsg.Nack(ctx)
+		defer func() { _ = receivedMsg.Nack(ctx) }()
 		require.Equal(t, msgID, receivedMsg.ID, "Message ID mismatch")
 		require.Equal(t, 2, receivedMsg.DeliveryAttempt, "Expected delivery attempt to be 2")
-	case <-time.After(3 * time.Second):
+	case <-time.After(1500 * time.Millisecond):
 		require.Fail(t, "Timeout waiting for message redelivery")
 	}
 }

@@ -20,9 +20,16 @@ The test suite uses a robust approach designed for reliable parallel test execut
 
 ### Running Tests
 
+> **Tip**: You can use `make` commands for common tasks. Run `make help` to see all available targets.
+
 #### Running all tests:
 ```bash
 go test ./...
+```
+
+#### Running tests with coverage:
+```bash
+go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 ```
 
 #### Running tests in short mode (skips long-running tests):
@@ -50,6 +57,38 @@ chmod +x scripts/quicktest.sh
 # Run quick tests with custom parallelism
 ./scripts/quicktest.sh 8  # Run with 8 parallel tests
 ```
+
+### Code Quality Checks
+
+#### Quick checks using built-in Go tools (no installation needed):
+```bash
+# Run formatting, vet, and staticcheck (if available)
+make check
+
+# Or individually:
+go fmt ./...              # Format code
+go vet ./...              # Check for common mistakes
+```
+
+#### Full linting with golangci-lint (optional, same as CI):
+
+GitHub Actions uses [golangci-lint](https://golangci-lint.run/) which runs multiple linters. You can install it locally if you want the exact same checks:
+
+```bash
+# macOS
+brew install golangci-lint
+
+# Linux and Windows
+# See: https://golangci-lint.run/usage/install/
+```
+
+Then run:
+```bash
+make lint              # Run golangci-lint
+make lint-fix          # Auto-fix issues where possible
+```
+
+**Recommendation**: Use `make check` for quick local validation. CI will catch anything else.
 
 ## Usage
 

@@ -105,6 +105,7 @@ func WithLogger(logger Logger) ConnectionOption {
 		c.logger = &levelLogAdapter{logger: logger}
 	}
 }
+
 // WithLevelLogger installs a leveled logger that supports Debug, Info, Warn, and Error methods.
 //
 // Parameters:

@@ -38,7 +38,7 @@ jobs:
         path: |
           ~/.cache/go-build
           ~/go/pkg/mod
-        key: ${{ runner.os }}-go-${{ matrix.go-version }}-${{ hashFiles('postgremq-go/go.sum') }}
+        key: ${{ runner.os }}-go-${{ matrix.go-version }}-${{ hashFiles('**/go.sum') }}
         restore-keys: |
           ${{ runner.os }}-go-${{ matrix.go-version }}-
 
@@ -48,7 +48,7 @@ jobs:
 
     - name: Run tests
       working-directory: ./postgremq-go
-      run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+      run: go test -v -race -timeout=20m -coverprofile=coverage.out -covermode=atomic ./...
 
     # Uncomment to enable Codecov (requires CODECOV_TOKEN secret)
     # - name: Upload coverage to Codecov

@@ -75,6 +75,15 @@ func (m *MockLogger) log(msg string) {
 	m.Messages = append(m.Messages, msg)
 }
 
+func (m *MockLogger) GetMessages() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Return a copy to avoid races
+	result := make([]string, len(m.Messages))
+	copy(result, m.Messages)
+	return result
+}
+
 // -----------------------------------------------------------------------
 // Connection Tests
 // -----------------------------------------------------------------------

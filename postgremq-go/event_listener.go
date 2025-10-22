@@ -144,7 +144,7 @@ func (el *EventListener) Close() {
 	for _, lst := range el.listeners {
 		for _, ch := range lst {
 			close(ch)
-			for _ = range ch { // drain the channel
+			for range ch { // drain the channel
 			}
 
 		}

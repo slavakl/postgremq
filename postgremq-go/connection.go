@@ -16,7 +16,7 @@ import (
 // ErrConnectionClosed is returned when an operation is attempted after
 // the Connection has begun shutting down or has been closed.
 var (
-    ErrConnectionClosed = errors.New("connection is stopped")
+	ErrConnectionClosed = errors.New("connection is stopped")
 )
 
 // Connection is a client handle to the PostgreMQ schema running in a
@@ -571,19 +571,6 @@ func (c *Connection) nackMessage(ctx context.Context, queue string, messageID in
 		}
 		return nil
 	})
-}
-
-func (c *Connection) extendLock(ctx context.Context, queue string, messageID int, consumerToken string, extraSeconds int) (time.Time, error) {
-	var extendedUntil time.Time
-	err := c.withRetry(ctx, func(ctx context.Context) error {
-		return c.pool.QueryRow(ctx,
-			"SELECT set_vt($1, $2, $3, $4)",
-			queue, messageID, consumerToken, extraSeconds).Scan(&extendedUntil)
-	})
-	if err != nil {
-		return time.Time{}, fmt.Errorf("failed to extend message lock: %w", err)
-	}
-	return extendedUntil, nil
 }
 
 // isClosed returns true if the connection is stopped

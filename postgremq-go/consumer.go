@@ -73,7 +73,7 @@ func newConsumer(parentCtx context.Context, conn *Connection, logger LevelLogger
 		dbCtx:            dbCtx,
 		events:           events,
 		vtMessageUpdates: make(chan messageUpdate, options.batchSize*2),
-		messageUpdates:   make(chan messageUpdate),
+		messageUpdates:   make(chan messageUpdate, 100), // Buffered to avoid blocking during shutdown
 		inFlightFlag:     make(chan struct{}),
 		logger:           logger,
 	}, nil
@@ -136,24 +136,19 @@ func (c *Consumer) startMessageLoop() {
 
 		close(c.messages) // Close channel when done
 
-		var closingWg sync.WaitGroup
-		closingWg.Add(1)
-		go func() {
-			defer closingWg.Done()
-			// release all buffered messages that client hasn't consumed yet
-			for msg := range c.messages {
-				if err := msg.Release(context.Background()); err != nil { // release message if client is not ready to receive it
-					c.logger.Errorf("Failed to release message %d: %v", msg.ID, err)
-				}
+		// release all buffered messages that client hasn't consumed yet
+		for msg := range c.messages {
+			if err := msg.Release(context.Background()); err != nil { // release message if client is not ready to receive it
+				c.logger.Errorf("Failed to release message %d: %v", msg.ID, err)
 			}
-		}()
-		closingWg.Add(1)
-		go func() {
-			defer closingWg.Done()
-			c.messageUpdates <- messageUpdate{op: messageLoopStopped} // signal message tracking loop to cancel messages
-			<-c.inFlightFlag                                          // waiting for all the messages to be completed
-		}()
-		closingWg.Wait()
+		}
+
+		// signal message tracking loop to cancel messages
+		c.messageUpdates <- messageUpdate{op: messageLoopStopped}
+
+		// wait for all in-flight messages to be completed
+		<-c.inFlightFlag
+
 		// let the auto-extend loop know that no more updates are coming
 		close(c.vtMessageUpdates)
 		close(c.messageUpdates)
@@ -230,23 +225,29 @@ func (c *Consumer) startMessageTrackingLoop() {
 		inFlight := make(map[string]*Message)
 		cancelled := false
 		for {
-			select {
-			case update := <-c.messageUpdates:
-				switch update.op {
-				case messageAdded:
-					c.logger.Debugf("Message tracking - received message added: %s", update.msg.trackingID)
-					inFlight[update.msg.trackingID] = update.msg
-				case messageRemoved:
-					c.logger.Debugf("Message tracking - Received message removed: %s", update.msg.trackingID)
-					delete(inFlight, update.msg.trackingID)
-				case messageLoopStopped:
-					c.logger.Debugf("Message tracking - Received message loop stopped")
-					for _, msg := range inFlight { // cancelling context of all in-flight messages letting client now that they should stop processing
-						msg.cancel()
-					}
-					cancelled = true
-
+			update, ok := <-c.messageUpdates
+			if !ok {
+				// Channel closed, clean up and exit
+				for _, msg := range inFlight {
+					msg.cancel()
 				}
+				close(c.inFlightFlag)
+				return
+			}
+			switch update.op {
+			case messageAdded:
+				c.logger.Debugf("Message tracking - received message added: %s", update.msg.trackingID)
+				inFlight[update.msg.trackingID] = update.msg
+			case messageRemoved:
+				c.logger.Debugf("Message tracking - Received message removed: %s", update.msg.trackingID)
+				delete(inFlight, update.msg.trackingID)
+			case messageLoopStopped:
+				c.logger.Debugf("Message tracking - Received message loop stopped")
+				for _, msg := range inFlight { // cancelling context of all in-flight messages letting client now that they should stop processing
+					msg.cancel()
+				}
+				cancelled = true
+
 			}
 			if cancelled && len(inFlight) == 0 {
 				break
@@ -332,7 +333,7 @@ func (c *Consumer) startExtendLoop() {
 					vts.push(&vtInfo{
 						messageID:     update.msg.ID,
 						consumerToken: update.msg.consumerToken,
-						extendAt:      calculateExtendAt(update.msg.VT),
+						extendAt:      calculateExtendAt(update.msg.GetVT()),
 					})
 				case messageRemoved:
 					vts.remove(update.msg.ID)
@@ -347,7 +348,7 @@ func (c *Consumer) startExtendLoop() {
 			}
 		}
 		// on shutdown drain updates channel
-		for _ = range c.vtMessageUpdates {
+		for range c.vtMessageUpdates {
 		}
 
 	}()
@@ -434,7 +435,7 @@ func (c *Consumer) extendVTs(vts *vtHeap) (tryAfter time.Time) {
 //
 // The channel will block when the buffer is full, providing natural backpressure.
 func (c *Consumer) Messages() <-chan *Message {
-    return c.messages
+	return c.messages
 }
 
 // Stop gracefully stops the consumer and waits for all operations to complete.
@@ -475,8 +476,8 @@ func (c *Consumer) Messages() <-chan *Message {
 //	    // Normal processing...
 //	}
 func (c *Consumer) Stop() {
-    c.cancel()
-    c.wg.Wait()
+	c.cancel()
+	c.wg.Wait()
 }
 
 // vtHeap implementation

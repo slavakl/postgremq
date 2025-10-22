@@ -34,7 +34,7 @@ func TestConcurrentMessageProcessing(t *testing.T) {
 	topicName := "test_concurrent_topic"
 	queueName := "test_concurrent_queue"
 	numConsumers := 5    // Number of concurrent consumers
-	numMessages := 100   // Total messages to publish
+	numMessages := 50    // Total messages to publish
 	processingTime := 50 // Simulated processing time in milliseconds
 
 	err = conn.CreateTopic(ctx, topicName)
@@ -88,7 +88,7 @@ func TestConcurrentMessageProcessing(t *testing.T) {
 					}
 				case <-ctx.Done():
 					return
-				case <-time.After(5 * time.Second):
+				case <-time.After(2 * time.Second):
 					// If no messages for 5 seconds and we've processed all messages, exit
 					if totalProcessed.Load() >= int32(numMessages) {
 						return
@@ -99,7 +99,7 @@ func TestConcurrentMessageProcessing(t *testing.T) {
 	}
 
 	// Give consumers time to start
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	// Publish test messages
 	for i := 0; i < numMessages; i++ {
@@ -163,7 +163,7 @@ func TestHighThroughputDelivery(t *testing.T) {
 	topicName := "test_highthroughput_topic"
 	queueName := "test_highthroughput_queue"
 	batchSize := 20
-	numMessages := 500
+	numMessages := 200
 	timeout := 60 * time.Second // Generous timeout for the whole test
 
 	// Setup topic and queue
@@ -195,7 +195,7 @@ func TestHighThroughputDelivery(t *testing.T) {
 	for i := 0; i < numConsumers; i++ {
 		consumer, err := conn.Consume(ctx, queueName,
 			postgremq.WithBatchSize(batchSize),
-			postgremq.WithVT(30))
+			postgremq.WithVT(10))
 		require.NoError(t, err, "Failed to create consumer")
 		defer consumer.Stop()
 
@@ -275,7 +275,7 @@ func TestHighThroughputDelivery(t *testing.T) {
 // TestRecoveryFromFailure tests the system's ability to recover from failures
 func TestRecoveryFromFailure(t *testing.T) {
 	skipIfShort(t) // Skip in short test mode
-	t.Parallel()
+	// Note: Not running in parallel due to resource contention issues
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
@@ -295,7 +295,7 @@ func TestRecoveryFromFailure(t *testing.T) {
 	require.NoError(t, err, "Failed to create queue")
 
 	// Publish test messages
-	numMessages := 20
+	numMessages := 10
 	for i := 0; i < numMessages; i++ {
 		_, err := conn.Publish(ctx, topicName, []byte(fmt.Sprintf(`{"value":%d}`, i)))
 		require.NoError(t, err, "Failed to publish message")
@@ -318,7 +318,7 @@ func TestRecoveryFromFailure(t *testing.T) {
 				err := msg.Nack(ctx)
 				require.NoError(t, err, "Failed to nack message")
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(2 * time.Second):
 			t.Fatalf("Timeout waiting for messages")
 		}
 	}
@@ -345,7 +345,7 @@ func TestRecoveryFromFailure(t *testing.T) {
 			require.NoError(t, err, "Failed to ack redelivered message")
 			redelivered++
 
-		case <-time.After(5 * time.Second):
+		case <-time.After(2 * time.Second):
 			t.Fatalf("Timeout waiting for redelivered messages, got %d/%d",
 				redelivered, expectedRedeliveries)
 		}

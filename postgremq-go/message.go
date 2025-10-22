@@ -55,6 +55,7 @@ type Message struct {
 	completeOnce sync.Once
 	cancel       context.CancelFunc
 	trackingID   string
+	vtMu         sync.RWMutex // Protects VT field from concurrent read/write
 }
 
 // Ack acknowledges the message, marking it as successfully processed.
@@ -257,7 +258,9 @@ func (m *Message) SetVT(ctx context.Context, vt int) (time.Time, error) {
 		return time.Time{}, err
 	}
 
+	m.vtMu.Lock()
 	m.VT = newVT
+	m.vtMu.Unlock()
 	return newVT, nil
 }
 
@@ -267,6 +270,20 @@ func (m *Message) complete(op int, err error) {
 			m.onComplete(m)
 		})
 	}
+}
+
+// GetVT returns the current visibility timeout in a thread-safe manner.
+//
+// This method should be used instead of directly accessing the VT field when
+// auto-extension is enabled, as the VT field may be updated concurrently by
+// the auto-extension goroutine.
+//
+// For performance reasons, you may choose to access the VT field directly if
+// you know auto-extension is disabled or if occasional stale reads are acceptable.
+func (m *Message) GetVT() time.Time {
+	m.vtMu.RLock()
+	defer m.vtMu.RUnlock()
+	return m.VT
 }
 
 // ConsumerToken returns the consumer token associated with this message.
@@ -282,5 +299,5 @@ func (m *Message) complete(op int, err error) {
 //
 // This method is primarily useful for debugging or logging purposes.
 func (m *Message) ConsumerToken() string {
-    return m.consumerToken
+	return m.consumerToken
 }

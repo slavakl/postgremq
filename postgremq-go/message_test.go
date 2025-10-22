@@ -57,7 +57,7 @@ func TestMessageAcknowledgment(t *testing.T) {
 		require.Len(t, messages, 1, "Expected one message")
 		require.Equal(t, messageID, messages[0].MessageID, "Message ID mismatch")
 		require.Equal(t, postgremq.MessageStatusCompleted, messages[0].Status, "Expected message status to be completed")
-	case <-time.After(2 * time.Second):
+	case <-time.After(1 * time.Second):
 		require.Fail(t, "Timeout waiting for message")
 	}
 }
@@ -102,7 +102,7 @@ func TestMessageNegativeAcknowledgment(t *testing.T) {
 		assert.Equal(t, messageID, messages[0].MessageID, "Message ID mismatch")
 		assert.Equal(t, 1, messages[0].DeliveryAttempts, "Wrong delivery attempts count")
 		assert.Equal(t, postgremq.MessageStatusPending, messages[0].Status, "Expected message status to be pending")
-	case <-time.After(2 * time.Second):
+	case <-time.After(1 * time.Second):
 		assert.Fail(t, "Timeout waiting for message")
 	}
 }
@@ -129,15 +129,15 @@ func TestMessageVisibilityTimeout(t *testing.T) {
 	messageID, err := conn.Publish(ctx, topicName, []byte(`{"test":"vt"}`))
 	require.NoError(t, err, "Failed to publish message")
 
-	consumer, err := conn.Consume(ctx, queueName, postgremq.WithVT(30))
+	consumer, err := conn.Consume(ctx, queueName, postgremq.WithVT(5))
 	require.NoError(t, err, "Failed to create consumer")
 	defer consumer.Stop()
 
 	<-time.After(50 * time.Millisecond)
 	select {
 	case msg := <-consumer.Messages():
-		defer msg.Ack(ctx)
-		initialVT := msg.VT
+		defer func() { _ = msg.Ack(ctx) }()
+		initialVT := msg.GetVT()
 		require.Equal(t, messageID, msg.ID, "Message ID mismatch")
 		newVT, err := msg.SetVT(ctx, 30)
 		require.NoError(t, err, "Failed to set visibility timeout")
@@ -148,7 +148,7 @@ func TestMessageVisibilityTimeout(t *testing.T) {
 		require.NoError(t, err, "Failed to list messages")
 		assert.Len(t, messages, 1, "Expected one message")
 		assert.Greater(t, messages[0].VT.UnixMilli(), initialVT.UnixMilli(), "Expected visibility timeout to be extended")
-	case <-time.After(2 * time.Second):
+	case <-time.After(1 * time.Second):
 		require.Fail(t, "Timeout waiting for message")
 	}
 }
@@ -199,7 +199,7 @@ func TestMessageDelayedDelivery(t *testing.T) {
 		assert.Equal(t, messageID, msg.ID, "Message ID mismatch")
 		err := msg.Ack(ctx)
 		require.NoError(t, err, "Failed to ack message")
-	case <-time.After(2 * time.Second):
+	case <-time.After(1 * time.Second):
 		require.Failf(t, "Timeout waiting for delayed message.", " Logs: \n\t%s", strings.Join(logger.Messages, "\n\t"))
 	}
 }
@@ -255,7 +255,7 @@ func TestMessageDelayedRedelivery(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			assert.Fail(t, "Timeout waiting for delayed message")
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(1 * time.Second):
 		assert.Fail(t, "Timeout waiting for initial message")
 	}
 }
@@ -311,7 +311,7 @@ func TestMessageStatusTransitions(t *testing.T) {
 		messages, err = conn.ListMessages(ctx, queueName)
 		require.NoError(t, err, "Failed to list messages")
 		assert.Equal(t, postgremq.MessageStatusCompleted, messages[0].Status, "Message should be completed after ack")
-	case <-time.After(2 * time.Second):
+	case <-time.After(1 * time.Second):
 		assert.Fail(t, "Timeout waiting for message")
 	}
 }
@@ -363,7 +363,7 @@ func TestMessageProperties(t *testing.T) {
 		// Verify message properties
 		assert.Equal(t, messageID, msg.ID, "Message ID mismatch")
 		assert.Equal(t, 1, msg.DeliveryAttempt, "Expected delivery attempt to be 1")
-		assert.False(t, msg.VT.IsZero(), "Expected valid visibility timeout")
+		assert.False(t, msg.GetVT().IsZero(), "Expected valid visibility timeout")
 
 		// Verify we can unmarshal and access properties
 		var data TestPayload
@@ -378,7 +378,7 @@ func TestMessageProperties(t *testing.T) {
 
 		err = msg.Ack(ctx)
 		require.NoError(t, err, "Failed to ack message")
-	case <-time.After(2 * time.Second):
+	case <-time.After(1 * time.Second):
 		assert.Fail(t, "Timeout waiting for message")
 	}
 }

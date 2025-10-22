@@ -31,10 +31,13 @@ type MockDisconnectingPool struct {
 	FailureError error         // The error to return when failing
 	FailureCount atomic.Int32  // Count of how many failures have occurred
 	Operations   []string      // Record of operations for verification
+	mu           sync.Mutex    // Protects Operations slice
 }
 
 func (m *MockDisconnectingPool) Exec(ctx context.Context, sql string, arguments ...interface{}) (pgconn.CommandTag, error) {
+	m.mu.Lock()
 	m.Operations = append(m.Operations, "Exec")
+	m.mu.Unlock()
 	if m.ShouldFail.Load() {
 		m.FailureCount.Add(1)
 		if m.FailureError != nil {
@@ -46,7 +49,9 @@ func (m *MockDisconnectingPool) Exec(ctx context.Context, sql string, arguments 
 }
 
 func (m *MockDisconnectingPool) Query(ctx context.Context, sql string, args ...interface{}) (pgx.Rows, error) {
+	m.mu.Lock()
 	m.Operations = append(m.Operations, "Query")
+	m.mu.Unlock()
 	if m.ShouldFail.Load() {
 		m.FailureCount.Add(1)
 		if m.FailureError != nil {
@@ -58,7 +63,9 @@ func (m *MockDisconnectingPool) Query(ctx context.Context, sql string, args ...i
 }
 
 func (m *MockDisconnectingPool) QueryRow(ctx context.Context, sql string, args ...interface{}) pgx.Row {
+	m.mu.Lock()
 	m.Operations = append(m.Operations, "QueryRow")
+	m.mu.Unlock()
 	if m.ShouldFail.Load() {
 		m.FailureCount.Add(1)
 		return &mockErrRow{err: errors.New("simulated connection loss")}
@@ -67,7 +74,9 @@ func (m *MockDisconnectingPool) QueryRow(ctx context.Context, sql string, args .
 }
 
 func (m *MockDisconnectingPool) Acquire(ctx context.Context) (*pgxpool.Conn, error) {
+	m.mu.Lock()
 	m.Operations = append(m.Operations, "Acquire")
+	m.mu.Unlock()
 	if m.ShouldFail.Load() {
 		m.FailureCount.Add(1)
 		if m.FailureError != nil {

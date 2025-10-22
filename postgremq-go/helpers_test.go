@@ -88,25 +88,25 @@ func newPostgresContainer(ctx context.Context) (*postgresContainer, error) {
 
 	mappedPort, err := container.MappedPort(ctx, "5432")
 	if err != nil {
-		container.Terminate(ctx)
+		_ = container.Terminate(ctx)
 		return nil, fmt.Errorf("failed to get mapped port: %w", err)
 	}
 
 	host, err := container.Host(ctx)
 	if err != nil {
-		container.Terminate(ctx)
+		_ = container.Terminate(ctx)
 		return nil, fmt.Errorf("failed to get host: %w", err)
 	}
 
 	connString := fmt.Sprintf("postgres://postgres:postgres@%s:%s/postgres", host, mappedPort.Port())
 	config, err := pgxpool.ParseConfig(connString)
 	if err != nil {
-		container.Terminate(ctx)
+		_ = container.Terminate(ctx)
 		return nil, fmt.Errorf("failed to parse connection config: %w", err)
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
-		container.Terminate(ctx)
+		_ = container.Terminate(ctx)
 		return nil, fmt.Errorf("failed to create a pool: %w", err)
 	}
 
