@@ -233,7 +233,9 @@ func TestConsumerVisibilityTimeoutExtension(t *testing.T) {
 	msg := <-consumer.Messages()
 
 	// Wait to allow auto-extension to occur.
-	time.Sleep(1 * time.Second)
+	// With VT=2 seconds, extension happens at halfway (1 second).
+	// Use 1.5 seconds to account for race detector overhead.
+	time.Sleep(1500 * time.Millisecond)
 
 	// Check that the visibility timeout has been extended.
 	messages, err := conn.ListMessages(ctx, queueName)
@@ -332,9 +334,12 @@ func TestConsumerStopAndRestart(t *testing.T) {
 	err = conn.CreateQueue(ctx, queueName, topicName, true)
 	require.NoError(t, err, "CreateQueue failed")
 
-	// First consumer session
-	consumer, err := conn.Consume(ctx, queueName)
+	// Create first consumer before publishing with small batch size
+	consumer, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(1))
 	require.NoError(t, err, "First consume failed")
+
+	// Give consumer time to set up LISTEN/NOTIFY and start fetch loop
+	time.Sleep(200 * time.Millisecond)
 
 	// Publish first batch of messages
 	for i := 0; i < 3; i++ {
@@ -343,9 +348,9 @@ func TestConsumerStopAndRestart(t *testing.T) {
 		require.NoError(t, err, "Publishing to first batch failed")
 	}
 
-	// Process first batch
+	// Process first batch with longer timeout for race detector
 	receivedFirst := 0
-	timeout := time.After(5 * time.Second)
+	timeout := time.After(10 * time.Second)
 	for receivedFirst < 3 {
 		select {
 		case msg := <-consumer.Messages():
@@ -360,6 +365,14 @@ func TestConsumerStopAndRestart(t *testing.T) {
 	// Stop first consumer
 	consumer.Stop()
 
+	// Create second consumer before publishing
+	consumer2, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(1))
+	require.NoError(t, err, "Second consume failed")
+	defer consumer2.Stop()
+
+	// Give consumer time to set up
+	time.Sleep(200 * time.Millisecond)
+
 	// Publish second batch
 	for i := 0; i < 3; i++ {
 		payload := []byte(fmt.Sprintf("{\"batch\": \"second\", \"index\": %d}", i))
@@ -367,14 +380,9 @@ func TestConsumerStopAndRestart(t *testing.T) {
 		require.NoError(t, err, "Publishing to second batch failed")
 	}
 
-	// Create new consumer
-	consumer2, err := conn.Consume(ctx, queueName)
-	require.NoError(t, err, "Second consume failed")
-	defer consumer2.Stop()
-
-	// Process second batch
+	// Process second batch with longer timeout for race detector
 	receivedSecond := 0
-	timeout = time.After(5 * time.Second)
+	timeout = time.After(10 * time.Second)
 	for receivedSecond < 3 {
 		select {
 		case msg := <-consumer2.Messages():

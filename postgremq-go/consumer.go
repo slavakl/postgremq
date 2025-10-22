@@ -122,7 +122,7 @@ func (c *Consumer) startMessageLoop() {
 					continue
 				}
 				fetch = true
-			case <-time.After(fetchAfter.Sub(time.Now())):
+			case <-time.After(time.Until(fetchAfter)):
 				fetch = true
 			}
 
@@ -207,7 +207,7 @@ func (c *Consumer) fetchMessages() time.Time {
 			c.logger.Errorf("Failed to get next visible time: %v", err)
 			return time.Now().Add(1 * time.Second) // retry after 1 second
 		}
-		c.logger.Debugf("Consumer - next available message in %d ms", nextVisibleTime.Sub(time.Now()).Milliseconds())
+		c.logger.Debugf("Consumer - next available message in %d ms", time.Until(nextVisibleTime).Milliseconds())
 		return nextVisibleTime
 	}
 	return time.Time{}
@@ -280,7 +280,7 @@ type vtInfo struct {
 //
 // Returns the timestamp when extension should occur, or now if VT has already expired.
 func calculateExtendAt(vtUntil time.Time) time.Time {
-	remaining := vtUntil.Sub(time.Now())
+	remaining := time.Until(vtUntil)
 	if remaining < 0 {
 		return time.Now()
 	}

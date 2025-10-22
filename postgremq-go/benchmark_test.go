@@ -115,11 +115,6 @@ func BenchmarkMessagePublishing(b *testing.B) {
 		payload := generatePayload(size)
 
 		b.Run(fmt.Sprintf("PayloadSize_%dB", size), func(b *testing.B) {
-			// Limit iterations for faster testing
-			if b.N > 500 && testing.Short() {
-				b.N = 500
-			}
-
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
@@ -165,11 +160,6 @@ func BenchmarkPublishConsume(b *testing.B) {
 		payload := generatePayload(size)
 
 		b.Run(fmt.Sprintf("PayloadSize_%dB", size), func(b *testing.B) {
-			// Only run a reasonable number of iterations for the benchmark
-			if b.N > 1000 {
-				b.N = 1000
-			}
-
 			// Create a consumer
 			consumer, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(10))
 			require.NoError(b, err, "Failed to create consumer")
@@ -251,11 +241,6 @@ func BenchmarkConcurrentConsumers(b *testing.B) {
 
 	for _, numConsumers := range consumerCounts {
 		b.Run(fmt.Sprintf("Consumers_%d", numConsumers), func(b *testing.B) {
-			// Limit iterations for practicality
-			if b.N > 1000 {
-				b.N = 1000
-			}
-
 			// Create multiple connections for consumers
 			consumers := make([]*postgremq.Consumer, numConsumers)
 			connections := make([]*postgremq.Connection, numConsumers)
@@ -375,9 +360,6 @@ func BenchmarkBatchProcessing(b *testing.B) {
 
 	for _, batchSize := range batchSizes {
 		b.Run(fmt.Sprintf("BatchSize_%d", batchSize), func(b *testing.B) {
-			// Since we're using a fixed number of messages, ignore b.N
-			b.N = 1
-
 			// Publish all messages upfront
 			for i := 0; i < totalMessages; i++ {
 				_, err := conn.Publish(ctx, topicName, payload)
