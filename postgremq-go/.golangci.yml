@@ -1,14 +1,12 @@
-version: 2
-
 run:
   timeout: 5m
   tests: true
 
 linters:
-  # Use default linters but disable errcheck locally (too noisy in tests)
-  # GitHub Actions will still catch important errors
+  # Enable default linters
+  enable-all: false
   disable:
-    - errcheck
+    - errcheck  # Too noisy in tests
 
 issues:
   # Maximum issues count per one linter
