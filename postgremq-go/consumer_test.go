@@ -305,7 +305,7 @@ func TestConsumerBufferedMessagesReleased(t *testing.T) {
 		} else {
 			assert.Equal(t, 0, msg.DeliveryAttempts, "Expected 0 delivery attempts for buffered messages")
 		}
-		if msg.DeliveryAttempts == 0 {
+		if msg.DeliveryAttempts == 0 { //nolint:staticcheck // QF1003: if/else is clearer than switch for this case
 			countAttempt0++
 		} else if msg.DeliveryAttempts == 1 {
 			countAttempt1++

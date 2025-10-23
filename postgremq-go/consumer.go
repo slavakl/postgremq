@@ -115,7 +115,7 @@ func (c *Consumer) startMessageLoop() {
 			fetchAfter = minTime(fetchAfter, time.Now().Add(c.checkTimeout))
 			select {
 			case <-c.ctx.Done():
-				break
+				break //nolint:staticcheck // SA4011: Break exits select, line 132 checks ctx.Err() and exits loop
 			case _, ok := <-eventsCh:
 				if !ok {
 					eventsCh = nil // if listener stopped we disable this branch. It means we're shutting down anyway
@@ -328,7 +328,7 @@ func (c *Consumer) startExtendLoop() {
 			// Second phase: handle updates or wait for extension
 			select {
 			case <-c.ctx.Done():
-				break
+				break //nolint:staticcheck // SA4011: Break exits select, line 348 checks ctx.Err() and exits loop
 			case update := <-c.vtMessageUpdates:
 				switch update.op {
 				case messageAdded:

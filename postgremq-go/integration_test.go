@@ -112,14 +112,10 @@ func TestConcurrentMessageProcessing(t *testing.T) {
 	defer waitCancel()
 
 	// Wait for all messages to be processed or timeout
-	for {
-		if totalProcessed.Load() >= int32(numMessages) {
-			break
-		}
+	for totalProcessed.Load() < int32(numMessages) {
 		select {
 		case <-waitCtx.Done():
-			t.Logf("Only processed %d out of %d messages before timeout", totalProcessed.Load(), numMessages)
-			break
+			t.Fatalf("Only processed %d out of %d messages before timeout", totalProcessed.Load(), numMessages)
 		case <-time.After(100 * time.Millisecond):
 			continue
 		}

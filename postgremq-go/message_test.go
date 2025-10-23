@@ -194,12 +194,13 @@ func TestMessageDelayedDelivery(t *testing.T) {
 	require.Len(t, msgs, 1, "Expected one message in the queue")
 
 	// Message should be available after delay
+	// Use 2 seconds timeout to account for race detector overhead
 	select {
 	case msg := <-consumer.Messages():
 		assert.Equal(t, messageID, msg.ID, "Message ID mismatch")
 		err := msg.Ack(ctx)
 		require.NoError(t, err, "Failed to ack message")
-	case <-time.After(1 * time.Second):
+	case <-time.After(2 * time.Second):
 		require.Failf(t, "Timeout waiting for delayed message.", " Logs: \n\t%s", strings.Join(logger.Messages, "\n\t"))
 	}
 }
