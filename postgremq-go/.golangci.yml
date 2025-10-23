@@ -1,12 +1,12 @@
-version: 2
+version: "2"
 
 run:
   timeout: 5m
   tests: true
 
 linters:
-  # Enable default linters
-  enable-all: false
+  # Use standard default linters
+  default: standard
   disable:
     - errcheck  # Too noisy in tests
 
