@@ -50,6 +50,10 @@ func newConsumer(parentCtx context.Context, conn *Connection, logger LevelLogger
 	for _, opt := range opts {
 		opt(&options)
 	}
+	return newConsumerFromOptions(parentCtx, conn, logger, queue, events, options)
+}
+
+func newConsumerFromOptions(parentCtx context.Context, conn *Connection, logger LevelLogger, queue string, events <-chan time.Time, options consumeOptions) (*Consumer, error) {
 	// Validate options
 	if err := validateConsumeOptions(&options); err != nil {
 		return nil, err

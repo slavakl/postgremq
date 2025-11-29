@@ -190,7 +190,45 @@ type consumeOptions struct {
 //
 // Consumer options are passed to Consume to customize fetching, visibility
 // timeout, and auto-extension behavior.
+//
+// ConsumeOption also implements HandlerConsumeOption, so options like WithVT
+// can be passed to both Consume and ConsumeHandler.
 type ConsumeOption func(*consumeOptions)
+
+// apply implements HandlerConsumeOption for ConsumeOption.
+func (o ConsumeOption) apply(opts *handlerConsumeOptions) {
+	o(&opts.consumeOptions)
+}
+
+// handlerConsumeOptions extends consumeOptions with handler-specific settings.
+type handlerConsumeOptions struct {
+	consumeOptions
+	maxInFlight int // 0 means unlimited
+}
+
+// HandlerConsumeOption configures handler consumer behavior.
+//
+// Both ConsumeOption (like WithVT, WithBatchSize) and handler-specific options
+// (like WithMaxInFlight) implement this interface.
+type HandlerConsumeOption interface {
+	apply(*handlerConsumeOptions)
+}
+
+// handlerConsumeOption is for options that only apply to handler consumers.
+type handlerConsumeOption func(*handlerConsumeOptions)
+
+func (o handlerConsumeOption) apply(opts *handlerConsumeOptions) {
+	o(opts)
+}
+
+// WithMaxInFlight sets the maximum number of concurrent handler executions.
+// Default is 0 (unlimited - handlers run as fast as messages arrive).
+// Only applies to ConsumeHandler, ignored by Consume.
+func WithMaxInFlight(n int) HandlerConsumeOption {
+	return handlerConsumeOption(func(o *handlerConsumeOptions) {
+		o.maxInFlight = n
+	})
+}
 
 func defaultConsumeOptions() consumeOptions {
 	return consumeOptions{
@@ -214,6 +252,23 @@ func validateConsumeOptions(options *consumeOptions) error {
 	}
 	if options.vt < 0 {
 		return fmt.Errorf("lock timeout must be positive")
+	}
+	return nil
+}
+
+func defaultHandlerConsumeOptions() handlerConsumeOptions {
+	return handlerConsumeOptions{
+		consumeOptions: defaultConsumeOptions(),
+		maxInFlight:    0, // 0 means unlimited
+	}
+}
+
+func validateHandlerConsumeOptions(options *handlerConsumeOptions) error {
+	if err := validateConsumeOptions(&options.consumeOptions); err != nil {
+		return err
+	}
+	if options.maxInFlight < 0 {
+		return fmt.Errorf("maxInFlight must be non-negative")
 	}
 	return nil
 }

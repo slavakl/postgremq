@@ -19,6 +19,11 @@ var (
 	ErrConnectionClosed = errors.New("connection is stopped")
 )
 
+// Stoppable is implemented by consumers that can be stopped during shutdown.
+type Stoppable interface {
+	Stop()
+}
+
 // Connection is a client handle to the PostgreMQ schema running in a
 // PostgreSQL database. It owns a connection Pool (unless created with
 // DialFromPool), manages consumers and an event listener (LISTEN/NOTIFY), and
@@ -36,7 +41,7 @@ type Connection struct {
 	cancel              context.CancelFunc
 	mu                  sync.RWMutex
 	shutdownTimeout     time.Duration
-	consumers           map[string]*Consumer
+	consumers           []Stoppable
 	eventListener       *EventListener
 	eventListenerDoOnce sync.Once
 	logger              LevelLogger
@@ -73,7 +78,7 @@ func newConnection(ctx context.Context, pool Pool, ownPool bool, opts ...Connect
 		ownPool:             ownPool,
 		ctx:                 ctx,
 		cancel:              cancel,
-		consumers:           make(map[string]*Consumer),
+		consumers:           nil,
 		logger:              NoopLogger{},
 		keepAliveWg:         sync.WaitGroup{},
 		retryConfig:         defaultRetryConfig(),
@@ -117,9 +122,12 @@ func (c *Connection) Close() error {
 
 	// Stop all consumers and wait for in-flight messages
 	var wg sync.WaitGroup
-	for _, consumer := range c.consumers {
+	c.mu.RLock()
+	consumers := c.consumers
+	c.mu.RUnlock()
+	for _, consumer := range consumers {
 		wg.Add(1)
-		go func(cons *Consumer) {
+		go func(cons Stoppable) {
 			defer wg.Done()
 			cons.Stop()
 		}(consumer)
@@ -303,7 +311,7 @@ func (c *Connection) Consume(ctx context.Context, queue string, opts ...ConsumeO
 	if err != nil {
 		return nil, err
 	}
-	c.consumers[queue] = consumer
+	c.consumers = append(c.consumers, consumer)
 	go consumer.start()
 
 	// starting event listener if not already started
@@ -312,6 +320,78 @@ func (c *Connection) Consume(ctx context.Context, queue string, opts ...ConsumeO
 	})
 
 	return consumer, nil
+}
+
+// ConsumeHandler creates a handler-based consumer for the specified queue.
+//
+// The handler function is called for each message. The handler should call
+// msg.Ack() or msg.Nack() to acknowledge or reject the message. If the handler
+// returns without calling either, the message is automatically acked. If the
+// handler panics, the message is automatically nacked.
+//
+// The context passed to the handler is cancelled when the consumer is stopping -
+// handlers should check ctx.Done() and return promptly.
+//
+// Parameters:
+//   - ctx: Context for cancellation. Cancelling this context stops the consumer.
+//   - queue: Name of the queue to consume from.
+//   - handler: Function to process each message.
+//   - opts: Options to configure the handler consumer (WithMaxInFlight, etc.).
+//
+// Example:
+//
+//	hc, err := conn.ConsumeHandler(ctx, "orders",
+//	    func(ctx context.Context, msg *postgremq.Message) {
+//	        select {
+//	        case <-ctx.Done():
+//	            msg.Nack(ctx)
+//	            return
+//	        default:
+//	        }
+//	        if err := processOrder(msg.Payload); err != nil {
+//	            msg.Nack(ctx, postgremq.WithDelayUntil(time.Now().Add(5*time.Second)))
+//	            return
+//	        }
+//	        msg.Ack(ctx)
+//	    },
+//	    postgremq.WithVT(60),
+//	    postgremq.WithMaxInFlight(10),
+//	)
+func (c *Connection) ConsumeHandler(
+	ctx context.Context,
+	queue string,
+	handler MessageHandler,
+	opts ...HandlerConsumeOption,
+) (*HandlerConsumer, error) {
+	// Parse and validate options
+	options := defaultHandlerConsumeOptions()
+	for _, opt := range opts {
+		opt.apply(&options)
+	}
+	if err := validateHandlerConsumeOptions(&options); err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Create consumer using the embedded consumeOptions
+	consumer, err := newConsumerFromOptions(c.ctx, c, c.logger, queue, c.eventListener.AddListener(queue), options.consumeOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	hc := newHandlerConsumer(ctx, c, consumer, handler, c.logger, options)
+
+	c.consumers = append(c.consumers, hc)
+
+	c.eventListenerDoOnce.Do(func() {
+		c.eventListener.Start()
+	})
+
+	go hc.start()
+
+	return hc, nil
 }
 
 // MessageExtension identifies a message to extend in a batch visibility timeout operation.
