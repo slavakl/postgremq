@@ -11,11 +11,25 @@ This directory contains runnable examples demonstrating various PostgreMQ featur
 
 ### 1. Install PostgreMQ schema
 
-First, install the PostgreMQ schema in your PostgreSQL database:
+Install the PostgreMQ schema using one of these methods:
 
+**Option A: Using the CLI (recommended)**
+```bash
+cd ../../cmd/postgremq
+go build -o postgremq .
+./postgremq migrate --dsn "postgres://user:password@localhost:5432/dbname?sslmode=disable"
+```
+
+**Option B: Using psql directly**
 ```bash
 cd ../../mq
 psql -U postgres -d your_database -f sql/latest.sql
+```
+
+**Option C: Programmatically (see migration example)**
+```bash
+cd migration
+go run main.go
 ```
 
 ### 2. Set database connection

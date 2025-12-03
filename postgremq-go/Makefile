@@ -1,4 +1,4 @@
-.PHONY: test test-coverage test-short check lint lint-fix fmt vet clean help
+.PHONY: test test-coverage test-short check lint lint-fix fmt vet clean help build-cli
 
 # Default target
 .DEFAULT_GOAL := help
@@ -48,6 +48,12 @@ vet:
 clean:
 	rm -f coverage.out coverage.html
 	go clean -testcache
+
+## build-cli: Build the postgremq CLI tool
+build-cli:
+	@echo "Building postgremq CLI..."
+	@cd ../cmd/postgremq && go build -o postgremq .
+	@echo "✓ CLI built at cmd/postgremq/postgremq"
 
 ## help: Show this help message
 help:

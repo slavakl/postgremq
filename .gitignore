@@ -93,6 +93,14 @@ postgremq-go/coverage.out
 *.test
 *.out
 
+# CLI binary
+cmd/postgremq/postgremq
+
+# Example binaries
+postgremq-go/examples/basic/basic
+postgremq-go/examples/transactions/transactions
+postgremq-go/examples/migration/migration
+
 # Claude Code and AI assistant files
 CLAUDE.md
 .claude/
