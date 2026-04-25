@@ -114,3 +114,5 @@ postgremq-ts/coverage/
 *.tmp
 *.temp
 .scratch/
+
+tmp/
