@@ -34,14 +34,14 @@
  *
  * Event Notifications
  * -------------------
- * Several operations emit LISTEN/NOTIFY events on channel `postgremq_events`.
- * The payload is a JSON object with shape:
- *   { "event": <text>, "queues": <text[]>, "vt": <timestamptz|null> }
- * Emitted events:
- *   - "message_published" by the distribution trigger after a publish
- *   - "message_nacked" when `nack_message` resets a message
- *   - "message_released" when `release_message` returns a message to pending
- * Clients can LISTEN to this channel to promptly react to new availability.
+ * Several operations emit LISTEN/NOTIFY events on per-topic and per-queue
+ * channels. The payload is the affected message id as plain text.
+ *   - publishes:           channel `pmq:t:<topic>`, payload `<message_id>`
+ *   - nack/release:        channel `pmq:q:<queue>`, payload `<message_id>`
+ * Clients LISTEN to the channels they care about; refcounted LISTEN/UNLISTEN
+ * is the client's responsibility. Channel names are derived from topic and
+ * queue names, which are validated at create time to be safe NOTIFY identifiers
+ * (matching `^[A-Za-z0-9_:.\-]+$`).
  *
  * Table Relationships and Cascade Behavior:
  * - topics: The root table containing topic names
@@ -138,41 +138,30 @@ WHERE status IN ('pending', 'processing');
  *   Trigger function that fans a newly published message (row in `messages`)
  *   out to all queues subscribed to the message's topic. For each matching
  *   queue, it inserts a row into `queue_messages` with initial vt set to the
- *   message's `deliver_after`. It also NOTIFY-s on channel `postgremq_events`
- *   with an event payload `{event:"message_published", queues:[...], vt: NEW.deliver_after}`.
+ *   message's `deliver_after`. It NOTIFYs once on the per-topic channel
+ *   `pmq:t:<topic>` with the message id as plain text.
  *
  * Trigger:
  *   - Installed as AFTER INSERT trigger `after_message_insert` on `messages`.
  *
  * Side Effects:
  *   - Inserts multiple rows into `queue_messages`.
- *   - Emits a NOTIFY event used by clients for push-based wakeups.
+ *   - Emits a single NOTIFY event used by clients for push-based wakeups.
  *
  * Returns:
  *   The unmodified NEW row for the `messages` table.
  */
-CREATE OR REPLACE FUNCTION distribute_message() 
+CREATE OR REPLACE FUNCTION distribute_message()
 RETURNS trigger AS $$
-DECLARE
-   published_queues TEXT[];
 BEGIN
-   WITH ins AS (
-     INSERT INTO queue_messages(queue_name, message_id, vt)
-     SELECT q.name, NEW.id, NEW.deliver_after
-     FROM queues q
-     WHERE q.topic_name = NEW.topic_name
-       AND (NOT q.exclusive OR q.keep_alive_until > NOW())
-     RETURNING queue_name
-   )
-   SELECT array_agg(queue_name) INTO published_queues FROM ins;
-   
-   PERFORM pg_notify('postgremq_events', 
-      json_build_object(
-         'event', 'message_published',
-         'queues', published_queues,
-         'vt', NEW.deliver_after
-      )::text);
-      
+   INSERT INTO queue_messages(queue_name, message_id, vt)
+   SELECT q.name, NEW.id, NEW.deliver_after
+   FROM queues q
+   WHERE q.topic_name = NEW.topic_name
+     AND (NOT q.exclusive OR q.keep_alive_until > NOW());
+
+   PERFORM pg_notify('pmq:t:' || NEW.topic_name, NEW.id::text);
+
    RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -191,11 +180,11 @@ $$ LANGUAGE plpgsql;
  *   For each newly inserted message, this trigger:
  *   1. Finds all active queues subscribed to the message's topic
  *   2. Creates queue_message entries for each queue via distribute_message()
- *   3. Emits NOTIFY event to wake up waiting consumers
+ *   3. Emits a single NOTIFY event on `pmq:t:<topic>` to wake consumers
  *
  * Side Effects:
  *   - Multiple inserts into queue_messages (one per subscribed queue)
- *   - NOTIFY on 'postgremq_events' channel with payload containing affected queue names
+ *   - NOTIFY on the per-topic channel `pmq:t:<topic>` with the message id as plain text
  *   - Exclusive queues with expired keep_alive_until are excluded from distribution
  */
 CREATE TRIGGER after_message_insert
@@ -221,6 +210,9 @@ EXECUTE FUNCTION distribute_message();
 CREATE OR REPLACE FUNCTION create_topic(p_topic VARCHAR(255))
 RETURNS VARCHAR(255) AS $$
 BEGIN
+  IF p_topic IS NULL OR p_topic !~ '^[A-Za-z0-9_:.\-]+$' THEN
+    RAISE EXCEPTION 'Invalid topic name "%": must match ^[A-Za-z0-9_:.\-]+$', p_topic;
+  END IF;
   INSERT INTO topics(name) VALUES (p_topic)
   ON CONFLICT (name) DO NOTHING;
   RETURN p_topic;
@@ -255,6 +247,9 @@ CREATE OR REPLACE FUNCTION create_queue(
     p_keep_alive_sec INTEGER DEFAULT 30
 ) RETURNS VOID AS $$
 BEGIN
+    IF p_queue_name IS NULL OR p_queue_name !~ '^[A-Za-z0-9_:.\-]+$' THEN
+        RAISE EXCEPTION 'Invalid queue name "%": must match ^[A-Za-z0-9_:.\-]+$', p_queue_name;
+    END IF;
     INSERT INTO queues (
         name,
         topic_name,
@@ -266,7 +261,7 @@ BEGIN
         p_topic_name,
         p_max_attempts,
         p_exclusive,
-        CASE 
+        CASE
             WHEN p_exclusive THEN NOW() + make_interval(secs => p_keep_alive_sec)
             ELSE NULL
         END
@@ -447,8 +442,16 @@ CREATE OR REPLACE FUNCTION nack_message(
     p_delay_until TIMESTAMPTZ DEFAULT NOW()
 ) RETURNS VOID AS $$
 DECLARE
-    published_queues TEXT[];
+    v_attempts     INT;
+    v_max_attempts INT;
 BEGIN
+    -- Look up the queue's retry limit. We need this to decide between the
+    -- "reset to pending" path and the "inline DLQ retirement" path.
+    SELECT max_delivery_attempts INTO v_max_attempts
+    FROM queues WHERE name = p_queue_name;
+
+    -- Reset to pending. RETURNING gives us the (post-consume-increment)
+    -- delivery_attempts so we can decide whether this was the final attempt.
     UPDATE queue_messages
     SET status = 'pending',
         vt = p_delay_until,
@@ -456,21 +459,28 @@ BEGIN
     WHERE queue_name = p_queue_name
         AND message_id = p_message_id
         AND status = 'processing'
-        AND consumer_token = p_consumer_token;
-        
+        AND consumer_token = p_consumer_token
+    RETURNING delivery_attempts INTO v_attempts;
+
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Nack failed: message not in processing state or token mismatch';
     END IF;
-    
-    published_queues := ARRAY[p_queue_name];
-    
-    PERFORM pg_notify('postgremq_events',
-        json_build_object(
-            'event', 'message_nacked',
-            'queues', published_queues,
-            'vt', p_delay_until
-        )::text);
-        
+
+    IF v_max_attempts > 0 AND v_attempts >= v_max_attempts THEN
+        -- Final attempt: retire to DLQ inline.
+        INSERT INTO dead_letter_queue(queue_name, message_id, retry_count)
+        VALUES (p_queue_name, p_message_id, v_attempts)
+        ON CONFLICT (queue_name, message_id) DO NOTHING;
+
+        DELETE FROM queue_messages
+        WHERE queue_name = p_queue_name
+          AND message_id = p_message_id;
+        -- No NOTIFY here: there's nothing to consume on this queue any more.
+    ELSE
+        -- Wake up consumers of this queue so redelivery is prompt.
+        PERFORM pg_notify('pmq:q:' || p_queue_name, p_message_id::text);
+    END IF;
+
     RETURN;
 END;
 $$ LANGUAGE plpgsql;
@@ -496,8 +506,6 @@ CREATE OR REPLACE FUNCTION release_message(
     p_consumer_token VARCHAR(64)
 )
     RETURNS VOID AS $$
-DECLARE
-    published_queues TEXT[];
 BEGIN
     UPDATE queue_messages
     SET status = 'pending',
@@ -513,10 +521,7 @@ BEGIN
         RAISE EXCEPTION 'Release message failed: message not in processing state or token mismatch';
     END IF;
 
-    published_queues := ARRAY[p_queue_name];
-
-    PERFORM pg_notify('postgremq_events',
-                      json_build_object('event', 'message_released', 'queues', published_queues)::text);
+    PERFORM pg_notify('pmq:q:' || p_queue_name, p_message_id::text);
 
     RETURN;
 END;

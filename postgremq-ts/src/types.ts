@@ -188,6 +188,12 @@ export interface ConsumerOptions {
   };
   /** Polling interval in milliseconds (when no messages and no notifications) */
   pollingIntervalMs?: number;
+  /**
+   * Topic name for the consumed queue. When set, bypasses the internal
+   * queue->topic cache and any database lookup. Use when the caller already
+   * knows the topic (e.g. consuming a queue created out-of-band).
+   */
+  topic?: string;
 }
 
 /**

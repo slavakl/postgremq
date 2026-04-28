@@ -66,7 +66,9 @@ func TestConcurrentMessageProcessing(t *testing.T) {
 			require.NoError(t, err, "Failed to create consumer connection")
 			defer consumerConn.Close()
 
-			consumer, err := consumerConn.Consume(ctx, queueName)
+			// Each consumer uses its own Connection, so its topic cache is
+			// empty for queueName. Pass the topic explicitly.
+			consumer, err := consumerConn.Consume(ctx, queueName, postgremq.WithTopic(topicName))
 			require.NoError(t, err, "Failed to create consumer")
 			defer consumer.Stop()
 

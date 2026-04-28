@@ -321,25 +321,24 @@ describe('Connection', () => {
 
       const messages = consumer.messages();
 
-      // First attempt - nack
+      // First attempt — nack (not the final attempt).
       const { value: msg1 } = await messages.next();
       await msg1.nack();
 
-      // Second attempt - nack (should hit max)
+      // Second attempt — nack triggers inline DLQ retirement.
       const { value: msg2 } = await messages.next();
-      expect(msg2.id).toBe(msg1.id); // Ensure it's the same message
+      expect(msg2.id).toBe(msg1.id);
       await msg2.nack();
 
-      // Stop consumer after both nacks
       await consumer.stop();
-
       await sleep(100);
 
-      // Explicitly move messages to DLQ
+      // Inline retirement: the message is in DLQ already.
+      // moveToDLQ is the recovery path for crashed-on-final-attempt rows;
+      // here it should find nothing more to move.
       const movedCount = await connection.moveToDLQ();
-      expect(movedCount).toBe(1);
+      expect(movedCount).toBe(0);
 
-      // Message should be in DLQ now
       const dlqMessages = await connection.listDLQMessages();
       expect(dlqMessages.length).toBe(1);
       expect(dlqMessages[0].retryCount).toBe(2);

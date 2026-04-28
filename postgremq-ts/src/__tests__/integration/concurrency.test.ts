@@ -442,19 +442,24 @@ describe('Concurrency', () => {
       const conn3 = new Connection({ connectionString: isolatedConnStr! });
       await Promise.all([conn1.connect(), conn2.connect(), conn3.connect()]);
 
+      // The queue was created on `connection`; conn1/2/3 don't have it in
+      // their topic cache, so we must pass `topic` explicitly.
       const consumer1 = conn1.consume('multi-conn-queue', {
         batchSize: 5,
-        visibilityTimeoutSec: 30
+        visibilityTimeoutSec: 30,
+        topic: 'multi-conn-topic'
       });
 
       const consumer2 = conn2.consume('multi-conn-queue', {
         batchSize: 5,
-        visibilityTimeoutSec: 30
+        visibilityTimeoutSec: 30,
+        topic: 'multi-conn-topic'
       });
 
       const consumer3 = conn3.consume('multi-conn-queue', {
         batchSize: 5,
-        visibilityTimeoutSec: 30
+        visibilityTimeoutSec: 30,
+        topic: 'multi-conn-topic'
       });
 
       const received1: any[] = [];

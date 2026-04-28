@@ -596,38 +596,37 @@ def test_requeue_dlq_messages_resets_delivery_attempts(cur):
     assert dlq_count == 0, "DLQ should be empty after requeue"
 
 def test_delayed_message_delivery_notifications(cur: psycopg2.extensions.cursor) -> None:
-    """Test that notifications include correct VT for delayed messages."""
+    """Publish-side NOTIFY now fires on per-topic channel pmq:t:<topic> with the message id as plain-text payload."""
     cur.execute("SELECT create_topic('TestTopic')")
     cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 2, false)")
-    
-    # Listen for notifications
-    cur.execute("LISTEN postgremq_events")
-    
+
+    # Listen on the per-topic channel.
+    cur.execute('LISTEN "pmq:t:TestTopic"')
+
     # Publish message with 2 second delay
     delay_time = datetime.now(pytz.UTC) + timedelta(seconds=2)
     cur.execute("""
         SELECT publish_message('TestTopic', '{"test":"data"}'::jsonb, %s)
     """, (delay_time,))
-    
+    msg_id = cur.fetchone()[0]
+
     # Get notification
     conn = cur.connection
     conn.poll()
     notify = conn.notifies.pop(0)
-    
-    notification = json.loads(notify.payload)
-    assert notification['event'] == 'message_published'
-    assert 'TestQueue' in notification['queues']
-    assert abs(parse_timestamp(notification['vt']) - delay_time) < timedelta(milliseconds=100)
-    
+
+    assert notify.channel == 'pmq:t:TestTopic'
+    assert int(notify.payload) == msg_id
+
     # Try to consume immediately - should get no messages
     cur.execute("""
         SELECT * FROM consume_message('TestQueue', 30)
     """)
     assert cur.fetchone() is None
-    
+
     # Wait for delay
     time.sleep(2)
-    
+
     # Now should get the message
     cur.execute("""
         SELECT * FROM consume_message('TestQueue', 30)
@@ -635,46 +634,44 @@ def test_delayed_message_delivery_notifications(cur: psycopg2.extensions.cursor)
     assert cur.fetchone() is not None
 
 def test_delayed_nack_notifications(cur: psycopg2.extensions.cursor) -> None:
-    """Test that notifications include correct VT for nacked messages."""
+    """Nack now fires NOTIFY on the per-queue channel pmq:q:<queue> with the message id as payload."""
     cur.execute("SELECT create_topic('TestTopic')")
     cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 2, false)")
-    
+
     # Publish and consume message
     cur.execute("SELECT publish_message('TestTopic', '{\"test\":\"data\"}'::jsonb)")
     cur.execute("""
-        SELECT message_id, consumer_token 
+        SELECT message_id, consumer_token
         FROM consume_message('TestQueue', 30)
     """)
     msg_id, token = cur.fetchone()
-    
-    # Listen for notifications
-    cur.execute("LISTEN postgremq_events")
-    
+
+    # Listen on the per-queue channel.
+    cur.execute('LISTEN "pmq:q:TestQueue"')
+
     # Nack with 2 second delay
     delay_time = datetime.now(pytz.UTC) + timedelta(seconds=2)
     cur.execute("""
         SELECT nack_message('TestQueue', %s, %s, %s)
     """, (msg_id, token, delay_time))
-    
+
     # Get notification
     conn = cur.connection
     conn.poll()
     notify = conn.notifies.pop(0)
-    
-    notification = json.loads(notify.payload)
-    assert notification['event'] == 'message_nacked'
-    assert 'TestQueue' in notification['queues']
-    assert abs(parse_timestamp(notification['vt']) - delay_time) < timedelta(milliseconds=100)
-    
+
+    assert notify.channel == 'pmq:q:TestQueue'
+    assert int(notify.payload) == msg_id
+
     # Try to consume immediately - should get no messages
     cur.execute("""
         SELECT * FROM consume_message('TestQueue', 30)
     """)
     assert cur.fetchone() is None
-    
+
     # Wait for delay
     time.sleep(2)
-    
+
     # Now should get the message
     cur.execute("""
         SELECT * FROM consume_message('TestQueue', 30)
@@ -682,6 +679,127 @@ def test_delayed_nack_notifications(cur: psycopg2.extensions.cursor) -> None:
     msg = cur.fetchone()
     assert msg is not None
     assert msg[1] == msg_id  # message_id matches
+
+def test_release_message_emits_per_queue_notify(cur: psycopg2.extensions.cursor) -> None:
+    """release_message now fires NOTIFY on pmq:q:<queue> with the message id as payload."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 0, false)")
+
+    cur.execute("SELECT publish_message('TestTopic', '{\"k\":\"v\"}'::jsonb)")
+    cur.execute("SELECT message_id, consumer_token FROM consume_message('TestQueue', 30)")
+    msg_id, token = cur.fetchone()
+
+    cur.execute('LISTEN "pmq:q:TestQueue"')
+    cur.execute("SELECT release_message('TestQueue', %s, %s)", (msg_id, token))
+
+    conn = cur.connection
+    conn.poll()
+    notify = conn.notifies.pop(0)
+    assert notify.channel == 'pmq:q:TestQueue'
+    assert int(notify.payload) == msg_id
+
+def test_create_topic_validates_name(cur: psycopg2.extensions.cursor) -> None:
+    """create_topic rejects names with characters that wouldn't be safe as NOTIFY channel suffixes."""
+    cur.execute("SELECT create_topic('valid_topic-1.2:3')")  # all permitted chars
+    for bad in ["topic with spaces", "topic'name", 'topic"name', "topic;name", ""]:
+        try:
+            cur.execute("SELECT create_topic(%s)", (bad,))
+            raise AssertionError(f"create_topic should have rejected {bad!r}")
+        except psycopg2.Error:
+            cur.connection.rollback()
+
+def test_create_queue_validates_name(cur: psycopg2.extensions.cursor) -> None:
+    """create_queue rejects names with characters that wouldn't be safe as NOTIFY channel suffixes."""
+    cur.execute("SELECT create_topic('Topic')")
+    cur.execute("SELECT create_queue('valid_queue-1.2:3', 'Topic', 0, false)")
+    for bad in ["queue with spaces", "queue'name", 'queue"name', "queue;name", ""]:
+        try:
+            cur.execute("SELECT create_queue(%s, 'Topic', 0, false)", (bad,))
+            raise AssertionError(f"create_queue should have rejected {bad!r}")
+        except psycopg2.Error:
+            cur.connection.rollback()
+
+def test_nack_final_attempt_inline_dlq(cur: psycopg2.extensions.cursor) -> None:
+    """Final-attempt nack moves the row to DLQ inline (no maintenance call needed)."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 2, false)")  # max_attempts=2
+    cur.execute("SELECT publish_message('TestTopic', '{\"k\":\"v\"}'::jsonb)")
+
+    # First consume + nack: not the final attempt, message resets to pending.
+    cur.execute("""
+        SELECT message_id, consumer_token FROM consume_message('TestQueue', 30)
+    """)
+    msg_id, token = cur.fetchone()
+    cur.execute("SELECT nack_message('TestQueue', %s, %s, NOW())", (msg_id, token))
+
+    cur.execute("""
+        SELECT status, delivery_attempts FROM queue_messages
+        WHERE queue_name='TestQueue' AND message_id=%s
+    """, (msg_id,))
+    row = cur.fetchone()
+    assert row['status'] == 'pending'
+    assert row['delivery_attempts'] == 1
+
+    # Second consume + nack: this is the final attempt; should retire inline.
+    cur.execute("""
+        SELECT message_id, consumer_token FROM consume_message('TestQueue', 30)
+    """)
+    msg_id2, token2 = cur.fetchone()
+    assert msg_id2 == msg_id
+
+    cur.execute("SELECT nack_message('TestQueue', %s, %s, NOW())", (msg_id, token2))
+
+    # Row should be gone from queue_messages and present in DLQ — without
+    # any maintenance call.
+    cur.execute("""
+        SELECT 1 FROM queue_messages
+        WHERE queue_name='TestQueue' AND message_id=%s
+    """, (msg_id,))
+    assert cur.fetchone() is None
+
+    cur.execute("""
+        SELECT retry_count FROM dead_letter_queue
+        WHERE queue_name='TestQueue' AND message_id=%s
+    """, (msg_id,))
+    dlq_row = cur.fetchone()
+    assert dlq_row is not None
+    assert dlq_row['retry_count'] == 2
+
+def test_nack_non_final_does_not_dlq(cur: psycopg2.extensions.cursor) -> None:
+    """A non-final nack must not retire the message to DLQ even if retries remain."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 5, false)")
+    cur.execute("SELECT publish_message('TestTopic', '{\"k\":\"v\"}'::jsonb)")
+
+    cur.execute("SELECT message_id, consumer_token FROM consume_message('TestQueue', 30)")
+    msg_id, token = cur.fetchone()
+    cur.execute("SELECT nack_message('TestQueue', %s, %s, NOW())", (msg_id, token))
+
+    cur.execute("""
+        SELECT status FROM queue_messages
+        WHERE queue_name='TestQueue' AND message_id=%s
+    """, (msg_id,))
+    assert cur.fetchone()['status'] == 'pending'
+
+    cur.execute("""
+        SELECT 1 FROM dead_letter_queue
+        WHERE queue_name='TestQueue' AND message_id=%s
+    """, (msg_id,))
+    assert cur.fetchone() is None
+
+def test_unlimited_attempts_never_dlq_inline(cur: psycopg2.extensions.cursor) -> None:
+    """When max_delivery_attempts=0 (unlimited), nack must never retire inline."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 0, false)")
+    cur.execute("SELECT publish_message('TestTopic', '{\"k\":\"v\"}'::jsonb)")
+
+    for _ in range(5):
+        cur.execute("SELECT message_id, consumer_token FROM consume_message('TestQueue', 30)")
+        msg_id, token = cur.fetchone()
+        cur.execute("SELECT nack_message('TestQueue', %s, %s, NOW())", (msg_id, token))
+
+    cur.execute("SELECT count(*) FROM dead_letter_queue WHERE queue_name='TestQueue'")
+    assert cur.fetchone()[0] == 0
 
 def parse_timestamp(ts_str: str) -> datetime:
     """Parse timestamp from notification."""

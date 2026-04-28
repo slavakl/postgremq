@@ -25,6 +25,20 @@ import {
 import { Consumer as ConsumerImpl } from './consumer';
 import { EventEmitter, DEFAULT_RETRY_POLICY, shouldRetry, sleep, withRetry } from './utils';
 
+/** Subscriber callback receives the message id parsed from the NOTIFY payload. */
+type SubscriberCallback = (messageId: number) => void;
+
+interface ChannelState {
+  refCount: number;
+  /** True when LISTEN has been issued on the active notify client. */
+  listening: boolean;
+  subscribers: Set<SubscriberCallback>;
+}
+
+function quoteIdent(s: string): string {
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
 // Forward declaration for Consumer
 // export class Consumer {
 //   constructor(queueName: string, connection: Connection, options?: Partial<ConsumerOptions>) {}
@@ -45,34 +59,52 @@ export class Connection implements IConnection {
 
   /** Client for notifications */
   private notifyClient: PoolClient | null = null;
-  
-  /** Event emitter for notification events */
-  private eventEmitter: EventEmitter = new EventEmitter();
-  
+
   /** Flag indicating if client is shutting down */
   private isShuttingDown: boolean = false;
-  
+
   /** Set of active consumers */
   private consumers: Set<ConsumerImpl> = new Set();
-  
+
   /** Map of exclusive queue keep-alive timeouts */
   private exclusiveQueueTimers: Map<string, NodeJS.Timeout> = new Map();
-  
+
   /** Map of exclusive queue keep-alive intervals in seconds */
   private exclusiveQueueIntervals: Map<string, number> = new Map();
-  
+
   /** Retry policy for operations */
   private retryPolicy: RetryPolicy;
-  
+
   /** Shutdown timeout in milliseconds */
   private shutdownTimeoutMs: number;
-  
+
   /** Flag indicating if client is connected */
   private connected: boolean = false;
-  
+
   /** Flag indicating if notification listener is active */
   private notificationListenerActive: boolean = false;
   private stoppingNotify: boolean = false;
+
+  /**
+   * Refcounted state for each NOTIFY channel we want to receive events on.
+   * The first subscriber to a channel triggers a LISTEN; the last unsubscribe
+   * triggers UNLISTEN. Multiple consumers on the same topic share one
+   * physical LISTEN.
+   */
+  private channelStates: Map<string, ChannelState> = new Map();
+
+  /**
+   * Cache of queue name -> topic name. Populated by createQueue (and by
+   * explicit `topic` option when consume() is called) so consume() knows
+   * which per-topic channel to subscribe to without querying the database.
+   */
+  private topicCache: Map<string, string> = new Map();
+
+  /**
+   * Promise used to serialise concurrent listener startup so multiple
+   * consumers don't each acquire their own notify client.
+   */
+  private notifyStartupPromise: Promise<void> | null = null;
 
   /**
    * Create a new connection manager
@@ -205,8 +237,9 @@ export class Connection implements IConnection {
         if (poolTimeoutId) clearTimeout(poolTimeoutId);
       }
       
-      // Clean up event listeners
-      this.eventEmitter.removeAllListeners();
+      // Clean up channel state
+      this.channelStates.clear();
+      this.topicCache.clear();
 
       this.connected = false;
       // Keep isShuttingDown true - connection cannot be reused after close
@@ -237,60 +270,152 @@ export class Connection implements IConnection {
     if (this.notifyClient || this.isShuttingDown || this.notificationListenerActive) {
       return;
     }
-    
-    try {
-      // Get a dedicated client for notifications
-      this.notifyClient = await this.pool.connect();
-      
-      // Set up notification handling
-      this.notifyClient.on('notification', msg => {
-        try {
-          // Parse the payload
-          const notification = JSON.parse(msg.payload!) as NotificationEvent;
+    if (this.notifyStartupPromise) {
+      return this.notifyStartupPromise;
+    }
 
-          // Emit event to listeners
-          this.eventEmitter.emit(msg.channel, notification);
+    this.notifyStartupPromise = (async () => {
+      try {
+        // Acquire dedicated client for LISTEN/NOTIFY.
+        const client = await this.pool.connect();
+        this.notifyClient = client;
 
-          // If this is a queue notification, also emit to specific queue channels
-          if (notification.queues && notification.queues.length > 0) {
-            for (const queue of notification.queues) {
-              this.eventEmitter.emit(`queue:${queue}`, notification);
+        // Dispatch by channel name; payload is the affected message id as
+        // plain text (`pmq:t:<topic>` for publishes, `pmq:q:<queue>` for
+        // nack/release). LISTEN/UNLISTEN are issued directly on this same
+        // client by subscribeChannel, so no control channel is needed.
+        client.on('notification', (msg) => {
+          if (!msg.channel) return;
+          const state = this.channelStates.get(msg.channel);
+          if (!state || state.subscribers.size === 0) {
+            return;
+          }
+          const id = parseInt(msg.payload ?? '', 10);
+          const messageId = Number.isFinite(id) ? id : 0;
+          for (const cb of state.subscribers) {
+            try {
+              cb(messageId);
+            } catch (err) {
+              console.error('Subscriber callback error:', err);
             }
           }
-        } catch (error) {
-          console.error('Failed to parse notification:', {
-            channel: msg.channel,
-            payload: msg.payload,
-            error: error instanceof Error ? error.message : String(error)
-          });
-          // Emit parse error event for monitoring
-          this.eventEmitter.emit('notification-error', {
-            channel: msg.channel,
-            payload: msg.payload,
-            error
+        });
+
+        client.on('error', (error) => {
+          this.handleNotifyClientError(error);
+        });
+
+        // Re-issue LISTEN for any channels that already have subscribers
+        // (typical after an automatic reconnect).
+        for (const [channel, state] of this.channelStates) {
+          if (state.refCount > 0 && !state.listening) {
+            await client.query('LISTEN ' + quoteIdent(channel));
+            state.listening = true;
+          }
+        }
+
+        this.notificationListenerActive = true;
+      } catch (error: any) {
+        if (this.notifyClient) {
+          try { this.notifyClient.release(); } catch {}
+          this.notifyClient = null;
+        }
+        this.notificationListenerActive = false;
+        throw new Error(`Failed to start notification listener: ${error.message}`);
+      } finally {
+        this.notifyStartupPromise = null;
+      }
+    })();
+    return this.notifyStartupPromise;
+  }
+
+  /**
+   * Subscribe to NOTIFY events on a single channel. Refcounts the channel so
+   * the first subscriber issues LISTEN and the last unsubscribe issues
+   * UNLISTEN. Returns an unsubscribe function.
+   * @internal
+   */
+  private subscribeChannel(channel: string, callback: SubscriberCallback): () => void {
+    let state = this.channelStates.get(channel);
+    if (!state) {
+      state = { refCount: 0, listening: false, subscribers: new Set() };
+      this.channelStates.set(channel, state);
+    }
+    state.refCount += 1;
+    state.subscribers.add(callback);
+
+    if (state.refCount === 1 && this.notifyClient && !state.listening) {
+      // Fire-and-forget LISTEN; the new connection handler also issues this
+      // on reconnect so we don't need to await here.
+      const c = this.notifyClient;
+      const stateRef = state;
+      c.query('LISTEN ' + quoteIdent(channel))
+        .then(() => { stateRef.listening = true; })
+        .catch((err) => {
+          if (this.isShuttingDown) return;
+          console.warn(`LISTEN ${channel} failed:`, err?.message ?? err);
+          // Without recovery, the channel's refCount stays >0 but no LISTEN
+          // is active — consumers fall back to polling forever. Treat as a
+          // client failure so handleNotifyClientError tears down and the
+          // reconnect path re-issues every desired LISTEN.
+          this.handleNotifyClientError(err);
+        });
+    }
+
+    return () => {
+      const s = this.channelStates.get(channel);
+      if (!s) return;
+      s.subscribers.delete(callback);
+      s.refCount -= 1;
+      if (s.refCount <= 0) {
+        this.channelStates.delete(channel);
+        if (this.notifyClient && s.listening && !this.isShuttingDown) {
+          const c = this.notifyClient;
+          c.query('UNLISTEN ' + quoteIdent(channel)).catch((err) => {
+            if (!this.isShuttingDown) {
+              console.warn(`UNLISTEN ${channel} failed:`, err?.message ?? err);
+            }
           });
         }
-      });
-      
-      // Listen for message events on the postgremq_events channel
-      await this.notifyClient.query('LISTEN postgremq_events');
-      
-      // Set up error handling
-      this.notifyClient.on('error', (error) => {
-        this.handleNotifyClientError(error);
-      });
-      
-      this.notificationListenerActive = true;
-    } catch (error: any) {
-      if (this.notifyClient) {
-        this.notifyClient.release();
-        this.notifyClient = null;
       }
-      
-      this.notificationListenerActive = false;
-      throw new Error(`Failed to start notification listener: ${error.message}`);
-    }
+    };
   }
+
+  /**
+   * Subscribe a consumer to both the per-topic publish channel and the
+   * per-queue nack/release channel. Returns a single unsubscribe function
+   * that drops both subscriptions.
+   * @internal
+   */
+  subscribeForConsumer(
+    queue: string,
+    topic: string,
+    callback: SubscriberCallback
+  ): () => void {
+    const offTopic = this.subscribeChannel('pmq:t:' + topic, callback);
+    const offQueue = this.subscribeChannel('pmq:q:' + queue, callback);
+    return () => {
+      offTopic();
+      offQueue();
+    };
+  }
+
+  /**
+   * Resolve a queue's topic. Lookup order: explicit override > in-memory
+   * cache. If neither is available, throws — callers must either pass
+   * `topic` to consume() or have populated the cache via createQueue.
+   * @internal
+   */
+  resolveTopic(queue: string, explicit?: string): string {
+    if (explicit) {
+      this.topicCache.set(queue, explicit);
+      return explicit;
+    }
+    const cached = this.topicCache.get(queue);
+    if (cached) return cached;
+    throw new Error(`Queue "${queue}" topic unknown — pass options.topic to consume() or call createQueue() first`);
+  }
+
   
   /**
    * Handle errors from the notification client
@@ -314,8 +439,16 @@ export class Connection implements IConnection {
       }
       this.notifyClient = null;
     }
-    
+
     this.notificationListenerActive = false;
+
+    // Reset per-channel listening flags so the next startNotificationListener
+    // re-issues LISTEN on the new client. Without this, the `!state.listening`
+    // guard in startNotificationListener skips channels that were marked
+    // listening on the now-dead client, leaving consumers without wake events.
+    for (const state of this.channelStates.values()) {
+      state.listening = false;
+    }
     
     // Use setTimeout to avoid potential recursion
     if (!this.isShuttingDown && this.consumers.size > 0 && !this.stoppingNotify) {
@@ -382,21 +515,14 @@ export class Connection implements IConnection {
       }
       this.notificationListenerActive = false;
       this.stoppingNotify = false;
+      // The released client's LISTENs are gone; clear flags so a future
+      // startNotificationListener will re-issue them on the new client.
+      for (const state of this.channelStates.values()) {
+        state.listening = false;
+      }
     }
   }
 
-  /**
-   * Subscribe to events for a specific queue
-   * @internal
-   * @param queueName - The queue name to subscribe to
-   * @param callback - The callback function to invoke on events
-   * @returns Unsubscribe function
-   */
-  subscribeToQueue(queueName: string, callback: (event: NotificationEvent) => void): () => void {
-    const channel = `queue:${queueName}`;
-    this.eventEmitter.on(channel, callback);
-    return () => this.eventEmitter.off(channel, callback);
-  }
 
   /**
    * Execute an operation with retry logic
@@ -527,6 +653,9 @@ export class Connection implements IConnection {
         this.startQueueKeepAlive(name, options.keepAliveSeconds);
       }
     });
+    // Cache the queue->topic mapping so consume() can subscribe to the
+    // per-topic publish channel without an extra DB lookup.
+    this.topicCache.set(name, topic);
   }
 
   /**
@@ -553,13 +682,19 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     // Cancel any keep-alive timer for this queue
     this.stopQueueKeepAlive(queue);
-    
+
     await this.executeWithRetry(async (client) => {
       await client.query('SELECT delete_queue($1)', [queue]);
     });
+
+    // Invalidate the cached topic mapping. If the queue is recreated under
+    // a different topic later, the next consume() call must re-resolve from
+    // a fresh source (explicit option or createQueue) instead of reading a
+    // stale entry.
+    this.topicCache.delete(queue);
   }
 
   /**

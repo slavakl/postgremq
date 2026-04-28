@@ -3,7 +3,7 @@
  * Consumer implementation
  */
 
-import { ConsumerOptions, NotificationEvent } from './types';
+import { ConsumerOptions } from './types';
 import { Connection } from './connection';
 import { Message } from './message';
 import { createDeferred, sleep } from './utils';
@@ -46,7 +46,8 @@ export class Consumer {
       extensionSec: 30,
       maxBatchSize: 100
     },
-    pollingIntervalMs: 1000
+    pollingIntervalMs: 1000,
+    topic: ''
   };
   
   /** Map of in-flight messages by ID */
@@ -57,10 +58,10 @@ export class Consumer {
   
   /** Flag indicating if the consumer is actively running */
   private running: boolean = false;
-  
+
   /** Flag indicating if the consumer is actively fetching messages */
   private fetching: boolean = false;
-  
+
   /** Notification unsubscribe function */
   private unsubscribe: (() => void) | null = null;
   
@@ -114,41 +115,46 @@ export class Consumer {
   }
 
   /**
-   * Start the consumer
-   * This method is called internally when messages() is called
+   * Start the consumer.
+   * Called internally when messages() is called. resolveTopic is now
+   * synchronous (explicit option > cache > throw), so subscription and the
+   * initial fetch happen on the same tick.
    */
   private start(): void {
     if (this.running) {
       return;
     }
-    
-    this.running = true;
-    
-    // Subscribe to queue notifications
-    this.unsubscribe = this.connection.subscribeToQueue(
+
+    const topic = this.connection.resolveTopic(
       this.queueName,
+      this.options.topic || undefined
+    );
+
+    this.running = true;
+    this.unsubscribe = this.connection.subscribeForConsumer(
+      this.queueName,
+      topic,
       this.handleNotification.bind(this)
     );
-    
-    // Start the auto-extension scheduler if enabled
+
     if (this.options.autoExtension.enabled) {
       this.scheduleNextExtension();
     }
-    
+
     // Start with an initial fetch
     this.triggerFetch();
   }
 
   /**
    * Handle a notification event
-   * @param event - The notification event
+   * Triggered by the connection's per-topic or per-queue NOTIFY listener.
    */
-  private handleNotification(event: NotificationEvent): void {
+  private handleNotification(_messageId: number): void {
     // If consumer is not running, ignore the notification
     if (!this.running) {
       return;
     }
-    
+
     // Events always trigger fetch immediately
     this.triggerFetch();
   }
@@ -435,9 +441,9 @@ export class Consumer {
     if (this.fetching || !this.running) {
       return;
     }
-    
+
     this.fetching = true;
-    
+
     try {
       // Calculate how many messages to fetch
       const fetchCount = Math.min(
@@ -560,7 +566,7 @@ export class Consumer {
       this.nextExtensionTimer = null;
     }
 
-    // Unsubscribe from notifications
+    // Unsubscribe from notifications (fire-and-forget UNLISTEN inside).
     if (this.unsubscribe) {
       this.unsubscribe();
       this.unsubscribe = null;
@@ -571,6 +577,17 @@ export class Consumer {
     if (this.iteratorSignal) {
       this.iteratorSignal[1]();
       this.iteratorSignal = null;
+    }
+
+    // Wait briefly for any in-flight fetchMessages to complete. Without
+    // this, a fetch that just consumed a message but hasn't yet added it
+    // to the buffer would orphan that message after stop() returns: it
+    // would be locked in the database (status='processing') with no one
+    // to release it. The wait is bounded so we don't block shutdown
+    // indefinitely if the fetch is stuck on a slow query.
+    const fetchDeadline = Date.now() + 1000;
+    while (this.fetching && Date.now() < fetchDeadline) {
+      await sleep(20);
     }
 
     // Release any buffered messages (similar to Go closing the channel and releasing buffered messages)

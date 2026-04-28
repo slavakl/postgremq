@@ -147,7 +147,7 @@ func (m *Message) AckWithTx(ctx context.Context, tx Tx) error {
 //   - Sets queue_messages.status = 'pending'
 //   - Sets vt to the specified delay time (or NOW() if no delay)
 //   - Clears the consumer_token field
-//   - Emits a NOTIFY event on 'postgremq_events' channel
+//   - Emits a NOTIFY event on the per-queue channel `pmq:q:<queue>`
 //   - Removes the message from the consumer's internal tracking
 //
 // If the message has reached max_delivery_attempts, it will be moved to the
@@ -197,7 +197,7 @@ func (m *Message) Nack(ctx context.Context, opts ...MessageOption) error {
 //   - Sets vt = NOW() (immediately visible)
 //   - Clears the consumer_token field
 //   - DECREMENTS delivery_attempts by 1 (to undo the increment from consume)
-//   - Emits a NOTIFY event on 'postgremq_events' channel
+//   - Emits a NOTIFY event on the per-queue channel `pmq:q:<queue>`
 //   - Removes the message from the consumer's internal tracking
 //
 // The operation uses the configured retry policy for transient errors.

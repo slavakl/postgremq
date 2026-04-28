@@ -184,6 +184,7 @@ type consumeOptions struct {
 	vt              int
 	noAutoExtension bool
 	extendBatchSize int
+	topic           string
 }
 
 // ConsumeOption configures consumer behavior.
@@ -344,6 +345,18 @@ func WithVT(seconds int) ConsumeOption {
 func WithNoAutoExtension() ConsumeOption {
 	return func(o *consumeOptions) {
 		o.noAutoExtension = true
+	}
+}
+
+// WithTopic provides the topic name for the consumed queue, bypassing the
+// internal queue->topic cache and any database lookup.
+//
+// Use this when the caller already knows the topic and wants to skip the
+// resolution round-trip — typically in code paths that consume from a queue
+// without having created it through this Connection.
+func WithTopic(topic string) ConsumeOption {
+	return func(o *consumeOptions) {
+		o.topic = topic
 	}
 }
 

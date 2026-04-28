@@ -50,7 +50,18 @@ type Connection struct {
 	keepAliveWg         sync.WaitGroup
 	retryConfig         RetryConfig
 	closedFlag          chan struct{}
+	// topicCache maps queue name -> topic name. Populated by CreateQueue
+	// in this session, and also by Consume when WithTopic is provided
+	// explicitly. Consume avoids any SQL round-trip when the entry is
+	// present; queues that exist in the database but were not created via
+	// this Connection (and are not passed WithTopic) error from Consume
+	// with ErrQueueNotFound.
+	topicCache sync.Map
 }
+
+// ErrQueueNotFound is returned when Consume cannot resolve a queue's topic
+// because the queue does not exist in the database.
+var ErrQueueNotFound = errors.New("postgremq: queue not found")
 
 // Dial creates a new Connection, building an underlying pgxpool.Pool from the
 // provided pgx PoolConfig.
@@ -117,10 +128,13 @@ func (c *Connection) Close() error {
 	close(c.closedFlag)
 	c.cancel()
 
-	// Stop event listener
+	// Stop the event listener first. This closes every consumer's wake
+	// channels, so consumers stop pulling new messages immediately while
+	// they finish processing whatever they already prefetched. Their
+	// Stop() calls below then become a clean drain.
 	c.eventListener.Close()
 
-	// Stop all consumers and wait for in-flight messages
+	// Stop all consumers and wait for in-flight messages to complete.
 	var wg sync.WaitGroup
 	c.mu.RLock()
 	consumers := c.consumers
@@ -151,6 +165,7 @@ func (c *Connection) Close() error {
 	} else {
 		wg.Wait()
 	}
+
 	// Stop keep-alive loops
 	c.keepAliveCancel()
 	c.keepAliveWg.Wait() // waiting for all keep-alive loops to finish
@@ -218,10 +233,29 @@ func (c *Connection) CreateQueue(ctx context.Context, name, topic string, exclus
 		}
 		return nil
 	})
-	if err == nil && exclusive {
+	if err != nil {
+		return err
+	}
+	c.topicCache.Store(name, topic)
+	if exclusive {
 		c.startKeepAlive(name, time.Duration(options.keepAliveIntervalSec)*time.Second)
 	}
-	return err
+	return nil
+}
+
+// resolveTopic returns the topic that owns the given queue. The lookup order
+// is: explicit override (from WithTopic) -> in-process cache. If neither is
+// available, the caller must either pass WithTopic or have populated the
+// cache via CreateQueue first; we don't query the database for this.
+func (c *Connection) resolveTopic(queue, explicit string) (string, error) {
+	if explicit != "" {
+		c.topicCache.Store(queue, explicit)
+		return explicit, nil
+	}
+	if v, ok := c.topicCache.Load(queue); ok {
+		return v.(string), nil
+	}
+	return "", fmt.Errorf("%w: %q (provide WithTopic or call CreateQueue first)", ErrQueueNotFound, queue)
 }
 
 // Publish publishes a message to a topic and returns its message ID.
@@ -304,15 +338,31 @@ func (c *Connection) PublishWithTx(ctx context.Context, tx Tx, topic string, pay
 //     client yet (no attempt), and waits for in‑flight messages to complete or
 //     be released.
 func (c *Connection) Consume(ctx context.Context, queue string, opts ...ConsumeOption) (*Consumer, error) {
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	consumer, err := newConsumer(c.ctx, c, c.logger, queue, c.eventListener.AddListener(queue), opts...)
+	options := defaultConsumeOptions()
+	for _, opt := range opts {
+		opt(&options)
+	}
+	topic, err := c.resolveTopic(queue, options.topic)
 	if err != nil {
 		return nil, err
 	}
+	options.topic = topic
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	topicHandle := c.eventListener.AddTopicListener(topic)
+	queueHandle := c.eventListener.AddQueueListener(queue)
+	consumer, err := newConsumerFromOptions(c.ctx, c, c.logger, queue, topicHandle, queueHandle, options)
+	if err != nil {
+		topicHandle.Close()
+		queueHandle.Close()
+		return nil, err
+	}
 	c.consumers = append(c.consumers, consumer)
-	go consumer.start()
+	// start() must run synchronously: each sub-loop Add(1)s the consumer's
+	// WaitGroup, and a caller that immediately calls Stop() (which Wait()s)
+	// would race with the Adds if start() were launched in a goroutine.
+	consumer.start()
 
 	// starting event listener if not already started
 	c.eventListenerDoOnce.Do(func() {
@@ -372,12 +422,21 @@ func (c *Connection) ConsumeHandler(
 		return nil, err
 	}
 
+	topic, err := c.resolveTopic(queue, options.consumeOptions.topic)
+	if err != nil {
+		return nil, err
+	}
+	options.consumeOptions.topic = topic
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Create consumer using the embedded consumeOptions
-	consumer, err := newConsumerFromOptions(c.ctx, c, c.logger, queue, c.eventListener.AddListener(queue), options.consumeOptions)
+	topicHandle := c.eventListener.AddTopicListener(topic)
+	queueHandle := c.eventListener.AddQueueListener(queue)
+	consumer, err := newConsumerFromOptions(c.ctx, c, c.logger, queue, topicHandle, queueHandle, options.consumeOptions)
 	if err != nil {
+		topicHandle.Close()
+		queueHandle.Close()
 		return nil, err
 	}
 
@@ -389,7 +448,9 @@ func (c *Connection) ConsumeHandler(
 		c.eventListener.Start()
 	})
 
-	go hc.start()
+	// Run synchronously for the same reason as Consume: start()'s sub-loops
+	// Add(1) the consumer's WaitGroup, and a fast Stop() would race.
+	hc.start()
 
 	return hc, nil
 }
@@ -977,10 +1038,17 @@ func (c *Connection) DeleteTopic(ctx context.Context, topic string) error {
 //
 // The operation uses the configured retry policy for transient errors.
 func (c *Connection) DeleteQueue(ctx context.Context, queue string) error {
-	return c.withRetry(ctx, func(ctx context.Context) error {
+	err := c.withRetry(ctx, func(ctx context.Context) error {
 		_, err := c.pool.Exec(ctx, "SELECT delete_queue($1)", queue)
 		return err
 	})
+	if err == nil {
+		// Drop the cached topic mapping so a future Consume on a recreated
+		// queue (possibly with a different topic) doesn't subscribe to the
+		// stale topic channel.
+		c.topicCache.Delete(queue)
+	}
+	return err
 }
 
 // DeleteQueueMessage deletes a specific message from a queue.

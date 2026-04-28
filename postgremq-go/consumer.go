@@ -16,6 +16,7 @@ import (
 type Consumer struct {
 	conn             *Connection
 	queue            string
+	topic            string
 	messages         chan *Message
 	batchSize        int // number of messages to fetch in one batch
 	vtSec            int // visibility timeout in seconds
@@ -26,7 +27,8 @@ type Consumer struct {
 	cancel           context.CancelFunc
 	dbCtx            context.Context
 	wg               sync.WaitGroup     // wg is used to wait for all goroutines to finish
-	events           <-chan time.Time   // events is used to signal that new messages are available
+	topicHandle      *ListenerHandle    // wakes on per-topic publish notifications
+	queueHandle      *ListenerHandle    // wakes on nack/release for this queue
 	vtMessageUpdates chan messageUpdate // signal of message updates. used to keep track of vts
 	messageUpdates   chan messageUpdate
 	inFlightFlag     chan struct{}
@@ -45,15 +47,15 @@ const (
 	messageLoopStopped
 )
 
-func newConsumer(parentCtx context.Context, conn *Connection, logger LevelLogger, queue string, events <-chan time.Time, opts ...ConsumeOption) (*Consumer, error) {
+func newConsumer(parentCtx context.Context, conn *Connection, logger LevelLogger, queue string, topicHandle, queueHandle *ListenerHandle, opts ...ConsumeOption) (*Consumer, error) {
 	options := defaultConsumeOptions()
 	for _, opt := range opts {
 		opt(&options)
 	}
-	return newConsumerFromOptions(parentCtx, conn, logger, queue, events, options)
+	return newConsumerFromOptions(parentCtx, conn, logger, queue, topicHandle, queueHandle, options)
 }
 
-func newConsumerFromOptions(parentCtx context.Context, conn *Connection, logger LevelLogger, queue string, events <-chan time.Time, options consumeOptions) (*Consumer, error) {
+func newConsumerFromOptions(parentCtx context.Context, conn *Connection, logger LevelLogger, queue string, topicHandle, queueHandle *ListenerHandle, options consumeOptions) (*Consumer, error) {
 	// Validate options
 	if err := validateConsumeOptions(&options); err != nil {
 		return nil, err
@@ -66,6 +68,7 @@ func newConsumerFromOptions(parentCtx context.Context, conn *Connection, logger 
 	return &Consumer{
 		conn:             conn,
 		queue:            queue,
+		topic:            options.topic,
 		messages:         make(chan *Message, options.batchSize),
 		batchSize:        options.batchSize,
 		vtSec:            options.vt,
@@ -75,7 +78,8 @@ func newConsumerFromOptions(parentCtx context.Context, conn *Connection, logger 
 		ctx:              ctx,
 		cancel:           cancel,
 		dbCtx:            dbCtx,
-		events:           events,
+		topicHandle:      topicHandle,
+		queueHandle:      queueHandle,
 		vtMessageUpdates: make(chan messageUpdate, options.batchSize*2),
 		messageUpdates:   make(chan messageUpdate, 100), // Buffered to avoid blocking during shutdown
 		inFlightFlag:     make(chan struct{}),
@@ -111,7 +115,8 @@ func (c *Consumer) startMessageLoop() {
 
 		// Fetch messages immediately instead of waiting for first tick
 		fetchAfter := c.fetchMessages()
-		eventsCh := c.events
+		topicCh := c.topicHandle.Wake()
+		queueCh := c.queueHandle.Wake()
 		for {
 			fetch := false
 
@@ -119,10 +124,16 @@ func (c *Consumer) startMessageLoop() {
 			fetchAfter = minTime(fetchAfter, time.Now().Add(c.checkTimeout))
 			select {
 			case <-c.ctx.Done():
-				break //nolint:staticcheck // SA4011: Break exits select, line 132 checks ctx.Err() and exits loop
-			case _, ok := <-eventsCh:
+				break //nolint:staticcheck // SA4011: Break exits select, the post-select check exits the loop
+			case _, ok := <-topicCh:
 				if !ok {
-					eventsCh = nil // if listener stopped we disable this branch. It means we're shutting down anyway
+					topicCh = nil // listener closed; rely on queue/timer wake
+					continue
+				}
+				fetch = true
+			case _, ok := <-queueCh:
+				if !ok {
+					queueCh = nil
 					continue
 				}
 				fetch = true
@@ -333,7 +344,12 @@ func (c *Consumer) startExtendLoop() {
 			select {
 			case <-c.ctx.Done():
 				break //nolint:staticcheck // SA4011: Break exits select, line 348 checks ctx.Err() and exits loop
-			case update := <-c.vtMessageUpdates:
+			case update, ok := <-c.vtMessageUpdates:
+				if !ok {
+					// Channel closed during shutdown: bail rather than
+					// dereferencing a zero-value messageUpdate.
+					return
+				}
 				switch update.op {
 				case messageAdded:
 					vts.push(&vtInfo{
@@ -484,6 +500,12 @@ func (c *Consumer) Messages() <-chan *Message {
 func (c *Consumer) Stop() {
 	c.cancel()
 	c.wg.Wait()
+	if c.topicHandle != nil {
+		c.topicHandle.Close()
+	}
+	if c.queueHandle != nil {
+		c.queueHandle.Close()
+	}
 }
 
 // vtHeap implementation
