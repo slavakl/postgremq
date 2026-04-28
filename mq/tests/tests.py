@@ -204,9 +204,9 @@ def test_unlimited_delivery_attempts(cur: psycopg2.extensions.cursor) -> None:
 
     # Verify message wasn't moved to DLQ
     cur.execute("""
-        SELECT move_messages_to_dlq();
-        SELECT count(*) 
-        FROM dead_letter_queue dlq 
+        SELECT * FROM pmq_maintenance_fast();
+        SELECT count(*)
+        FROM dead_letter_queue dlq
         WHERE dlq.queue_name = 'UnlimitedQueue';
     """)
     assert cur.fetchone()[0] == 0
@@ -288,6 +288,47 @@ def test_consume_does_not_revive_expired_exclusive_queue(cur: psycopg2.extension
     after = cur.fetchone()[0]
     assert after == expired_at, "expired exclusive queue must not be revived by consume"
 
+def test_pmq_maintenance_fast(cur: psycopg2.extensions.cursor) -> None:
+    """pmq_maintenance_fast retires crashed-final-attempt rows to DLQ and
+    reaps expired exclusive queues, returning counters for both. Both
+    branches must fire when the conditions are met, and the function must
+    be idempotent (counters drop to 0 on a second call)."""
+    cur.execute("SELECT create_topic('MaintTopic')")
+    # Queue with max_attempts=2 so we can manufacture a crashed-final-attempt
+    # row by setting delivery_attempts past the threshold without going through
+    # nack — mimicking a consumer that died after consuming the last allowed
+    # attempt. consume_message refuses to re-pick those rows (delivery_attempts
+    # >= max), so they'd stay stuck in 'processing' without this recovery path.
+    cur.execute("SELECT create_queue('MaintQueue', 'MaintTopic', 2, false)")
+    cur.execute("SELECT publish_message('MaintTopic', '{\"x\": 1}'::jsonb)")
+    cur.execute("SELECT message_id FROM consume_message('MaintQueue', 30, 1)")
+    msg_id = cur.fetchone()[0]
+    cur.execute(
+        "UPDATE queue_messages SET delivery_attempts = 2 WHERE queue_name = 'MaintQueue' AND message_id = %s",
+        (msg_id,),
+    )
+
+    # Expired exclusive queue (the inactive-queue branch).
+    cur.execute("SELECT create_queue('ExpiredEx', 'MaintTopic', 0, true, interval '60 seconds')")
+    cur.execute("UPDATE queues SET keep_alive_until = NOW() - interval '1 second' WHERE name = 'ExpiredEx'")
+
+    cur.execute("SELECT retired_to_dlq, inactive_queues_dropped FROM pmq_maintenance_fast()")
+    retired, dropped = cur.fetchone()
+    assert retired == 1, f"retired_to_dlq should be 1, got {retired}"
+    assert dropped == 1, f"inactive_queues_dropped should be 1, got {dropped}"
+
+    # Idempotency: a second call has nothing to do.
+    cur.execute("SELECT retired_to_dlq, inactive_queues_dropped FROM pmq_maintenance_fast()")
+    retired2, dropped2 = cur.fetchone()
+    assert retired2 == 0 and dropped2 == 0
+
+    # The retired message landed in the DLQ.
+    cur.execute("SELECT message_id FROM dead_letter_queue WHERE queue_name = 'MaintQueue'")
+    assert cur.fetchone()[0] == msg_id
+    # The expired exclusive queue is gone.
+    cur.execute("SELECT count(*) FROM queues WHERE name = 'ExpiredEx'")
+    assert cur.fetchone()[0] == 0
+
 def test_message_delivery_and_acknowledgment(cur: psycopg2.extensions.cursor) -> None:
     """Test message publishing, consumption, and acknowledgment."""
     # Setup
@@ -364,9 +405,9 @@ def test_message_retry_behavior(cur: psycopg2.extensions.cursor) -> None:
 
     # Move to DLQ and verify
     cur.execute("""
-        SELECT move_messages_to_dlq();
-        SELECT count(*), MAX(retry_count) 
-        FROM dead_letter_queue dlq 
+        SELECT * FROM pmq_maintenance_fast();
+        SELECT count(*), MAX(retry_count)
+        FROM dead_letter_queue dlq
         WHERE dlq.queue_name = 'RetryQueue';
     """)
     count, retries = cur.fetchone()
@@ -610,7 +651,7 @@ def test_requeue_dlq_messages_resets_delivery_attempts(cur):
         """, (queue, msg_id, result['consumer_token']))  # Use dictionary access for DictCursor
 
     # Move messages to DLQ
-    cur.execute("SELECT move_messages_to_dlq()")
+    cur.execute("SELECT * FROM pmq_maintenance_fast()")
 
     # Verify message moved to DLQ
     cur.execute("SELECT message_id FROM dead_letter_queue WHERE queue_name = %s", (queue,))
@@ -1631,7 +1672,7 @@ def test_list_dlq_messages(cur: psycopg2.extensions.cursor) -> None:
             """, (msg['message_id'], msg['consumer_token']))
     
     # Move to DLQ
-    cur.execute("SELECT move_messages_to_dlq()")
+    cur.execute("SELECT * FROM pmq_maintenance_fast()")
     
     # Test list_dlq_messages with column names from SQL function
     cur.execute("SELECT queue_name, message_id, retry_count, published_at FROM list_dlq_messages()")
@@ -1677,7 +1718,7 @@ def test_purge_dlq(cur: psycopg2.extensions.cursor) -> None:
             """, (msg['message_id'], msg['consumer_token']))
     
     # Move to DLQ
-    cur.execute("SELECT move_messages_to_dlq()")
+    cur.execute("SELECT * FROM pmq_maintenance_fast()")
     
     # Verify messages are in DLQ
     cur.execute("SELECT COUNT(*) FROM list_dlq_messages()")

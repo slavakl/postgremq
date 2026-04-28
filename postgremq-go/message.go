@@ -150,8 +150,8 @@ func (m *Message) AckWithTx(ctx context.Context, tx Tx) error {
 //   - Emits a NOTIFY event on the per-queue channel `pmq:q:<queue>`
 //   - Removes the message from the consumer's internal tracking
 //
-// If the message has reached max_delivery_attempts, it will be moved to the
-// DLQ when move_messages_to_dlq() is next called.
+// If the message has reached max_delivery_attempts, this Nack retires it to
+// the DLQ inline (no maintenance call required).
 //
 // The operation uses the configured retry policy for transient errors.
 //

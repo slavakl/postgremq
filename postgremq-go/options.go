@@ -140,7 +140,8 @@ func defaultQueueOptions() queueOptions {
 // WithMaxDeliveryAttempts sets the maximum delivery attempts for a queue.
 //
 // When a message's delivery_attempts reaches this limit, it is moved to the
-// Dead Letter Queue (DLQ) by the move_messages_to_dlq() function.
+// Dead Letter Queue (DLQ) inline by nack_message on the final attempt.
+// MaintenanceFast also recovers any crashed-final-attempt rows.
 //
 // Parameters:
 //   - n: Maximum delivery attempts (0 for unlimited retries).

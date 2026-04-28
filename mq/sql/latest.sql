@@ -26,8 +26,9 @@
  *   otherwise the queue is eligible for deletion by `delete_inactive_queues()`.
  * - Delivery Attempts: Each time a message is consumed its
  *   `delivery_attempts` is incremented. When a queue has
- *   `max_delivery_attempts > 0` and a message reaches the limit it is
- *   moved to the DLQ by `move_messages_to_dlq()`.
+ *   `max_delivery_attempts > 0` and a message reaches the limit, the
+ *   final-attempt nack retires the message inline; `pmq_maintenance_fast()`
+ *   covers leftover crashed-final-attempt rows.
  * - DLQ (Dead Letter Queue): Failed messages are copied to
  *   `dead_letter_queue`. Use `list_dlq_messages()`, `requeue_dlq_messages()`
  *   and `purge_dlq()` to manage.
@@ -62,8 +63,10 @@
  *   - nack_message: Return to pending with optional delay; clears token; NOTIFY.
  *   - release_message: Return to pending without incrementing attempts; NOTIFY.
  *   - set_vt / set_vt_batch: Extend visibility time for one or many messages.
- *   - move_messages_to_dlq / requeue_dlq_messages / purge_dlq.
+ *   - requeue_dlq_messages / purge_dlq for DLQ management.
  *   - extend_queue_keep_alive / delete_inactive_queues for exclusive queues.
+ *   - pmq_maintenance_fast: bundled cron entry — retires crashed-final-attempt
+ *     rows to DLQ, reaps expired exclusive queues; returns counters.
  *   - Management: create_topic, create_queue, delete_topic, delete_queue,
  *     list_topics, list_queues, get_queue_statistics, clean_up_* helpers,
  *     list_messages, get_message, get_next_visible_time, cleanup_completed_messages.
@@ -607,22 +610,39 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-/* Function: move_messages_to_dlq
+/* Function: pmq_maintenance_fast
  *
  * Description:
- *   Moves messages from the active queue (queue_messages) into the dead letter queue if their
- *   delivery_attempts have reached/exceeded the maximum allowed by the corresponding queue.
- *   Only moves messages from queues with max_delivery_attempts > 0.
- *   Uses a single atomic CTE operation for efficiency.
+ *   Bundles the latency-sensitive maintenance routines into one cron entry:
  *
- * Parameters: None.
+ *   1. Retire crashed-final-attempt rows to DLQ. nack_message already retires
+ *      messages inline when their delivery_attempts hit max_delivery_attempts,
+ *      so this only catches rows whose consumer crashed mid-handler before
+ *      acking/nacking the final attempt — those would otherwise stay stuck
+ *      in 'processing' (consume_message refuses to re-pick them because
+ *      delivery_attempts >= max_delivery_attempts).
+ *   2. Reap exclusive queues whose keep_alive_until has expired.
  *
- * Returns: INTEGER - number of messages moved to DLQ.
+ *   Intended to run every 30-60 seconds (≤ ½ × the shortest
+ *   keep_alive_interval in your queues so dead exclusive queues are reaped
+ *   within ~1.5× their interval).
+ *
+ *   cleanup_completed_messages stays separate because it's latency-tolerant
+ *   bulk DELETE governed by retention policy, not freshness.
+ *
+ * Returns:
+ *   A single row with two counters for monitoring:
+ *     retired_to_dlq          - rows moved into dead_letter_queue
+ *     inactive_queues_dropped - exclusive queues whose keep_alive_until expired
  */
-CREATE OR REPLACE FUNCTION move_messages_to_dlq()
-RETURNS INTEGER AS $$
+CREATE OR REPLACE FUNCTION pmq_maintenance_fast()
+RETURNS TABLE (
+    retired_to_dlq          BIGINT,
+    inactive_queues_dropped BIGINT
+) AS $$
 DECLARE
-    v_moved_count INTEGER;
+    v_retired BIGINT;
+    v_dropped BIGINT;
 BEGIN
     WITH deleted_messages AS (
         DELETE FROM queue_messages qm
@@ -631,13 +651,24 @@ BEGIN
           AND q.max_delivery_attempts > 0
           AND qm.delivery_attempts >= q.max_delivery_attempts
         RETURNING qm.queue_name, qm.message_id, qm.delivery_attempts
+    ),
+    inserted AS (
+        INSERT INTO dead_letter_queue(queue_name, message_id, retry_count)
+        SELECT queue_name, message_id, delivery_attempts
+        FROM deleted_messages
+        RETURNING 1
     )
-    INSERT INTO dead_letter_queue(queue_name, message_id, retry_count)
-    SELECT queue_name, message_id, delivery_attempts
-    FROM deleted_messages;
+    SELECT count(*) INTO v_retired FROM inserted;
 
-    GET DIAGNOSTICS v_moved_count = ROW_COUNT;
-    RETURN v_moved_count;
+    WITH dropped AS (
+        DELETE FROM queues
+        WHERE exclusive = true
+          AND (keep_alive_until IS NULL OR keep_alive_until <= NOW())
+        RETURNING name
+    )
+    SELECT count(*) INTO v_dropped FROM dropped;
+
+    RETURN QUERY SELECT v_retired, v_dropped;
 END;
 $$ LANGUAGE plpgsql;
 

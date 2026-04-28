@@ -790,17 +790,30 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Move messages from active queues to DLQ if they exceed max delivery attempts
-   * @returns Promise that resolves to the number of messages moved
+   * Bundle the latency-sensitive maintenance routines into one call: retire
+   * crashed-final-attempt rows to DLQ + reap expired exclusive queues. Run
+   * on a 30-60 second cron (≤ ½ × the shortest keepAliveInterval in your
+   * queues so dead exclusive queues are reaped within ~1.5× their interval).
+   *
+   * nack_message already retires the final attempt inline; this only catches
+   * rows whose consumer crashed mid-handler. cleanup_completed_messages
+   * stays separate — it's a latency-tolerant bulk DELETE governed by
+   * retention policy.
    */
-  async moveToDLQ(): Promise<number> {
+  async maintenanceFast(): Promise<{ retiredToDlq: number; inactiveQueuesDropped: number }> {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
 
     return this.executeWithRetry(async (client) => {
-      const result = await client.query('SELECT move_messages_to_dlq() as moved_count');
-      return result.rows[0].moved_count;
+      const result = await client.query(
+        'SELECT retired_to_dlq, inactive_queues_dropped FROM pmq_maintenance_fast()'
+      );
+      const row = result.rows[0];
+      return {
+        retiredToDlq: Number(row.retired_to_dlq),
+        inactiveQueuesDropped: Number(row.inactive_queues_dropped),
+      };
     });
   }
 

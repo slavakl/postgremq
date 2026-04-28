@@ -95,8 +95,8 @@ export interface IConnection {
   /** Get statistics for a queue or all queues */
   getQueueStatistics(queue?: string): Promise<QueueStatistics>;
 
-  /** Move messages from active queues to DLQ if they exceed max delivery attempts */
-  moveToDLQ(): Promise<number>;
+  /** Bundled fast maintenance: retire crashed-final-attempt rows to DLQ + reap expired exclusive queues. */
+  maintenanceFast(): Promise<{ retiredToDlq: number; inactiveQueuesDropped: number }>;
 
   /** List all messages in the Dead Letter Queue */
   listDLQMessages(): Promise<DLQMessage[]>;

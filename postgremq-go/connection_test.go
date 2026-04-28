@@ -429,7 +429,7 @@ func TestDLQOperations(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Explicitly move messages to DLQ as noted by the user
-	_, err = conn.MoveToDLQ(ctx)
+	_, err = conn.MaintenanceFast(ctx)
 	require.NoError(t, err, "Failed to move messages to DLQ")
 
 	// Allow more time for the message to be available in the DLQ
@@ -604,7 +604,7 @@ func TestAdministrativeOperations(t *testing.T) {
 	consumer.Stop()
 
 	// Move to DLQ
-	_, err = conn.MoveToDLQ(ctx)
+	_, err = conn.MaintenanceFast(ctx)
 	require.NoError(t, err, "Failed to move messages to DLQ")
 
 	// Verify message is in DLQ
@@ -1244,7 +1244,7 @@ func TestDLQOperationsAdmin(t *testing.T) {
 	consumer.Stop()
 
 	// Move eligible messages to DLQ
-	_, err = conn.MoveToDLQ(ctx)
+	_, err = conn.MaintenanceFast(ctx)
 	require.NoError(t, err, "Failed to move messages to DLQ")
 
 	// Allow time for DLQ processing
@@ -1308,7 +1308,7 @@ func TestDLQOperationsAdmin(t *testing.T) {
 	consumer.Stop()
 
 	// Move to DLQ again
-	_, err = conn.MoveToDLQ(ctx)
+	_, err = conn.MaintenanceFast(ctx)
 	require.NoError(t, err, "Failed to move messages to DLQ again")
 
 	// Allow time for DLQ processing

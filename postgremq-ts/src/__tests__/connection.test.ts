@@ -334,10 +334,10 @@ describe('Connection', () => {
       await sleep(100);
 
       // Inline retirement: the message is in DLQ already.
-      // moveToDLQ is the recovery path for crashed-on-final-attempt rows;
+      // maintenanceFast is the recovery path for crashed-on-final-attempt rows;
       // here it should find nothing more to move.
-      const movedCount = await connection.moveToDLQ();
-      expect(movedCount).toBe(0);
+      const counters = await connection.maintenanceFast();
+      expect(counters.retiredToDlq).toBe(0);
 
       const dlqMessages = await connection.listDLQMessages();
       expect(dlqMessages.length).toBe(1);
@@ -369,7 +369,7 @@ describe('Connection', () => {
       await sleep(100);
 
       // Explicitly move messages to DLQ
-      await connection.moveToDLQ();
+      await connection.maintenanceFast();
 
       // Verify in DLQ
       let dlqMessages = await connection.listDLQMessages();
@@ -411,7 +411,7 @@ describe('Connection', () => {
       await sleep(100);
 
       // Explicitly move messages to DLQ
-      await connection.moveToDLQ();
+      await connection.maintenanceFast();
 
       let dlqMessages = await connection.listDLQMessages();
       expect(dlqMessages.length).toBeGreaterThan(0);

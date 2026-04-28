@@ -770,28 +770,33 @@ type DLQMessage struct {
 	PublishedAt time.Time
 }
 
-// MoveToDLQ moves messages from active queues to the Dead Letter Queue (DLQ)
-// if they have exceeded their max delivery attempts.
+// MaintenanceCounters carries the counters returned by MaintenanceFast.
+type MaintenanceCounters struct {
+	// RetiredToDLQ counts crashed-final-attempt rows moved into
+	// dead_letter_queue. nack_message already retires final attempts inline
+	// when a handler completes normally; this only catches rows whose
+	// consumer crashed mid-handler before acking/nacking.
+	RetiredToDLQ int64
+	// InactiveQueuesDropped counts exclusive queues whose keep_alive_until
+	// expired.
+	InactiveQueuesDropped int64
+}
+
+// MaintenanceFast bundles the latency-sensitive maintenance routines into one
+// call: retire crashed-final-attempt rows to DLQ + reap expired exclusive
+// queues. Run on a 30-60 second cron (≤ ½ × the shortest keep_alive_interval
+// so dead exclusive queues are reaped within ~1.5× their interval).
 //
-// This method scans all queues with max_delivery_attempts > 0 and moves messages
-// where delivery_attempts >= max_delivery_attempts to the dead_letter_queue table.
-//
-// Parameters:
-//   - ctx: Context for cancellation and timeout control.
-//
-// Returns the number of messages moved to the DLQ, or an error if the operation fails.
-//
-// This operation is typically called periodically by a background worker or
-// scheduler to clean up failed messages. It's safe to call multiple times and
-// is idempotent within each call.
-//
-// The operation uses the configured retry policy for transient errors.
-func (c *Connection) MoveToDLQ(ctx context.Context) (int, error) {
-	var movedCount int
+// cleanup_completed_messages stays separate — it's a latency-tolerant bulk
+// DELETE governed by retention policy, not freshness.
+func (c *Connection) MaintenanceFast(ctx context.Context) (MaintenanceCounters, error) {
+	var counters MaintenanceCounters
 	err := c.withRetry(ctx, func(ctx context.Context) error {
-		return c.pool.QueryRow(ctx, "SELECT move_messages_to_dlq()").Scan(&movedCount)
+		return c.pool.QueryRow(ctx,
+			"SELECT retired_to_dlq, inactive_queues_dropped FROM pmq_maintenance_fast()").
+			Scan(&counters.RetiredToDLQ, &counters.InactiveQueuesDropped)
 	})
-	return movedCount, err
+	return counters, err
 }
 
 // ListTopics returns all available topics in the system.

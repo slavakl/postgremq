@@ -331,7 +331,7 @@ describe('Error Scenarios', () => {
       await sleep(100);
 
       // Explicitly move messages to DLQ
-      await connection.moveToDLQ();
+      await connection.maintenanceFast();
 
       let dlqMessages = await connection.listDLQMessages();
       expect(dlqMessages.length).toBe(1);
