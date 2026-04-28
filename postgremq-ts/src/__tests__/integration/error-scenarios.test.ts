@@ -538,7 +538,7 @@ describe('Error Scenarios', () => {
     test('should handle exclusive queue cleanup on expiration', async () => {
       await connection.createTopic('exclusive-expire-topic');
       await connection.createQueue('exclusive-expire-queue', 'exclusive-expire-topic', true, {
-        keepAliveSeconds: 2 // Very short keep-alive
+        keepAliveInterval: 2 // Very short keep-alive
       });
 
       // Publish a message

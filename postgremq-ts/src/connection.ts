@@ -651,16 +651,19 @@ export class Connection implements IConnection {
       await this.executeWithRetry(async (client) => {
         // Always pass all parameters to avoid parameter index misalignment
         const maxDeliveryAttempts = options.maxDeliveryAttempts ?? 0;
-        const keepAliveSeconds = options.keepAliveSeconds ?? 30;
+        const keepAliveSeconds = options.keepAliveInterval ?? 30;
 
+        // Scale seconds to INTERVAL via "$5 * interval '1 sec'" so the SQL
+        // function can stay typed as INTERVAL without us needing a per-driver
+        // serializer for it.
         await client.query(
-          'SELECT create_queue($1, $2, $3, $4, $5)',
+          "SELECT create_queue($1, $2, $3, $4, $5 * interval '1 sec')",
           [name, topic, maxDeliveryAttempts, exclusive, keepAliveSeconds]
         );
 
         // If this is an exclusive queue with a keep-alive period, set up the keep-alive timer
-        if (exclusive && options.keepAliveSeconds) {
-          this.startQueueKeepAlive(name, options.keepAliveSeconds);
+        if (exclusive && options.keepAliveInterval) {
+          this.startQueueKeepAlive(name, options.keepAliveInterval);
         }
       });
     } catch (err) {

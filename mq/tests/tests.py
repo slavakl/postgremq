@@ -108,7 +108,7 @@ def test_topic_and_queue_creation(cur: psycopg2.extensions.cursor) -> None:
     cur.execute("""
         SELECT create_topic('TestTopic');
         SELECT create_queue('TestQueue', 'TestTopic', 3, false);
-        SELECT create_queue('TestQueue_Ex', 'TestTopic', 2, true, 300);
+        SELECT create_queue('TestQueue_Ex', 'TestTopic', 2, true, interval '300 seconds');
     """)
     
     # Verify queues were created
@@ -135,7 +135,7 @@ def test_queue_keep_alive_extension(cur: psycopg2.extensions.cursor) -> None:
     # Setup
     cur.execute("""
         SELECT create_topic('TestTopic');
-        SELECT create_queue('TestQueue_Ex', 'TestTopic', 2, true, 300);
+        SELECT create_queue('TestQueue_Ex', 'TestTopic', 2, true, interval '300 seconds');
         SELECT create_queue('TestQueue_NonEx', 'TestTopic', 2, false);
     """)
 
@@ -163,13 +163,13 @@ def test_exclusive_queue_uniqueness(cur: psycopg2.extensions.cursor) -> None:
 
     # Create first exclusive queue
     cur.execute("""
-        SELECT create_queue('ExQueue1', 'TestTopic', 2, true, 300)
+        SELECT create_queue('ExQueue1', 'TestTopic', 2, true, interval '300 seconds')
     """)
 
     # Attempt to create second exclusive queue with same name; raises PMQ03.
     with pytest.raises(psycopg2.Error) as exc_info:
         cur.execute("""
-            SELECT create_queue('ExQueue1', 'TestTopic', 2, true, 300)
+            SELECT create_queue('ExQueue1', 'TestTopic', 2, true, interval '300 seconds')
         """)
     assert "already exists" in str(exc_info.value)
     assert exc_info.value.pgcode == 'PMQ03', f"expected PMQ03, got {exc_info.value.pgcode}"
@@ -228,11 +228,65 @@ def test_non_exclusive_queue_keep_alive_ignored(cur: psycopg2.extensions.cursor)
     """Test that keep_alive is ignored for non-exclusive queues."""
     cur.execute("""
         SELECT create_topic('TestTopic');
-        SELECT create_queue('NonExQueue', 'TestTopic', 2, false, 300);
+        SELECT create_queue('NonExQueue', 'TestTopic', 2, false, interval '300 seconds');
     """)
-    
+
     cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'NonExQueue'")
     assert cur.fetchone()[0] is None
+
+def test_consume_refreshes_keep_alive_for_exclusive(cur: psycopg2.extensions.cursor) -> None:
+    """consume_message must advance keep_alive_until for exclusive queues so an
+    actively-polling consumer cannot have its queue GC'd by drift in the
+    explicit extend_queue_keep_alive timer."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    # 60s keep-alive so the test window is comfortable.
+    cur.execute("SELECT create_queue('ExActive', 'TestTopic', 0, true, interval '60 seconds')")
+    cur.execute("SELECT publish_message('TestTopic', '{\"x\": 1}'::jsonb)")
+
+    # Snapshot keep_alive_until and pin queue's view of NOW(), then consume.
+    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExActive'")
+    before = cur.fetchone()[0]
+
+    # Sleep briefly so NOW() advances; the refresh is NOW() + interval, so the
+    # post-consume value must be strictly later than the pre-consume value.
+    time.sleep(1.2)
+    cur.execute("SELECT consume_message('ExActive', 30, 1)")
+
+    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExActive'")
+    after = cur.fetchone()[0]
+    assert after > before, f"keep_alive_until should advance on consume: before={before} after={after}"
+    # Must be ~now+60s (the interval), not now+30 (vt) or unchanged.
+    now = datetime.now(pytz.UTC)
+    assert after > now + timedelta(seconds=55)
+    assert after < now + timedelta(seconds=65)
+
+def test_consume_does_not_touch_keep_alive_for_non_exclusive(cur: psycopg2.extensions.cursor) -> None:
+    """Non-exclusive queues have keep_alive_until = NULL; consume must leave it alone."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT create_queue('NonExActive', 'TestTopic', 0, false)")
+    cur.execute("SELECT publish_message('TestTopic', '{\"x\": 1}'::jsonb)")
+
+    cur.execute("SELECT consume_message('NonExActive', 30, 1)")
+
+    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'NonExActive'")
+    assert cur.fetchone()[0] is None
+
+def test_consume_does_not_revive_expired_exclusive_queue(cur: psycopg2.extensions.cursor) -> None:
+    """If keep_alive_until has already expired the queue is logically dead and
+    consume must NOT resurrect it via the implicit refresh — otherwise an
+    expired queue could survive indefinitely if a stale consumer keeps polling."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT create_queue('ExExpired', 'TestTopic', 0, true, interval '60 seconds')")
+    # Force expiry.
+    cur.execute("UPDATE queues SET keep_alive_until = NOW() - interval '5 seconds' WHERE name = 'ExExpired'")
+
+    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExExpired'")
+    expired_at = cur.fetchone()[0]
+    cur.execute("SELECT consume_message('ExExpired', 30, 1)")
+
+    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExExpired'")
+    after = cur.fetchone()[0]
+    assert after == expired_at, "expired exclusive queue must not be revived by consume"
 
 def test_message_delivery_and_acknowledgment(cur: psycopg2.extensions.cursor) -> None:
     """Test message publishing, consumption, and acknowledgment."""
@@ -533,8 +587,8 @@ def test_requeue_dlq_messages_resets_delivery_attempts(cur):
     topic = "test_requeue_dlq_topic"
     queue = "test_requeue_dlq_queue"
     cur.execute("SELECT create_topic(%s)", (topic,))
-    cur.execute("SELECT create_queue(%s, %s, %s, %s, %s)",
-                  (queue, topic, 2, True, 60))  # Changed from '60 seconds' to 60
+    cur.execute("SELECT create_queue(%s, %s, %s, %s, %s * interval '1 sec')",
+                  (queue, topic, 2, True, 60))
 
     # Publish a message
     cur.execute("SELECT publish_message(%s, %s)", 

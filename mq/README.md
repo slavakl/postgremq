@@ -126,12 +126,12 @@ Lists all topics with their metadata.
 
 ### Queue Management
 
-#### `create_queue(queue_name TEXT, topic_name TEXT, exclusive BOOLEAN, max_delivery_attempts INTEGER, keep_alive_seconds INTEGER) RETURNS INTEGER`
+#### `create_queue(queue_name TEXT, topic_name TEXT, exclusive BOOLEAN, max_delivery_attempts INTEGER, keep_alive_interval INTERVAL) RETURNS INTEGER`
 Creates a new queue subscribed to a topic.
 
 - `exclusive`: If true, creates a temporary queue
 - `max_delivery_attempts`: Number of retries before moving to DLQ
-- `keep_alive_seconds`: For exclusive queues, initial keep-alive duration
+- `keep_alive_interval`: Stored on the queue and used as both the initial keep-alive duration and the per-consume refresh amount. Effectively only matters for exclusive queues. Defaults to `'30 seconds'`.
 
 #### `delete_queue(queue_name TEXT) RETURNS VOID`
 Deletes a queue and all its queue_messages.

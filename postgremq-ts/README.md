@@ -232,7 +232,7 @@ Exclusive queues (non-durable) are automatically deleted when their keep-alive t
 ```typescript
 // Create an exclusive queue that expires after 60 seconds of inactivity
 await client.createQueue('temp-queue', 'orders', true, {
-  keepAliveSeconds: 60
+  keepAliveInterval: 60
 });
 
 // Extend the queue's lifetime

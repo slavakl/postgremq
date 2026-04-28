@@ -53,7 +53,7 @@ describe('Per-topic NOTIFY', () => {
       // Queue created out of band: not via this Connection's createQueue, so
       // the topic cache is empty for this queue.
       await pool.query("SELECT create_topic('TopicOutOfBand')");
-      await pool.query("SELECT create_queue('QueueOutOfBand', 'TopicOutOfBand', 0, false, 30)");
+      await pool.query("SELECT create_queue('QueueOutOfBand', 'TopicOutOfBand', 0, false, interval '30 seconds')");
 
       // Without explicit topic, starting iteration must throw — no DB fallback.
       const noTopicConsumer = connection.consume('QueueOutOfBand', { visibilityTimeoutSec: 30 });

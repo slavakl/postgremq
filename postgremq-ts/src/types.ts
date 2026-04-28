@@ -163,8 +163,12 @@ export interface PublishOptions {
 export interface QueueOptions {
   /** Maximum number of delivery attempts before moving to DLQ (0 for unlimited) */
   maxDeliveryAttempts?: number;
-  /** The keep-alive time in seconds (for exclusive queues) */
-  keepAliveSeconds?: number;
+  /**
+   * Keep-alive interval in seconds for exclusive queues. consume_message
+   * refreshes keep_alive_until on every call, and the client also runs a
+   * background timer that extends it every (interval / 2). Default 30s.
+   */
+  keepAliveInterval?: number;
 }
 
 /**

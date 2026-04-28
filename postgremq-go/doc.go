@@ -225,7 +225,7 @@
 //
 //	// Create exclusive queue with 5-minute keep-alive
 //	_ = conn.CreateQueue(ctx, "temp-queue", "events", true,
-//		postgremq.WithKeepAliveInterval(300))
+//		postgremq.WithKeepAliveInterval(5*time.Minute))
 //
 // The client extends keep-alive every 2.5 minutes (half the interval). If the connection
 // closes or the application crashes, the queue will be deleted after 5 minutes of inactivity.

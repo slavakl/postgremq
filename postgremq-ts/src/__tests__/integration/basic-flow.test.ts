@@ -233,7 +233,7 @@ describe('Basic Message Flow', () => {
   test('should support exclusive queues', async () => {
     await connection.createTopic('exclusive-topic');
     await connection.createQueue('exclusive-queue', 'exclusive-topic', true, {
-      keepAliveSeconds: 30
+      keepAliveInterval: 30
     });
 
     // Publish and consume

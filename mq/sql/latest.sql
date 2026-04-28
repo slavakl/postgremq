@@ -81,6 +81,7 @@ CREATE TABLE queues (
   topic_name VARCHAR(255) REFERENCES topics(name) ON DELETE CASCADE,
   max_delivery_attempts INT NOT NULL DEFAULT 0,
   exclusive BOOLEAN NOT NULL DEFAULT false,  -- Changed from durable
+  keep_alive_interval INTERVAL NOT NULL DEFAULT '30 seconds',
   keep_alive_until TIMESTAMPTZ
 );
 
@@ -232,8 +233,11 @@ $$ LANGUAGE plpgsql;
  *   - p_topic_name (VARCHAR): Name of the topic to subscribe to.
  *   - p_max_attempts (INTEGER): Maximum delivery attempts before moving to DLQ.
  *   - p_exclusive (BOOLEAN): If true, queue will be deleted when keep_alive expires.
- *   - p_keep_alive_sec (INTEGER): Seconds to keep the queue alive (only used for exclusive queues,
- *                                defaults to 30 seconds).
+ *   - p_keep_alive_interval (INTERVAL): Stored on the queue and used for both the initial
+ *                                       keep_alive_until (NOW() + interval) and for the
+ *                                       implicit refresh in consume_message. Defaults to
+ *                                       '30 seconds'. Effectively only matters for exclusive
+ *                                       queues; non-exclusive ones never expire.
  *
  * Returns: VOID.
  *
@@ -245,7 +249,7 @@ CREATE OR REPLACE FUNCTION create_queue(
     p_topic_name VARCHAR(255),
     p_max_attempts INTEGER DEFAULT 0,  -- Changed to 0 for unlimited retries
     p_exclusive BOOLEAN DEFAULT false,
-    p_keep_alive_sec INTEGER DEFAULT 30
+    p_keep_alive_interval INTERVAL DEFAULT '30 seconds'
 ) RETURNS VOID AS $$
 BEGIN
     IF p_queue_name IS NULL OR p_queue_name !~ '^[A-Za-z0-9_:.\-]+$' THEN
@@ -257,14 +261,16 @@ BEGIN
         topic_name,
         max_delivery_attempts,
         exclusive,
+        keep_alive_interval,
         keep_alive_until
     ) VALUES (
         p_queue_name,
         p_topic_name,
         p_max_attempts,
         p_exclusive,
+        p_keep_alive_interval,
         CASE
-            WHEN p_exclusive THEN NOW() + make_interval(secs => p_keep_alive_sec)
+            WHEN p_exclusive THEN NOW() + p_keep_alive_interval
             ELSE NULL
         END
     );
@@ -356,6 +362,17 @@ BEGIN
     IF p_limit <= 0 THEN
         RAISE EXCEPTION 'p_limit must be > 0' USING ERRCODE = 'PMQ03';
     END IF;
+
+    -- Refresh keep_alive_until for exclusive queues on every consume call.
+    -- Additive to extend_queue_keep_alive: covers the active-polling case
+    -- so a drifted client timer can't GC a queue that's still being used.
+    -- No-op for non-exclusive queues (their keep_alive_until is NULL).
+    UPDATE queues
+    SET keep_alive_until = NOW() + keep_alive_interval
+    WHERE name = p_queue_name
+      AND exclusive
+      AND keep_alive_until > NOW();
+
     RETURN QUERY
     WITH target_queue AS (
         SELECT name, max_delivery_attempts

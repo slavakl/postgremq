@@ -86,7 +86,7 @@ func TestPerTopicNotify_OutOfBandQueueNeedsWithTopic(t *testing.T) {
 	const queue = "QueueOutOfBand"
 	_, err := pool.Exec(ctx, "SELECT create_topic($1)", topic)
 	require.NoError(t, err)
-	_, err = pool.Exec(ctx, "SELECT create_queue($1, $2, 0, false, 30)", queue, topic)
+	_, err = pool.Exec(ctx, "SELECT create_queue($1, $2, 0, false, interval '30 seconds')", queue, topic)
 	require.NoError(t, err)
 
 	conn, err := postgremq.DialFromPool(ctx, pool)

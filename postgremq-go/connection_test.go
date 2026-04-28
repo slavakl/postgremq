@@ -1451,7 +1451,7 @@ func TestDeleteInactiveQueues(t *testing.T) {
 
 	// Create an active exclusive queue with future expiration (1 hour)
 	err = conn.CreateQueue(ctx, activeExclusiveQueueName, topicName, true,
-		postgremq.WithKeepAliveInterval(2))
+		postgremq.WithKeepAliveInterval(2*time.Second))
 	require.NoError(t, err, "Failed to create active exclusive queue")
 
 	// Create a non-exclusive queue (should not be affected by DeleteInactiveQueues)
@@ -1460,7 +1460,7 @@ func TestDeleteInactiveQueues(t *testing.T) {
 
 	// Create an exclusive queue that will be expired
 	err = conn.CreateQueue(ctx, expiredExclusiveQueueName, topicName, true,
-		postgremq.WithKeepAliveInterval(2))
+		postgremq.WithKeepAliveInterval(2*time.Second))
 	require.NoError(t, err, "Failed to create soon-to-be-expired exclusive queue")
 
 	// Verify all three queues exist initially

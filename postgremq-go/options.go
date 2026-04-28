@@ -120,8 +120,8 @@ func WithLevelLogger(logger LevelLogger) ConnectionOption {
 
 // queueOptions holds configuration for queue creation.
 type queueOptions struct {
-	maxDeliveryAttempts  int
-	keepAliveIntervalSec int
+	maxDeliveryAttempts int
+	keepAliveInterval   time.Duration
 }
 
 // QueueOption configures queue creation parameters.
@@ -132,8 +132,8 @@ type QueueOption func(*queueOptions)
 
 func defaultQueueOptions() queueOptions {
 	return queueOptions{
-		maxDeliveryAttempts:  3,
-		keepAliveIntervalSec: 300,
+		maxDeliveryAttempts: 3,
+		keepAliveInterval:   5 * time.Minute,
 	}
 }
 
@@ -156,24 +156,23 @@ func WithMaxDeliveryAttempts(n int) QueueOption {
 	}
 }
 
-// WithKeepAliveInterval sets the keep-alive interval (seconds) for exclusive queues.
+// WithKeepAliveInterval sets the keep-alive interval for exclusive queues.
 //
 // Exclusive queues are automatically deleted when their keep_alive_until
-// timestamp expires. The Connection automatically extends the keep-alive
-// timestamp roughly every (interval / 2) seconds while active.
+// timestamp expires. consume_message refreshes keep_alive_until on every
+// call (so an actively-polling consumer keeps its queue alive for free),
+// and the Connection runs a background timer that extends keep_alive_until
+// every (interval / 2) regardless. The interval should comfortably exceed
+// the longest expected gap between consume calls or message-handler runs.
 //
 // Parameters:
-//   - seconds: Keep-alive interval in seconds. Default is 300 (5 minutes).
+//   - d: Keep-alive interval. Default is 5 minutes.
 //
-// If the Connection closes or crashes, the queue will be deleted after
-// the interval expires. This is useful for temporary queues that should
-// be cleaned up when no longer needed.
-//
-// Only applicable when creating exclusive queues (exclusive=true parameter
-// in CreateQueue).
-func WithKeepAliveInterval(seconds int) QueueOption {
+// If the Connection closes or crashes, the queue is deleted after the
+// interval elapses. Only applicable to exclusive queues.
+func WithKeepAliveInterval(d time.Duration) QueueOption {
 	return func(o *queueOptions) {
-		o.keepAliveIntervalSec = seconds
+		o.keepAliveInterval = d
 	}
 }
 
