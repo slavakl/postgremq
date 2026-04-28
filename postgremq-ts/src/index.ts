@@ -23,6 +23,17 @@ export {
   Transaction
 } from './types';
 
+// Export typed errors so application code can `instanceof LeaseLostError`
+// or check `err.code === 'PMQ01'` without importing internal modules.
+export {
+  LeaseLostError,
+  QueueNotFoundError,
+  ValidationError,
+  ErrCodeLeaseLost,
+  ErrCodeQueueNotFound,
+  ErrCodeValidation,
+} from './errors';
+
 // Import implementation classes
 import { Connection as ConnectionImpl } from './connection';
 import { ConnectionOptions } from './types';

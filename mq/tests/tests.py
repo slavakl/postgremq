@@ -160,18 +160,20 @@ def test_queue_keep_alive_extension(cur: psycopg2.extensions.cursor) -> None:
 def test_exclusive_queue_uniqueness(cur: psycopg2.extensions.cursor) -> None:
     """Test that exclusive queues must have unique names."""
     cur.execute("SELECT create_topic('TestTopic')")
-    
+
     # Create first exclusive queue
     cur.execute("""
         SELECT create_queue('ExQueue1', 'TestTopic', 2, true, 300)
     """)
-    
-    # Attempt to create second exclusive queue with same name
-    with pytest.raises(Exception) as exc_info:
+
+    # Attempt to create second exclusive queue with same name; raises PMQ03.
+    with pytest.raises(psycopg2.Error) as exc_info:
         cur.execute("""
             SELECT create_queue('ExQueue1', 'TestTopic', 2, true, 300)
         """)
     assert "already exists" in str(exc_info.value)
+    assert exc_info.value.pgcode == 'PMQ03', f"expected PMQ03, got {exc_info.value.pgcode}"
+    cur.connection.rollback()
     
     # Verify we can call create twice for non-exclusive queues
     cur.execute("""
@@ -497,36 +499,30 @@ def test_set_vt_batch_comprehensive(cur: psycopg2.extensions.cursor) -> None:
     """, (subset_ids, subset_tokens))
     assert cur.fetchone()[0] == 2
     
-    # Test 3: Mismatched array lengths - should return correct number of matches
+    # Test 3: Mismatched array lengths now raise PMQ03 (validation error).
     truncated_tokens = tokens[:-1]
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM set_vt_batch('BatchCompQueue', %s, %s, 60)
+        """, (msg_ids, truncated_tokens))
+    assert exc_info.value.pgcode == 'PMQ03', f"expected PMQ03, got {exc_info.value.pgcode}"
+    cur.connection.rollback()
+
+    # Test 4: Non-existent queue — does not raise (no rows matched is fine).
     cur.execute("""
-        SELECT COUNT(*) 
-        FROM set_vt_batch('BatchCompQueue', %s, %s, 60)
-    """, (msg_ids, truncated_tokens))
-    # The actual implementation appears to match as many as it can
-    assert cur.fetchone()[0] == 4
-    
-    # Test 4: Non-existent queue
-    cur.execute("""
-        SELECT COUNT(*) 
+        SELECT COUNT(*)
         FROM set_vt_batch('NonExistentQueue', %s, %s, 60)
     """, (msg_ids, tokens))
-    
-    # Test 5: Negative VT value
-    cur.execute("""
-        SELECT COUNT(*) 
-        FROM set_vt_batch('BatchCompQueue', %s, %s, -60)
-    """, (msg_ids, tokens))
-    
-    # After setting negative VT, they should all be expired
-    time.sleep(0.1)  # Small delay to ensure they expire
-    
-    # Messages should be visible again
-    cur.execute("""
-        SELECT COUNT(*) 
-        FROM consume_message('BatchCompQueue', 30, 5)
-    """)
-    assert cur.fetchone()[0] == 5
+
+    # Test 5: Negative VT now raises PMQ03 (validation error).
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM set_vt_batch('BatchCompQueue', %s, %s, -60)
+        """, (msg_ids, tokens))
+    assert exc_info.value.pgcode == 'PMQ03'
+    cur.connection.rollback()
     
     # Clean up
     cur.execute("DELETE FROM queues WHERE name = 'BatchCompQueue'")
@@ -718,6 +714,76 @@ def test_create_queue_validates_name(cur: psycopg2.extensions.cursor) -> None:
             raise AssertionError(f"create_queue should have rejected {bad!r}")
         except psycopg2.Error:
             cur.connection.rollback()
+
+def test_sqlstate_codes_pmq01_lease_lost(cur: psycopg2.extensions.cursor) -> None:
+    """ack/nack/release/set_vt all raise PMQ01 when token doesn't match or vt expired."""
+    cur.execute("SELECT create_topic('SqlstateTopic')")
+    cur.execute("SELECT create_queue('SqlstateQueue', 'SqlstateTopic', 0, false)")
+    cur.execute("SELECT publish_message('SqlstateTopic', '{}'::jsonb)")
+    cur.execute("SELECT message_id, consumer_token FROM consume_message('SqlstateQueue', 30)")
+    msg_id, _ = cur.fetchone()
+
+    # Wrong token → PMQ01 from each operation.
+    for sql, args in [
+        ("SELECT ack_message('SqlstateQueue', %s, %s)", (msg_id, 'bogus')),
+        ("SELECT nack_message('SqlstateQueue', %s, %s)", (msg_id, 'bogus')),
+        ("SELECT release_message('SqlstateQueue', %s, %s)", (msg_id, 'bogus')),
+        ("SELECT set_vt('SqlstateQueue', %s, %s, 60)", (msg_id, 'bogus')),
+    ]:
+        with pytest.raises(psycopg2.Error) as exc_info:
+            cur.execute(sql, args)
+        assert exc_info.value.pgcode == 'PMQ01', f"{sql}: expected PMQ01, got {exc_info.value.pgcode}"
+        cur.connection.rollback()
+
+def test_sqlstate_codes_pmq02_topic_not_found(cur: psycopg2.extensions.cursor) -> None:
+    """publish_message on a non-existent topic raises PMQ02."""
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT publish_message('NoSuchTopic', '{}'::jsonb)")
+    assert exc_info.value.pgcode == 'PMQ02', f"expected PMQ02, got {exc_info.value.pgcode}"
+    cur.connection.rollback()
+
+def test_sqlstate_codes_pmq03_validation(cur: psycopg2.extensions.cursor) -> None:
+    """Validation paths raise PMQ03: negative vt, p_limit<=0, mismatched arrays, malformed names."""
+    cur.execute("SELECT create_topic('VTopic')")
+    cur.execute("SELECT create_queue('VQueue', 'VTopic', 0, false)")
+
+    # consume_message: negative vt
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT * FROM consume_message('VQueue', -1, 1)")
+    assert exc_info.value.pgcode == 'PMQ03'
+    cur.connection.rollback()
+
+    # consume_message: p_limit <= 0
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT * FROM consume_message('VQueue', 30, 0)")
+    assert exc_info.value.pgcode == 'PMQ03'
+    cur.connection.rollback()
+
+    # set_vt: negative vt
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT set_vt('VQueue', 1, 'tok', -1)")
+    assert exc_info.value.pgcode == 'PMQ03'
+    cur.connection.rollback()
+
+    # set_vt_batch: mismatched array lengths
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("""
+            SELECT * FROM set_vt_batch('VQueue', ARRAY[1,2]::int[], ARRAY['a']::varchar[], 60)
+        """)
+    assert exc_info.value.pgcode == 'PMQ03'
+    cur.connection.rollback()
+
+    # create_topic: invalid name
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT create_topic('bad name')")
+    assert exc_info.value.pgcode == 'PMQ03'
+    cur.connection.rollback()
+
+    # create_queue: invalid name
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT create_queue('bad queue', 'VTopic', 0, false)")
+    assert exc_info.value.pgcode == 'PMQ03'
+    cur.connection.rollback()
 
 def test_nack_final_attempt_inline_dlq(cur: psycopg2.extensions.cursor) -> None:
     """Final-attempt nack moves the row to DLQ inline (no maintenance call needed)."""

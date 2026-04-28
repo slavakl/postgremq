@@ -24,6 +24,7 @@ import {
 } from './types';
 import { Consumer as ConsumerImpl } from './consumer';
 import { EventEmitter, DEFAULT_RETRY_POLICY, shouldRetry, sleep, withRetry } from './utils';
+import { mapDbError } from './errors';
 
 /** Subscriber callback receives the message id parsed from the NOTIFY payload. */
 type SubscriberCallback = (messageId: number) => void;
@@ -565,21 +566,25 @@ export class Connection implements IConnection {
       throw new Error('Client is not connected');
     }
     
-    return this.executeWithRetry(async (client) => {
-      let query: string;
-      let params: any[];
-      
-      if (options.deliverAfter) {
-        query = 'SELECT publish_message($1, $2, $3) as publish_message';
-        params = [topic, JSON.stringify(payload), options.deliverAfter];
-      } else {
-        query = 'SELECT publish_message($1, $2) as publish_message';
-        params = [topic, JSON.stringify(payload)];
-      }
-      
-      const result = await client.query(query, params);
-      return result.rows[0].publish_message;
-    });
+    try {
+      return await this.executeWithRetry(async (client) => {
+        let query: string;
+        let params: any[];
+
+        if (options.deliverAfter) {
+          query = 'SELECT publish_message($1, $2, $3) as publish_message';
+          params = [topic, JSON.stringify(payload), options.deliverAfter];
+        } else {
+          query = 'SELECT publish_message($1, $2) as publish_message';
+          params = [topic, JSON.stringify(payload)];
+        }
+
+        const result = await client.query(query, params);
+        return result.rows[0].publish_message;
+      });
+    } catch (err) {
+      throw mapDbError(err);
+    }
   }
 
   /**
@@ -614,10 +619,14 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
-    await this.executeWithRetry(async (client) => {
-      await client.query('SELECT create_topic($1)', [topic]);
-    });
+
+    try {
+      await this.executeWithRetry(async (client) => {
+        await client.query('SELECT create_topic($1)', [topic]);
+      });
+    } catch (err) {
+      throw mapDbError(err);
+    }
   }
 
   /**
@@ -638,21 +647,25 @@ export class Connection implements IConnection {
       throw new Error('Client is not connected');
     }
 
-    await this.executeWithRetry(async (client) => {
-      // Always pass all parameters to avoid parameter index misalignment
-      const maxDeliveryAttempts = options.maxDeliveryAttempts ?? 0;
-      const keepAliveSeconds = options.keepAliveSeconds ?? 30;
+    try {
+      await this.executeWithRetry(async (client) => {
+        // Always pass all parameters to avoid parameter index misalignment
+        const maxDeliveryAttempts = options.maxDeliveryAttempts ?? 0;
+        const keepAliveSeconds = options.keepAliveSeconds ?? 30;
 
-      await client.query(
-        'SELECT create_queue($1, $2, $3, $4, $5)',
-        [name, topic, maxDeliveryAttempts, exclusive, keepAliveSeconds]
-      );
+        await client.query(
+          'SELECT create_queue($1, $2, $3, $4, $5)',
+          [name, topic, maxDeliveryAttempts, exclusive, keepAliveSeconds]
+        );
 
-      // If this is an exclusive queue with a keep-alive period, set up the keep-alive timer
-      if (exclusive && options.keepAliveSeconds) {
-        this.startQueueKeepAlive(name, options.keepAliveSeconds);
-      }
-    });
+        // If this is an exclusive queue with a keep-alive period, set up the keep-alive timer
+        if (exclusive && options.keepAliveSeconds) {
+          this.startQueueKeepAlive(name, options.keepAliveSeconds);
+        }
+      });
+    } catch (err) {
+      throw mapDbError(err);
+    }
     // Cache the queue->topic mapping so consume() can subscribe to the
     // per-topic publish channel without an extra DB lookup.
     this.topicCache.set(name, topic);
@@ -668,9 +681,13 @@ export class Connection implements IConnection {
       throw new Error('Client is not connected');
     }
     
-    await this.executeWithRetry(async (client) => {
-      await client.query('SELECT delete_topic($1)', [topic]);
-    });
+    try {
+      await this.executeWithRetry(async (client) => {
+        await client.query('SELECT delete_topic($1)', [topic]);
+      });
+    } catch (err) {
+      throw mapDbError(err);
+    }
   }
 
   /**
@@ -941,14 +958,17 @@ export class Connection implements IConnection {
       throw new Error('Client is not connected or shutting down');
     }
 
-    return this.executeWithRetry(async (client) => {
-      const result = await client.query(
-        'SELECT * FROM consume_message($1, $2, $3)',
-        [queueName, visibilityTimeout, limit]
-      );
-
-      return result.rows;
-    });
+    try {
+      return await this.executeWithRetry(async (client) => {
+        const result = await client.query(
+          'SELECT * FROM consume_message($1, $2, $3)',
+          [queueName, visibilityTimeout, limit]
+        );
+        return result.rows;
+      });
+    } catch (err) {
+      throw mapDbError(err);
+    }
   }
 
   /**
@@ -971,21 +991,29 @@ export class Connection implements IConnection {
     }
     
     if (tx) {
-      await tx.query('SELECT ack_message($1, $2, $3)', [
-        queueName,
-        messageId,
-        consumerToken
-      ]);
+      try {
+        await tx.query('SELECT ack_message($1, $2, $3)', [
+          queueName,
+          messageId,
+          consumerToken
+        ]);
+      } catch (err) {
+        throw mapDbError(err);
+      }
       return;
     }
-    
-    await this.executeWithRetry(async (client) => {
-      await client.query('SELECT ack_message($1, $2, $3)', [
-        queueName,
-        messageId,
-        consumerToken
-      ]);
-    });
+
+    try {
+      await this.executeWithRetry(async (client) => {
+        await client.query('SELECT ack_message($1, $2, $3)', [
+          queueName,
+          messageId,
+          consumerToken
+        ]);
+      });
+    } catch (err) {
+      throw mapDbError(err);
+    }
   }
 
   /**
@@ -1007,22 +1035,26 @@ export class Connection implements IConnection {
       throw new Error('Client is not connected');
     }
     
-    await this.executeWithRetry(async (client) => {
-      if (delayUntil) {
-        await client.query('SELECT nack_message($1, $2, $3, $4)', [
-          queueName,
-          messageId,
-          consumerToken,
-          delayUntil
-        ]);
-      } else {
-        await client.query('SELECT nack_message($1, $2, $3)', [
-          queueName,
-          messageId,
-          consumerToken
-        ]);
-      }
-    });
+    try {
+      await this.executeWithRetry(async (client) => {
+        if (delayUntil) {
+          await client.query('SELECT nack_message($1, $2, $3, $4)', [
+            queueName,
+            messageId,
+            consumerToken,
+            delayUntil
+          ]);
+        } else {
+          await client.query('SELECT nack_message($1, $2, $3)', [
+            queueName,
+            messageId,
+            consumerToken
+          ]);
+        }
+      });
+    } catch (err) {
+      throw mapDbError(err);
+    }
   }
 
   /**
@@ -1042,13 +1074,17 @@ export class Connection implements IConnection {
       throw new Error('Client is not connected');
     }
     
-    await this.executeWithRetry(async (client) => {
-      await client.query('SELECT release_message($1, $2, $3)', [
-        queueName,
-        messageId,
-        consumerToken
-      ]);
-    });
+    try {
+      await this.executeWithRetry(async (client) => {
+        await client.query('SELECT release_message($1, $2, $3)', [
+          queueName,
+          messageId,
+          consumerToken
+        ]);
+      });
+    } catch (err) {
+      throw mapDbError(err);
+    }
   }
 
   /**
@@ -1070,14 +1106,17 @@ export class Connection implements IConnection {
       throw new Error('Client is not connected');
     }
     
-    return this.executeWithRetry(async (client) => {
-      const result = await client.query(
-        'SELECT set_vt($1, $2, $3, $4) AS new_vt',
-        [queueName, messageId, consumerToken, visibilityTimeout]
-      );
-      
-      return new Date(result.rows[0].new_vt);
-    });
+    try {
+      return await this.executeWithRetry(async (client) => {
+        const result = await client.query(
+          'SELECT set_vt($1, $2, $3, $4) AS new_vt',
+          [queueName, messageId, consumerToken, visibilityTimeout]
+        );
+        return new Date(result.rows[0].new_vt);
+      });
+    } catch (err) {
+      throw mapDbError(err);
+    }
   }
 
   /**
@@ -1099,17 +1138,20 @@ export class Connection implements IConnection {
       throw new Error('Client is not connected');
     }
     
-    return this.executeWithRetry(async (client) => {
-      const result = await client.query(
-        'SELECT * FROM set_vt_batch($1, $2, $3, $4)',
-        [queueName, messageIds, consumerTokens, visibilityTimeout]
-      );
-      
-      return result.rows.map(row => [
-        row.message_id,
-        new Date(row.new_vt)
-      ]);
-    });
+    try {
+      return await this.executeWithRetry(async (client) => {
+        const result = await client.query(
+          'SELECT * FROM set_vt_batch($1, $2, $3, $4)',
+          [queueName, messageIds, consumerTokens, visibilityTimeout]
+        );
+        return result.rows.map(row => [
+          row.message_id,
+          new Date(row.new_vt)
+        ]);
+      });
+    } catch (err) {
+      throw mapDbError(err);
+    }
   }
 
   /**

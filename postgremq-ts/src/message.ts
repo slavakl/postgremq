@@ -4,6 +4,7 @@
  */
 
 import { MessageOptions, Transaction } from './types';
+import { LeaseLostError, QueueNotFoundError, ValidationError } from './errors';
 
 /**
  * Message class representing a message retrieved from a queue.
@@ -292,6 +293,17 @@ export class Message {
    * @returns Wrapped error
    */
   private wrapError(message: string, error: any): Error {
+    // Preserve typed PostgreMQ errors (LeaseLostError / QueueNotFoundError /
+    // ValidationError) so callers can `instanceof`-match. Wrapping these in
+    // a generic Error would erase the type — and the `code` field — that the
+    // application relies on to distinguish failure modes.
+    if (
+      error instanceof LeaseLostError ||
+      error instanceof QueueNotFoundError ||
+      error instanceof ValidationError
+    ) {
+      return error;
+    }
     const wrappedError = new Error(`${message}: ${error.message}`);
     wrappedError.stack = error.stack;
     return wrappedError;

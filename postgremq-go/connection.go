@@ -4,19 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-)
-
-// ErrConnectionClosed is returned when an operation is attempted after
-// the Connection has begun shutting down or has been closed.
-var (
-	ErrConnectionClosed = errors.New("connection is stopped")
 )
 
 // Stoppable is implemented by consumers that can be stopped during shutdown.
@@ -58,10 +51,6 @@ type Connection struct {
 	// with ErrQueueNotFound.
 	topicCache sync.Map
 }
-
-// ErrQueueNotFound is returned when Consume cannot resolve a queue's topic
-// because the queue does not exist in the database.
-var ErrQueueNotFound = errors.New("postgremq: queue not found")
 
 // Dial creates a new Connection, building an underlying pgxpool.Pool from the
 // provided pgx PoolConfig.
@@ -192,7 +181,7 @@ func (c *Connection) CreateTopic(ctx context.Context, topic string) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
 		_, err := c.pool.Exec(ctx, "SELECT create_topic($1)", topic)
 		if err != nil {
-			return fmt.Errorf("failed to create topic: %w", err)
+			return mapPgError(fmt.Errorf("failed to create topic: %w", err))
 		}
 		return nil
 	})
@@ -229,7 +218,7 @@ func (c *Connection) CreateQueue(ctx context.Context, name, topic string, exclus
 			exclusive,                    // p_exclusive
 			options.keepAliveIntervalSec) // p_keep_alive_sec
 		if err != nil {
-			return fmt.Errorf("failed to create queue: %w", err)
+			return mapPgError(fmt.Errorf("failed to create queue: %w", err))
 		}
 		return nil
 	})
@@ -520,18 +509,18 @@ func (c *Connection) SetVTBatch(ctx context.Context, queue string, locks []Messa
 			"SELECT message_id, vt FROM set_vt_batch($1, $2, $3, $4)",
 			queue, ids, tokens, vt)
 		if err != nil {
-			return fmt.Errorf("failed to set message visibility timeout: %w", err)
+			return mapPgError(fmt.Errorf("failed to set message visibility timeout: %w", err))
 		}
 		defer rows.Close()
 
 		for rows.Next() {
 			var newLock MessageLock
 			if err := rows.Scan(&newLock.ID, &newLock.VT); err != nil {
-				return err
+				return mapPgError(err)
 			}
 			extendedIDs = append(extendedIDs, newLock)
 		}
-		return rows.Err()
+		return mapPgError(rows.Err())
 	})
 
 	return extendedIDs, err
@@ -594,7 +583,7 @@ func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, pa
 		messageID, err = publish(ctx)
 	}
 	if err != nil {
-		return 0, fmt.Errorf("failed to publish message: %w", err)
+		return 0, mapPgError(fmt.Errorf("failed to publish message: %w", err))
 	}
 	return messageID, nil
 }
@@ -610,7 +599,7 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 			"SELECT message_id, payload, consumer_token, delivery_attempts, vt, published_at FROM consume_message($1, $2, $3)",
 			queue, vt, limit)
 		if err != nil {
-			return fmt.Errorf("failed to consume messages: %w", err)
+			return mapPgError(fmt.Errorf("failed to consume messages: %w", err))
 		}
 		defer rows.Close()
 
@@ -625,7 +614,7 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 				publishedAt      time.Time
 			)
 			if err := rows.Scan(&id, &payload, &consumerToken, &deliveryAttempts, &vt, &publishedAt); err != nil {
-				return fmt.Errorf("failed to scan message: %w", err)
+				return mapPgError(fmt.Errorf("failed to scan message: %w", err))
 			}
 
 			// Create a new Message and ensure all internal fields are initialized.
@@ -641,7 +630,7 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 			}
 			messages = append(messages, msg)
 		}
-		return rows.Err()
+		return mapPgError(rows.Err())
 	})
 
 	return messages, err
@@ -662,7 +651,7 @@ func (c *Connection) ackMessage(ctx context.Context, queue string, messageID int
 			"SELECT ack_message($1, $2, $3)",
 			queue, messageID, consumerToken)
 		if err != nil {
-			return fmt.Errorf("failed to ack message: %w", err)
+			return mapPgError(fmt.Errorf("failed to ack message: %w", err))
 		}
 		return nil
 	})
@@ -678,7 +667,7 @@ func (c *Connection) ackMessageWithTx(ctx context.Context, tx Tx, queue string, 
 		"SELECT ack_message($1, $2, $3)",
 		queue, messageID, consumerToken)
 	if err != nil {
-		return fmt.Errorf("failed to ack message within transaction: %w", err)
+		return mapPgError(fmt.Errorf("failed to ack message within transaction: %w", err))
 	}
 	return nil
 }
@@ -689,7 +678,7 @@ func (c *Connection) releaseMessage(ctx context.Context, queue string, messageID
 			"SELECT release_message($1, $2, $3)",
 			queue, messageID, consumerToken)
 		if err != nil {
-			return fmt.Errorf("failed to release message: %w", err)
+			return mapPgError(fmt.Errorf("failed to release message: %w", err))
 		}
 		return nil
 	})
@@ -708,7 +697,7 @@ func (c *Connection) nackMessage(ctx context.Context, queue string, messageID in
 				queue, messageID, consumerToken)
 		}
 		if err != nil {
-			return fmt.Errorf("failed to nack message: %w", err)
+			return mapPgError(fmt.Errorf("failed to nack message: %w", err))
 		}
 		return nil
 	})
@@ -1019,7 +1008,7 @@ func (c *Connection) PurgeAllMessages(ctx context.Context) error {
 func (c *Connection) DeleteTopic(ctx context.Context, topic string) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
 		_, err := c.pool.Exec(ctx, "SELECT delete_topic($1)", topic)
-		return err
+		return mapPgError(err)
 	})
 }
 

@@ -255,7 +255,7 @@ func (m *Message) SetVT(ctx context.Context, vt int) (time.Time, error) {
 			m.queue, m.ID, m.consumerToken, vt).Scan(&newVT)
 	})
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, mapPgError(err)
 	}
 
 	m.vtMu.Lock()

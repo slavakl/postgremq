@@ -211,7 +211,8 @@ CREATE OR REPLACE FUNCTION create_topic(p_topic VARCHAR(255))
 RETURNS VARCHAR(255) AS $$
 BEGIN
   IF p_topic IS NULL OR p_topic !~ '^[A-Za-z0-9_:.\-]+$' THEN
-    RAISE EXCEPTION 'Invalid topic name "%": must match ^[A-Za-z0-9_:.\-]+$', p_topic;
+    RAISE EXCEPTION 'Invalid topic name "%": must match ^[A-Za-z0-9_:.\-]+$', p_topic
+      USING ERRCODE = 'PMQ03';
   END IF;
   INSERT INTO topics(name) VALUES (p_topic)
   ON CONFLICT (name) DO NOTHING;
@@ -248,7 +249,8 @@ CREATE OR REPLACE FUNCTION create_queue(
 ) RETURNS VOID AS $$
 BEGIN
     IF p_queue_name IS NULL OR p_queue_name !~ '^[A-Za-z0-9_:.\-]+$' THEN
-        RAISE EXCEPTION 'Invalid queue name "%": must match ^[A-Za-z0-9_:.\-]+$', p_queue_name;
+        RAISE EXCEPTION 'Invalid queue name "%": must match ^[A-Za-z0-9_:.\-]+$', p_queue_name
+          USING ERRCODE = 'PMQ03';
     END IF;
     INSERT INTO queues (
         name,
@@ -269,7 +271,8 @@ BEGIN
 EXCEPTION
     WHEN unique_violation THEN
         IF p_exclusive THEN
-            RAISE EXCEPTION 'An exclusive queue with name "%" already exists', p_queue_name;
+            RAISE EXCEPTION 'An exclusive queue with name "%" already exists', p_queue_name
+              USING ERRCODE = 'PMQ03';
         ELSE
             RAISE;
         END IF;
@@ -306,7 +309,8 @@ DECLARE
     v_message_id INT;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM topics WHERE name = p_topic) THEN
-        RAISE EXCEPTION 'Topic "%" does not exist', p_topic;
+        RAISE EXCEPTION 'Topic "%" does not exist', p_topic
+          USING ERRCODE = 'PMQ02';
     END IF;
     
     INSERT INTO messages(topic_name, payload, deliver_after)
@@ -337,15 +341,21 @@ CREATE OR REPLACE FUNCTION consume_message(
     p_vt INTEGER,
     p_limit INT DEFAULT 1
 ) RETURNS TABLE(
-    queue_name VARCHAR(255), 
+    queue_name VARCHAR(255),
     message_id INT,
-    payload JSONB, 
+    payload JSONB,
     consumer_token VARCHAR(64),
     delivery_attempts INT,
     vt TIMESTAMPTZ,
     published_at TIMESTAMPTZ
 ) AS $$
 BEGIN
+    IF p_vt < 0 THEN
+        RAISE EXCEPTION 'p_vt must be >= 0' USING ERRCODE = 'PMQ03';
+    END IF;
+    IF p_limit <= 0 THEN
+        RAISE EXCEPTION 'p_limit must be > 0' USING ERRCODE = 'PMQ03';
+    END IF;
     RETURN QUERY
     WITH target_queue AS (
         SELECT name, max_delivery_attempts
@@ -415,7 +425,8 @@ BEGIN
     AND status = 'processing'
     AND consumer_token = p_consumer_token;
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'Ack failed: message not found, not in processing state, or token mismatch';
+    RAISE EXCEPTION 'Ack failed: message not found, not in processing state, or token mismatch'
+      USING ERRCODE = 'PMQ01';
   END IF;
 END;
 $$ LANGUAGE plpgsql;
@@ -463,7 +474,8 @@ BEGIN
     RETURNING delivery_attempts INTO v_attempts;
 
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'Nack failed: message not in processing state or token mismatch';
+        RAISE EXCEPTION 'Nack failed: message not in processing state or token mismatch'
+          USING ERRCODE = 'PMQ01';
     END IF;
 
     IF v_max_attempts > 0 AND v_attempts >= v_max_attempts THEN
@@ -518,7 +530,8 @@ BEGIN
       AND consumer_token = p_consumer_token;
 
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'Release message failed: message not in processing state or token mismatch';
+        RAISE EXCEPTION 'Release message failed: message not in processing state or token mismatch'
+          USING ERRCODE = 'PMQ01';
     END IF;
 
     PERFORM pg_notify('pmq:q:' || p_queue_name, p_message_id::text);
@@ -555,6 +568,10 @@ CREATE OR REPLACE FUNCTION set_vt(
 DECLARE
     v_vt TIMESTAMPTZ;
 BEGIN
+    IF p_vt < 0 THEN
+        RAISE EXCEPTION 'p_vt must be >= 0' USING ERRCODE = 'PMQ03';
+    END IF;
+
     UPDATE queue_messages
     SET vt = NOW() + make_interval(secs => p_vt)
     WHERE queue_name = p_queue_name
@@ -565,7 +582,8 @@ BEGIN
     RETURNING vt INTO v_vt;
 
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'Extend lock failed: message not in processing state or token mismatch';
+        RAISE EXCEPTION 'Extend lock failed: message not in processing state or token mismatch'
+          USING ERRCODE = 'PMQ01';
     END IF;
 
     RETURN v_vt;
@@ -839,7 +857,8 @@ CREATE OR REPLACE FUNCTION delete_topic(p_topic VARCHAR(255))
 RETURNS VOID AS $$
 BEGIN
   IF EXISTS (SELECT 1 FROM messages WHERE topic_name = p_topic) THEN
-    RAISE EXCEPTION 'Cannot delete topic "%" because messages exist. Clean up the topic first.', p_topic;
+    RAISE EXCEPTION 'Cannot delete topic "%" because messages exist. Clean up the topic first.', p_topic
+      USING ERRCODE = 'PMQ03';
   END IF;
   DELETE FROM topics WHERE name = p_topic;
 END;
@@ -960,6 +979,16 @@ CREATE OR REPLACE FUNCTION set_vt_batch(
     p_vt INTEGER
 ) RETURNS TABLE (message_id INTEGER, vt TIMESTAMPTZ) AS $$
 BEGIN
+    IF p_vt < 0 THEN
+        RAISE EXCEPTION 'p_vt must be >= 0' USING ERRCODE = 'PMQ03';
+    END IF;
+    IF COALESCE(array_length(p_message_ids, 1), 0)
+       IS DISTINCT FROM
+       COALESCE(array_length(p_consumer_tokens, 1), 0) THEN
+        RAISE EXCEPTION 'p_message_ids and p_consumer_tokens must have the same length'
+          USING ERRCODE = 'PMQ03';
+    END IF;
+
     RETURN QUERY
     WITH to_update AS (
         SELECT unnest(p_message_ids) AS msg_id,
