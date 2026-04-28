@@ -769,9 +769,18 @@ export class Consumer {
         
         // This shouldn't happen, but just in case
         return messageIterator.next();
-      }
+      },
+
+      // Called by the runtime when the consumer of `for await ... of` exits
+      // early — break, return, throw, an outer-scope catch. Without this, the
+      // auto-extension timer, LISTEN refcount, and any buffered/in-flight
+      // messages would leak until the GC eventually finalized the iterator.
+      return: async (): Promise<IteratorResult<Message>> => {
+        await this.stop();
+        return { done: true, value: undefined as any };
+      },
     };
-    
+
     return messageIterator;
   }
-} 
+}

@@ -3,7 +3,7 @@
  * Tests consumer behavior, batching, auto-extension, and shutdown
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, jest } from '@jest/globals';
 import {
   TestDatabase,
   createIsolatedTestConnection,
@@ -403,6 +403,78 @@ describe('Consumer', () => {
         const hasValidError = validErrors.some(msg => error.message.includes(msg));
         expect(hasValidError).toBe(true);
       }
+    });
+  });
+
+  // The consumer's messages() returns an AsyncIterableIterator. When user
+  // code does `for await (const msg of consumer) { ...; break; }`, the
+  // runtime calls iterator.return() for early-exit cleanup. Without an
+  // explicit return() implementation, the auto-extension timer, LISTEN
+  // refcount, and any buffered/in-flight messages would leak until GC.
+  describe('AsyncIterator cleanup on early exit', () => {
+    test('break out of for-await triggers consumer.stop()', async () => {
+      for (let i = 0; i < 3; i++) {
+        await connection.publish('consumer-test-topic', generateTestPayload(i));
+      }
+
+      const consumer = connection.consume('consumer-test-queue', {
+        batchSize: 5,
+        visibilityTimeoutSec: 30,
+      });
+      const stopSpy = jest.spyOn(consumer, 'stop');
+
+      let received = 0;
+      for await (const msg of consumer.messages()) {
+        received++;
+        await msg.ack();
+        break;
+      }
+
+      expect(received).toBe(1);
+      expect(stopSpy).toHaveBeenCalled();
+    });
+
+    test('return out of for-await triggers consumer.stop()', async () => {
+      for (let i = 0; i < 2; i++) {
+        await connection.publish('consumer-test-topic', generateTestPayload(i));
+      }
+
+      const consumer = connection.consume('consumer-test-queue', {
+        batchSize: 5,
+        visibilityTimeoutSec: 30,
+      });
+      const stopSpy = jest.spyOn(consumer, 'stop');
+
+      const wrap = async () => {
+        for await (const msg of consumer.messages()) {
+          await msg.ack();
+          return 'early';
+        }
+        return 'completed';
+      };
+      expect(await wrap()).toBe('early');
+      expect(stopSpy).toHaveBeenCalled();
+    });
+
+    test('throw inside for-await triggers consumer.stop()', async () => {
+      for (let i = 0; i < 2; i++) {
+        await connection.publish('consumer-test-topic', generateTestPayload(i));
+      }
+
+      const consumer = connection.consume('consumer-test-queue', {
+        batchSize: 5,
+        visibilityTimeoutSec: 30,
+      });
+      const stopSpy = jest.spyOn(consumer, 'stop');
+
+      await expect(async () => {
+        for await (const msg of consumer.messages()) {
+          await msg.ack();
+          throw new Error('intentional');
+        }
+      }).rejects.toThrow('intentional');
+
+      expect(stopSpy).toHaveBeenCalled();
     });
   });
 });
