@@ -29,7 +29,7 @@ const (
 // mismatch or message no longer in processing state).
 type Message struct {
 	// ID is the unique message identifier.
-	ID int
+	ID int64
 	// Payload is the JSON-encoded message payload.
 	Payload json.RawMessage
 	// PublishedAt is when the message was first published to the topic.

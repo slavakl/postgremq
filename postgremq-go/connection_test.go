@@ -335,7 +335,7 @@ func TestMessagePublishing(t *testing.T) {
 	payload := []byte(`{"key":"value","number":42}`)
 	msgID, err := conn.Publish(ctx, topicName, payload)
 	require.NoError(t, err, "Failed to publish message")
-	require.Greater(t, msgID, 0, "Message ID should be positive")
+	require.Greater(t, msgID, int64(0), "Message ID should be positive")
 
 	// Consume the message to verify it was published
 	consumer, err := conn.Consume(ctx, queueName)
@@ -811,7 +811,7 @@ func TestQueueStatistics(t *testing.T) {
 
 	// Publish messages to the queue
 	numMessages := 5
-	messageIDs := make([]int, numMessages)
+	messageIDs := make([]int64, numMessages)
 	for i := 0; i < numMessages; i++ {
 		msgID, err := conn.Publish(ctx, topicName, []byte(fmt.Sprintf(`{"index":%d}`, i)))
 		require.NoError(t, err, "Failed to publish message")
@@ -1063,10 +1063,10 @@ func TestCleanupCompletedMessages(t *testing.T) {
 	require.NoError(t, err, "Failed to consume messages directly")
 	defer rows.Close()
 
-	var messageIDs []int
+	var messageIDs []int64
 	var tokens []string
 	for rows.Next() {
-		var id int
+		var id int64
 		var token string
 		err := rows.Scan(&id, &token)
 		require.NoError(t, err, "Failed to scan consumed message")
@@ -1515,7 +1515,7 @@ func TestPublishWithTx(t *testing.T) {
 		payload := []byte(`{"key":"commit_test","number":123}`)
 		msgID, err := conn.PublishWithTx(ctx, tx, topicName, payload)
 		require.NoError(t, err, "Failed to publish message within transaction")
-		require.Greater(t, msgID, 0, "Message ID should be positive")
+		require.Greater(t, msgID, int64(0), "Message ID should be positive")
 
 		// Commit the transaction
 		err = tx.Commit(ctx)
@@ -1577,7 +1577,7 @@ func TestPublishWithTx(t *testing.T) {
 		payload := []byte(`{"key":"rollback_test","number":456}`)
 		msgID, err := conn.PublishWithTx(ctx, tx, topicName, payload)
 		require.NoError(t, err, "Failed to publish message within transaction")
-		require.Greater(t, msgID, 0, "Message ID should be positive")
+		require.Greater(t, msgID, int64(0), "Message ID should be positive")
 
 		// Rollback the transaction
 		err = tx.Rollback(ctx)

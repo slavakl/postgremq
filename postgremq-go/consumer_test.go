@@ -47,7 +47,7 @@ func TestConsumerStartAndReceive(t *testing.T) {
 		payload := []byte(fmt.Sprintf("{\"message\": \"message-%d\"}", i))
 		messageID, err := conn.Publish(ctx, topicName, payload)
 		require.NoError(t, err, "Publish failed")
-		assert.Greater(t, messageID, 0, "Expected valid message ID")
+		assert.Greater(t, messageID, int64(0), "Expected valid message ID")
 	}
 
 	// conn.Consume automatically starts the consumer.
@@ -150,7 +150,7 @@ func TestConsumerMultipleDistribution(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		messageID, err := conn.Publish(ctx, topicName, []byte(fmt.Sprintf("\"msg-%d\"", i)))
 		require.NoError(t, err, "Publish failed")
-		assert.Greater(t, messageID, 0, "Expected valid message ID")
+		assert.Greater(t, messageID, int64(0), "Expected valid message ID")
 	}
 
 	consumer1, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(3))
@@ -161,7 +161,7 @@ func TestConsumerMultipleDistribution(t *testing.T) {
 	require.NoError(t, err, "Consume failed for consumer2")
 	defer consumer2.Stop()
 
-	receivedMsgs := make(map[int]bool)
+	receivedMsgs := make(map[int64]bool)
 	var mu sync.Mutex
 	wg := sync.WaitGroup{}
 	wg.Add(2)
@@ -272,14 +272,14 @@ func TestConsumerBufferedMessagesReleased(t *testing.T) {
 		payload := []byte(fmt.Sprintf("{\"msg\": \"msg-%d\"}", i))
 		messageID, err := conn.Publish(ctx, topicName, payload)
 		require.NoError(t, err, "Publish failed")
-		require.Greater(t, messageID, 0, "Expected valid message ID")
+		require.Greater(t, messageID, int64(0), "Expected valid message ID")
 	}
 
 	// Create a consumer with a BatchSize of 5.
 	consumer, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(5), postgremq.WithVT(10))
 	require.NoError(t, err, "Consume failed")
 
-	nackedMessages := make(map[int]struct{})
+	nackedMessages := make(map[int64]struct{})
 	// Read only 3 messages from the consumer and nack them.
 	for i := 0; i < 3; i++ {
 		msg := <-consumer.Messages()

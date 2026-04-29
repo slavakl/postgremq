@@ -89,8 +89,10 @@ CREATE TABLE queues (
 );
 
 -- Messages table: payload stored as JSONB.
+-- id is BIGSERIAL: int32 SERIAL would wrap in months at sustained high publish
+-- rates and silently corrupt message identity.
 CREATE TABLE messages (
-  id SERIAL PRIMARY KEY,
+  id BIGSERIAL PRIMARY KEY,
   topic_name VARCHAR(255) REFERENCES topics(name) ON DELETE CASCADE,
   payload JSONB NOT NULL,
   published_at TIMESTAMPTZ DEFAULT NOW(),
@@ -101,7 +103,7 @@ CREATE TABLE messages (
 -- Composite primary key: (queue_name, message_id).
 CREATE TABLE queue_messages (
   queue_name VARCHAR(255) REFERENCES queues(name) ON DELETE CASCADE,
-  message_id INT REFERENCES messages(id) ON DELETE CASCADE,
+  message_id BIGINT REFERENCES messages(id) ON DELETE CASCADE,
   status VARCHAR(16) DEFAULT 'pending',  -- Allowed: 'pending', 'processing', 'completed'
   published_at TIMESTAMPTZ DEFAULT NOW(),
   vt TIMESTAMPTZ NOT NULL DEFAULT NOW(),  -- Renamed from locked_until
@@ -115,7 +117,7 @@ CREATE TABLE queue_messages (
 -- Composite primary key: (queue_name, message_id).
 CREATE TABLE dead_letter_queue (
   queue_name VARCHAR(255) REFERENCES queues(name) ON DELETE CASCADE,
-  message_id INT REFERENCES messages(id) ON DELETE CASCADE,
+  message_id BIGINT REFERENCES messages(id) ON DELETE CASCADE,
   retry_count INT,
   published_at TIMESTAMPTZ DEFAULT NOW(),
   PRIMARY KEY (queue_name, message_id)
@@ -303,19 +305,19 @@ $$ LANGUAGE plpgsql;
  *   - p_deliver_after (TIMESTAMPTZ, default NOW()): First visibility time.
  *
  * Returns:
- *   INT: The generated message id.
+ *   BIGINT: The generated message id.
  *
  * Side Effects:
  *   - Triggers `distribute_message()` which inserts into `queue_messages` and
  *     emits NOTIFY on `postgremq_events`.
  */
 CREATE OR REPLACE FUNCTION publish_message(
-    p_topic VARCHAR(255), 
+    p_topic VARCHAR(255),
     p_payload JSONB,
     p_deliver_after TIMESTAMPTZ DEFAULT NOW()
-) RETURNS INT AS $$
+) RETURNS BIGINT AS $$
 DECLARE
-    v_message_id INT;
+    v_message_id BIGINT;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM topics WHERE name = p_topic) THEN
         RAISE EXCEPTION 'Topic "%" does not exist', p_topic
@@ -351,7 +353,7 @@ CREATE OR REPLACE FUNCTION consume_message(
     p_limit INT DEFAULT 1
 ) RETURNS TABLE(
     queue_name VARCHAR(255),
-    message_id INT,
+    message_id BIGINT,
     payload JSONB,
     consumer_token VARCHAR(64),
     delivery_attempts INT,
@@ -433,7 +435,7 @@ $$ LANGUAGE plpgsql;
  *
  * Note: The actual implementation is assumed to exist elsewhere if not defined here.
  */
-CREATE OR REPLACE FUNCTION ack_message(p_queue_name VARCHAR(255), p_message_id INT, p_consumer_token VARCHAR(64))
+CREATE OR REPLACE FUNCTION ack_message(p_queue_name VARCHAR(255), p_message_id BIGINT, p_consumer_token VARCHAR(64))
 RETURNS VOID AS $$
 BEGIN
   UPDATE queue_messages
@@ -468,7 +470,7 @@ $$ LANGUAGE plpgsql;
  */
 CREATE OR REPLACE FUNCTION nack_message(
     p_queue_name VARCHAR(255),
-    p_message_id INT,
+    p_message_id BIGINT,
     p_consumer_token VARCHAR(64),
     p_delay_until TIMESTAMPTZ DEFAULT NOW()
 ) RETURNS VOID AS $$
@@ -534,7 +536,7 @@ $$ LANGUAGE plpgsql;
  */
 CREATE OR REPLACE FUNCTION release_message(
     p_queue_name VARCHAR(255),
-    p_message_id INT,
+    p_message_id BIGINT,
     p_consumer_token VARCHAR(64)
 )
     RETURNS VOID AS $$
@@ -581,7 +583,7 @@ $$ LANGUAGE plpgsql;
  */
 CREATE OR REPLACE FUNCTION set_vt(
     p_queue_name VARCHAR(255),
-    p_message_id INTEGER,
+    p_message_id BIGINT,
     p_consumer_token VARCHAR(64),
     p_vt INTEGER
 ) RETURNS TIMESTAMPTZ AS $$
@@ -819,7 +821,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION list_dlq_messages()
 RETURNS TABLE(
   queue_name VARCHAR(255),
-  message_id INT,
+  message_id BIGINT,
   retry_count INT,
   published_at TIMESTAMPTZ
 ) AS $$
@@ -940,7 +942,7 @@ $$ LANGUAGE plpgsql;
  *
  * Returns: VOID.
  */
-CREATE OR REPLACE FUNCTION delete_queue_message(p_queue_name VARCHAR(255), p_message_id INT)
+CREATE OR REPLACE FUNCTION delete_queue_message(p_queue_name VARCHAR(255), p_message_id BIGINT)
 RETURNS VOID AS $$
 BEGIN
   DELETE FROM queue_messages
@@ -1022,10 +1024,10 @@ $$ LANGUAGE plpgsql;
  */
 CREATE OR REPLACE FUNCTION set_vt_batch(
     p_queue_name VARCHAR(255),
-    p_message_ids INTEGER[],
+    p_message_ids BIGINT[],
     p_consumer_tokens VARCHAR[],
     p_vt INTEGER
-) RETURNS TABLE (message_id INTEGER, vt TIMESTAMPTZ) AS $$
+) RETURNS TABLE (message_id BIGINT, vt TIMESTAMPTZ) AS $$
 BEGIN
     IF p_vt < 0 THEN
         RAISE EXCEPTION 'p_vt must be >= 0' USING ERRCODE = 'PMQ03';
@@ -1076,7 +1078,7 @@ $$ LANGUAGE plpgsql;
  */
 CREATE OR REPLACE FUNCTION list_messages(p_queue_name VARCHAR(255))
 RETURNS TABLE(
-    message_id INT,
+    message_id BIGINT,
     status VARCHAR(16),
     published_at TIMESTAMPTZ,
     delivery_attempts INT,
@@ -1109,9 +1111,9 @@ $$ LANGUAGE plpgsql;
  * Returns:
  *   A TABLE with message details and payload.
  */
-CREATE OR REPLACE FUNCTION get_message(p_message_id INT)
+CREATE OR REPLACE FUNCTION get_message(p_message_id BIGINT)
 RETURNS TABLE(
-    message_id INT,
+    message_id BIGINT,
     topic_name VARCHAR(255),
     payload JSONB,
     published_at TIMESTAMPTZ

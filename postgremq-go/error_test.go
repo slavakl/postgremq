@@ -425,7 +425,7 @@ func TestVeryLargePayload(t *testing.T) {
 	// Publish the large message
 	messageID, err := conn.Publish(ctx, topicName, jsonPayload)
 	require.NoError(t, err, "Failed to publish large message")
-	assert.Greater(t, messageID, 0, "Expected valid message ID")
+	assert.Greater(t, messageID, int64(0), "Expected valid message ID")
 
 	// Consume and verify the message
 	consumer, err := conn.Consume(ctx, queueName)
@@ -470,7 +470,7 @@ func TestBoundaryConditions(t *testing.T) {
 	// Test boundary conditions with empty payload
 	messageID, err := conn.Publish(ctx, topicName, []byte(`{}`))
 	require.NoError(t, err, "Should accept empty JSON object payload")
-	assert.Greater(t, messageID, 0, "Should return valid message ID")
+	assert.Greater(t, messageID, int64(0), "Should return valid message ID")
 
 	// Allow time for the message to be properly published
 	time.Sleep(1 * time.Second)

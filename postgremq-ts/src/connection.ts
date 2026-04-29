@@ -3,7 +3,16 @@
  * Connection management
  */
 
-import { Pool, PoolClient, PoolConfig } from 'pg';
+import { Pool, PoolClient, PoolConfig, types as pgTypes } from 'pg';
+
+// PostgreSQL BIGINT (OID 20) is parsed by node-pg as a string by default to
+// avoid silent precision loss past 2^53. JS `number` covers up to
+// Number.MAX_SAFE_INTEGER (~9×10¹⁵), which is far past PostgreMQ's expected
+// id range (and significantly larger than the int32 it just replaced), so we
+// register a parser that returns a number — matching the TypeScript surface
+// (`Message.id: number`, `MessageId: number`, etc.). Process-global setting;
+// safe because PostgreMQ controls the column types it inserts.
+pgTypes.setTypeParser(20, (val: string) => parseInt(val, 10));
 import {
   ConnectionOptions,
   Consumer,

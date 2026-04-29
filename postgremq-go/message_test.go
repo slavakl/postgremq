@@ -411,7 +411,7 @@ func TestAckWithTx(t *testing.T) {
 		payload := []byte(`{"key":"ack_commit_test","number":789}`)
 		msgID, err := conn.Publish(ctx, topicName, payload)
 		require.NoError(t, err, "Failed to publish message")
-		require.Greater(t, msgID, 0, "Message ID should be positive")
+		require.Greater(t, msgID, int64(0), "Message ID should be positive")
 
 		// Consume the message
 		consumer, err := conn.Consume(ctx, queueName)
@@ -466,7 +466,7 @@ func TestAckWithTx(t *testing.T) {
 		payload := []byte(`{"key":"ack_rollback_test","number":999}`)
 		msgID, err := conn.Publish(ctx, topicName, payload)
 		require.NoError(t, err, "Failed to publish message")
-		require.Greater(t, msgID, 0, "Message ID should be positive")
+		require.Greater(t, msgID, int64(0), "Message ID should be positive")
 
 		// Consume the message with a very short visibility timeout (1 second)
 		consumer, err := conn.Consume(ctx, queueName, postgremq.WithVT(1), postgremq.WithCheckTimeout(1*time.Second))
@@ -510,4 +510,43 @@ func TestAckWithTx(t *testing.T) {
 			require.Fail(t, "Timeout waiting for redelivered message after rollback")
 		}
 	})
+}
+
+// TestMessageID_BeyondInt32 verifies that publish/consume correctly round-trips
+// a message id above 2^31. messages.id is BIGSERIAL; without the schema/Go-side
+// widening to int64, ids past int32 max would either error or silently
+// truncate.
+func TestMessageID_BeyondInt32(t *testing.T) {
+	t.Parallel()
+	pool, ctx := setupTestConnection(t)
+	defer pool.Close()
+
+	const seedTo int64 = 2_200_000_000 // > math.MaxInt32 (2_147_483_647)
+	_, err := pool.Exec(ctx, "SELECT setval('messages_id_seq', $1)", seedTo)
+	require.NoError(t, err, "setval messages_id_seq")
+
+	conn, err := postgremq.DialFromPool(ctx, pool)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const topicName = "test_int64_topic"
+	const queueName = "test_int64_queue"
+	require.NoError(t, conn.CreateTopic(ctx, topicName))
+	require.NoError(t, conn.CreateQueue(ctx, queueName, topicName, false))
+
+	publishedID, err := conn.Publish(ctx, topicName, []byte(`{"big": true}`))
+	require.NoError(t, err)
+	require.Greater(t, publishedID, int64(seedTo), "publish_message must hand back the post-setval id")
+
+	consumer, err := conn.Consume(ctx, queueName)
+	require.NoError(t, err)
+	defer consumer.Stop()
+
+	select {
+	case msg := <-consumer.Messages():
+		require.Equal(t, publishedID, msg.ID, "consumed id must equal published id")
+		require.NoError(t, msg.Ack(ctx))
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timeout waiting for big-id message")
+	}
 }

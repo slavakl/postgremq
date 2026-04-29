@@ -277,7 +277,7 @@ func (c *Consumer) startMessageTrackingLoop() {
 
 // auto-extend implementation
 type vtInfo struct {
-	messageID     int
+	messageID     int64
 	consumerToken string
 	extendAt      time.Time
 }
@@ -391,7 +391,7 @@ const (
 func (c *Consumer) extendVTs(vts *vtHeap) (tryAfter time.Time) {
 	// Calculate the extension deadline window: current time + 20% of VT period
 	extendDeadline := time.Now().Add(time.Duration(c.vtSec*ExtendWindowPercent*10) * time.Millisecond)
-	extendingMap := make(map[int]*vtInfo)
+	extendingMap := make(map[int64]*vtInfo)
 	var extending []MessageExtension
 
 	// get the batch of messages to extend
@@ -512,13 +512,13 @@ func (c *Consumer) Stop() {
 
 type vtHeap struct {
 	items     []*vtInfo
-	itemIndex map[int]int // maps messageID to index in items slice
+	itemIndex map[int64]int // maps messageID to index in items slice
 }
 
 func newVTHeap() *vtHeap {
 	return &vtHeap{
 		items:     make([]*vtInfo, 0),
-		itemIndex: make(map[int]int),
+		itemIndex: make(map[int64]int),
 	}
 }
 
@@ -562,7 +562,7 @@ func (h *vtHeap) peek() *vtInfo {
 	return h.items[0]
 }
 
-func (h *vtHeap) remove(messageID int) *vtInfo {
+func (h *vtHeap) remove(messageID int64) *vtInfo {
 	if idx, ok := h.itemIndex[messageID]; ok {
 		return heap.Remove(h, idx).(*vtInfo)
 	}

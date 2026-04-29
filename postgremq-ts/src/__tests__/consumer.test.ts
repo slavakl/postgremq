@@ -12,10 +12,12 @@ import {
   waitFor
 } from './helpers';
 import { Connection } from '../connection';
+import { Pool } from 'pg';
 
 describe('Consumer', () => {
   let testDb: TestDatabase;
   let connection: Connection;
+  let isoPool: Pool | null = null;
 
   let dropDb: (() => Promise<void>) | null = null;
 
@@ -27,6 +29,7 @@ describe('Consumer', () => {
   beforeEach(async () => {
     const iso = await createIsolatedTestConnection(testDb);
     connection = iso.connection;
+    isoPool = iso.pool;
     dropDb = iso.dropDatabase;
     await connection.createTopic('consumer-test-topic');
     await connection.createQueue('consumer-test-queue', 'consumer-test-topic', false);
@@ -475,6 +478,33 @@ describe('Consumer', () => {
       }).rejects.toThrow('intentional');
 
       expect(stopSpy).toHaveBeenCalled();
+    });
+  });
+
+  // messages.id is BIGSERIAL — without the BIGINT type parser registered in
+  // src/connection.ts, node-pg returns BIGINT values as strings; without the
+  // schema widening, ids past 2^31 would either error or silently truncate.
+  describe('Message ID widening (BIGINT round-trip)', () => {
+    test('publish/consume round-trips a message id past 2^31', async () => {
+      const seedTo = 2_200_000_000; // > 2^31 (2_147_483_647)
+      await isoPool!.query("SELECT setval('messages_id_seq', $1)", [seedTo]);
+
+      const publishedId = await connection.publish('consumer-test-topic', { big: true });
+      expect(typeof publishedId).toBe('number');
+      expect(publishedId).toBeGreaterThan(seedTo);
+
+      const consumer = connection.consume('consumer-test-queue', {
+        batchSize: 1,
+        visibilityTimeoutSec: 30,
+      });
+
+      let receivedId: number | undefined;
+      for await (const msg of consumer.messages()) {
+        receivedId = msg.id;
+        await msg.ack();
+        break;
+      }
+      expect(receivedId).toBe(publishedId);
     });
   });
 });

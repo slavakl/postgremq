@@ -46,7 +46,7 @@ func TestConcurrentMessageProcessing(t *testing.T) {
 
 	// Create a map to track processed messages
 	var (
-		processedMsgs     = make(map[int]int)
+		processedMsgs     = make(map[int64]int)
 		processedMsgsLock sync.Mutex
 		totalProcessed    atomic.Int32
 	)
@@ -173,7 +173,7 @@ func TestHighThroughputDelivery(t *testing.T) {
 
 	// Track received messages
 	var (
-		received     = make(map[int]bool)
+		received     = make(map[int64]bool)
 		receivedLock sync.Mutex
 		wg           sync.WaitGroup
 	)

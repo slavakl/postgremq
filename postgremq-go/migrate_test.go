@@ -133,7 +133,7 @@ func TestMigration_SchemaIsUsable(t *testing.T) {
 	// Publish message
 	msgID, err := conn.Publish(ctx, topicName, []byte(`{"test": "data"}`))
 	require.NoError(t, err, "Should be able to publish message after migration")
-	assert.Greater(t, msgID, 0, "Message ID should be positive")
+	assert.Greater(t, msgID, int64(0), "Message ID should be positive")
 
 	// Consume message
 	consumer, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(1), postgremq.WithVT(30))

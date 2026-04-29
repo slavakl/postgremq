@@ -273,7 +273,7 @@ func (c *Connection) resolveTopic(queue, explicit string) (string, error) {
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-func (c *Connection) Publish(ctx context.Context, topic string, payload json.RawMessage, opts ...PublishOption) (int, error) {
+func (c *Connection) Publish(ctx context.Context, topic string, payload json.RawMessage, opts ...PublishOption) (int64, error) {
 	return c.executePublish(ctx, c.pool, topic, payload, true, opts...)
 }
 
@@ -307,7 +307,7 @@ func (c *Connection) Publish(ctx context.Context, topic string, payload json.Raw
 //	}
 //	// ... other DB operations ...
 //	tx.Commit(ctx)
-func (c *Connection) PublishWithTx(ctx context.Context, tx Tx, topic string, payload json.RawMessage, opts ...PublishOption) (int, error) {
+func (c *Connection) PublishWithTx(ctx context.Context, tx Tx, topic string, payload json.RawMessage, opts ...PublishOption) (int64, error) {
 	return c.executePublish(ctx, tx, topic, payload, false, opts...)
 }
 
@@ -450,7 +450,7 @@ func (c *Connection) ConsumeHandler(
 // visibility timeouts extended.
 type MessageExtension struct {
 	// ID is the message ID to extend.
-	ID int
+	ID int64
 	// ConsumerToken is the consumer token that currently owns the message.
 	// Must match the token in the database for the extension to succeed.
 	ConsumerToken string
@@ -462,7 +462,7 @@ type MessageExtension struct {
 // and their new visibility timeout expiration timestamps.
 type MessageLock struct {
 	// ID is the message ID that was extended.
-	ID int
+	ID int64
 	// VT is the new visibility timeout expiration timestamp.
 	VT time.Time
 }
@@ -496,7 +496,7 @@ func (c *Connection) SetVTBatch(ctx context.Context, queue string, locks []Messa
 		return nil, nil
 	}
 
-	ids := make([]int, len(locks))
+	ids := make([]int64, len(locks))
 	tokens := make([]string, len(locks))
 	for i, lock := range locks {
 		ids[i] = lock.ID
@@ -551,7 +551,7 @@ func (c *Connection) startKeepAlive(queue string, interval time.Duration) {
 
 // // Database methods
 // executePublish handles the actual execution of publish SQL with the given transaction
-func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, payload json.RawMessage, retry bool, opts ...PublishOption) (int, error) {
+func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, payload json.RawMessage, retry bool, opts ...PublishOption) (int64, error) {
 	if err := c.checkClosed(); err != nil {
 		return 0, err
 	}
@@ -561,7 +561,7 @@ func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, pa
 		opt(options)
 	}
 
-	publish := func(ctx context.Context) (messageID int, err error) {
+	publish := func(ctx context.Context) (messageID int64, err error) {
 		if options.deliverAfter != nil {
 			err = tx.QueryRow(ctx, "SELECT publish_message($1, $2, $3)",
 				topic, payload, *options.deliverAfter).Scan(&messageID)
@@ -571,7 +571,7 @@ func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, pa
 		}
 		return messageID, err
 	}
-	var messageID int
+	var messageID int64
 	var err error
 	if retry {
 		err = c.withRetry(ctx, func(ctx context.Context) error {
@@ -606,7 +606,7 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 		messages = nil // Reset on retry
 		for rows.Next() {
 			var (
-				id               int
+				id               int64
 				payload          json.RawMessage
 				consumerToken    string
 				deliveryAttempts int
@@ -645,7 +645,7 @@ func (c *Connection) sendKeepAlive(ctx context.Context, queue string, interval t
 	})
 }
 
-func (c *Connection) ackMessage(ctx context.Context, queue string, messageID int, consumerToken string) error {
+func (c *Connection) ackMessage(ctx context.Context, queue string, messageID int64, consumerToken string) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
 		_, err := c.pool.Exec(ctx,
 			"SELECT ack_message($1, $2, $3)",
@@ -658,7 +658,7 @@ func (c *Connection) ackMessage(ctx context.Context, queue string, messageID int
 }
 
 // ackMessageWithTx acknowledges a message within an existing transaction
-func (c *Connection) ackMessageWithTx(ctx context.Context, tx Tx, queue string, messageID int, consumerToken string) error {
+func (c *Connection) ackMessageWithTx(ctx context.Context, tx Tx, queue string, messageID int64, consumerToken string) error {
 	if err := c.checkClosed(); err != nil {
 		return err
 	}
@@ -672,7 +672,7 @@ func (c *Connection) ackMessageWithTx(ctx context.Context, tx Tx, queue string, 
 	return nil
 }
 
-func (c *Connection) releaseMessage(ctx context.Context, queue string, messageID int, consumerToken string) error {
+func (c *Connection) releaseMessage(ctx context.Context, queue string, messageID int64, consumerToken string) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
 		_, err := c.pool.Exec(ctx,
 			"SELECT release_message($1, $2, $3)",
@@ -684,7 +684,7 @@ func (c *Connection) releaseMessage(ctx context.Context, queue string, messageID
 	})
 }
 
-func (c *Connection) nackMessage(ctx context.Context, queue string, messageID int, consumerToken string, delayUntil *time.Time) error {
+func (c *Connection) nackMessage(ctx context.Context, queue string, messageID int64, consumerToken string, delayUntil *time.Time) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
 		var err error
 		if delayUntil != nil && !delayUntil.IsZero() {
@@ -763,7 +763,7 @@ type DLQMessage struct {
 	// QueueName is the name of the original queue.
 	QueueName string
 	// MessageID is the ID of the failed message.
-	MessageID int
+	MessageID int64
 	// RetryCount is the number of delivery attempts that were made.
 	RetryCount int
 	// PublishedAt is when the message was originally published.
@@ -1058,7 +1058,7 @@ func (c *Connection) DeleteQueue(ctx context.Context, queue string) error {
 // Returns an error if the operation fails.
 //
 // The operation uses the configured retry policy for transient errors.
-func (c *Connection) DeleteQueueMessage(ctx context.Context, queue string, messageID int) error {
+func (c *Connection) DeleteQueueMessage(ctx context.Context, queue string, messageID int64) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
 		_, err := c.pool.Exec(ctx, "SELECT delete_queue_message($1, $2)", queue, messageID)
 		return err
@@ -1163,7 +1163,7 @@ func (c *Connection) CleanupCompletedMessages(ctx context.Context, olderThanHour
 // The payload is excluded for efficiency when listing many messages.
 type QueueMessage struct {
 	// MessageID is the unique message identifier.
-	MessageID int
+	MessageID int64
 	// Status is the current processing status ('pending', 'processing', or 'completed').
 	Status string
 	// PublishedAt is when the message was first published to the topic.
@@ -1182,7 +1182,7 @@ type QueueMessage struct {
 // Returned by GetMessage to retrieve the full message data for inspection.
 type PublishedMessage struct {
 	// MessageID is the unique message identifier.
-	MessageID int
+	MessageID int64
 	// TopicName is the name of the topic this message was published to.
 	TopicName string
 	// Payload is the JSON-encoded message payload.
@@ -1253,7 +1253,7 @@ func (c *Connection) ListMessages(ctx context.Context, queueName string) ([]Queu
 // The operation uses the configured retry policy for transient errors.
 //
 // Use this for debugging or inspecting message payloads.
-func (c *Connection) GetMessage(ctx context.Context, messageID int) (*PublishedMessage, error) {
+func (c *Connection) GetMessage(ctx context.Context, messageID int64) (*PublishedMessage, error) {
 	var msg PublishedMessage
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		return c.pool.QueryRow(ctx,

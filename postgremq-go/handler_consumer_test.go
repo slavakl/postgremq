@@ -517,7 +517,7 @@ func TestHandlerConsumerMessageFields(t *testing.T) {
 	require.NoError(t, err, "Publish failed")
 
 	done := make(chan struct{})
-	var receivedID int
+	var receivedID int64
 	var receivedDeliveryAttempt int
 	var receivedPayload []byte
 	var publishedAtSet, vtSet bool
