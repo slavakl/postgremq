@@ -110,7 +110,9 @@ CREATE TABLE queue_messages (
   delivery_attempts INT DEFAULT 0,
   consumer_token VARCHAR(64),
   processed_at TIMESTAMPTZ,
-  PRIMARY KEY (queue_name, message_id)
+  PRIMARY KEY (queue_name, message_id),
+  CONSTRAINT queue_messages_delivery_attempts_nonneg
+    CHECK (delivery_attempts >= 0)
 );
 
 -- Dead Letter Queue table.
@@ -545,7 +547,10 @@ BEGIN
     SET status = 'pending',
         vt = NOW(),  -- Renamed from locked_until
         consumer_token = NULL,
-        delivery_attempts = delivery_attempts - 1
+        -- GREATEST floors at 0: a stale consumer racing a reclaim path could
+        -- otherwise underflow delivery_attempts on repeated releases. The
+        -- CHECK constraint on the column is a hard backstop.
+        delivery_attempts = GREATEST(delivery_attempts - 1, 0)
     WHERE queue_name = p_queue_name
       AND message_id = p_message_id
       AND status = 'processing'

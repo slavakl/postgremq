@@ -329,6 +329,53 @@ def test_pmq_maintenance_fast(cur: psycopg2.extensions.cursor) -> None:
     cur.execute("SELECT count(*) FROM queues WHERE name = 'ExpiredEx'")
     assert cur.fetchone()[0] == 0
 
+def test_release_floor_at_zero(cur: psycopg2.extensions.cursor) -> None:
+    """release_message must floor delivery_attempts at 0. Without the GREATEST
+    guard a stale consumer racing a reclaim path could underflow the counter
+    on repeated releases. The CHECK constraint on the column is the backstop
+    — a direct UPDATE that would push it negative is rejected."""
+    cur.execute("SELECT create_topic('FloorTopic')")
+    cur.execute("SELECT create_queue('FloorQueue', 'FloorTopic', 0, false)")
+    cur.execute("SELECT publish_message('FloorTopic', '{\"x\": 1}'::jsonb)")
+
+    # Consume → delivery_attempts becomes 1, status 'processing'.
+    cur.execute("SELECT message_id, consumer_token FROM consume_message('FloorQueue', 30, 1)")
+    msg_id, token = cur.fetchone()
+    cur.execute("SELECT delivery_attempts FROM queue_messages WHERE queue_name='FloorQueue' AND message_id=%s", (msg_id,))
+    assert cur.fetchone()[0] == 1
+
+    # Release once: 1 → 0.
+    cur.execute("SELECT release_message('FloorQueue', %s, %s)", (msg_id, token))
+    cur.execute("SELECT delivery_attempts FROM queue_messages WHERE queue_name='FloorQueue' AND message_id=%s", (msg_id,))
+    assert cur.fetchone()[0] == 0
+
+    # Re-consume to obtain a fresh token, force delivery_attempts back to 0
+    # (bypass the consume increment), then release again. Without the floor
+    # this would write -1; with it, the value stays at 0.
+    cur.execute("SELECT message_id, consumer_token FROM consume_message('FloorQueue', 30, 1)")
+    msg_id2, token2 = cur.fetchone()
+    assert msg_id2 == msg_id
+    cur.execute("UPDATE queue_messages SET delivery_attempts = 0 WHERE queue_name='FloorQueue' AND message_id=%s", (msg_id,))
+    cur.execute("SELECT release_message('FloorQueue', %s, %s)", (msg_id, token2))
+    cur.execute("SELECT delivery_attempts FROM queue_messages WHERE queue_name='FloorQueue' AND message_id=%s", (msg_id,))
+    assert cur.fetchone()[0] == 0, "release_message must floor delivery_attempts at 0"
+
+def test_delivery_attempts_check_constraint(cur: psycopg2.extensions.cursor) -> None:
+    """The queue_messages_delivery_attempts_nonneg CHECK constraint blocks any
+    direct UPDATE that would write delivery_attempts < 0 — the backstop for
+    paths the application-level floor doesn't cover."""
+    cur.execute("SELECT create_topic('CheckTopic')")
+    cur.execute("SELECT create_queue('CheckQueue', 'CheckTopic', 0, false)")
+    cur.execute("SELECT publish_message('CheckTopic', '{\"x\": 1}'::jsonb)")
+    cur.execute("SELECT message_id FROM consume_message('CheckQueue', 30, 1)")
+    msg_id = cur.fetchone()[0]
+
+    with pytest.raises(psycopg2.errors.CheckViolation):
+        cur.execute(
+            "UPDATE queue_messages SET delivery_attempts = -1 WHERE queue_name='CheckQueue' AND message_id=%s",
+            (msg_id,),
+        )
+
 def test_message_delivery_and_acknowledgment(cur: psycopg2.extensions.cursor) -> None:
     """Test message publishing, consumption, and acknowledgment."""
     # Setup
