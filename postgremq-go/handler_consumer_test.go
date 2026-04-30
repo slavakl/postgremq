@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -595,6 +596,12 @@ func TestHandlerConsumerConnectionClose(t *testing.T) {
 
 	conn, err := postgremq.DialFromPool(ctx, pool, postgremq.WithShutdownTimeout(5*time.Second))
 	require.NoError(t, err, "DialFromPool failed")
+	// Safety net: if the test fatals before reaching the explicit conn.Close()
+	// below, EventListener.session would otherwise keep a pgx connection
+	// checked out and the deferred pool.Close() would hang on its WaitGroup.
+	// conn.Close is idempotent so the explicit call later still drives the
+	// shutdown timing being tested.
+	defer conn.Close()
 
 	err = conn.CreateTopic(ctx, topicName)
 	require.NoError(t, err, "CreateTopic failed")
@@ -644,7 +651,14 @@ func TestHandlerConsumerConnectionClose(t *testing.T) {
 	assert.Less(t, closeDuration, 2*time.Second, "Connection close should complete quickly")
 }
 
-// TestMultipleConsumersSameQueue verifies that multiple consumers on the same queue are all tracked.
+// TestMultipleConsumersSameQueue verifies that conn.Close cleanly stops every
+// HandlerConsumer registered on the same queue, regardless of which consumer
+// actually picks up messages. With concurrent SKIP LOCKED fetches racing for
+// the same queue, distribution is non-deterministic — one consumer can grab
+// all messages and leave the other idle. The test only requires that
+// (a) at least one handler runs (proves connection wiring), and
+// (b) after conn.Close every started handler unblocks via msg.StoppedCtx,
+// because that's what the cleanup path actually guarantees.
 func TestMultipleConsumersSameQueue(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
@@ -655,77 +669,85 @@ func TestMultipleConsumersSameQueue(t *testing.T) {
 
 	conn, err := postgremq.DialFromPool(ctx, pool, postgremq.WithShutdownTimeout(5*time.Second))
 	require.NoError(t, err, "DialFromPool failed")
+	// Safety net: if the test fatals before reaching the explicit conn.Close()
+	// below, EventListener.session would otherwise keep a pgx connection
+	// checked out and the deferred pool.Close() would hang on its WaitGroup.
+	// conn.Close is idempotent.
+	defer conn.Close()
 
 	err = conn.CreateTopic(ctx, topicName)
 	require.NoError(t, err, "CreateTopic failed")
 	err = conn.CreateQueue(ctx, queueName, topicName, true)
 	require.NoError(t, err, "CreateQueue failed")
 
-	// Create two consumers on the same queue
-	consumer1Started := make(chan struct{})
-	consumer1Done := make(chan struct{})
+	// Track handler activity per consumer. started/done counters fire once per
+	// invocation; the test asserts on aggregate behaviour, not per-consumer
+	// liveness, since distribution is racy.
+	var (
+		mu                  sync.Mutex
+		startedTotal        int
+		doneTotal           int
+		c1Started, c2Started bool
+	)
+	allStarted := make(chan struct{}) // closed when first handler from any consumer reports started
 
-	consumer2Started := make(chan struct{})
-	consumer2Done := make(chan struct{})
-
-	// Publish 2 messages
-	_, err = conn.Publish(ctx, topicName, []byte(`{"msg": 1}`))
-	require.NoError(t, err)
-	_, err = conn.Publish(ctx, topicName, []byte(`{"msg": 2}`))
-	require.NoError(t, err)
-
-	_, err = conn.ConsumeHandler(ctx, queueName,
-		func(ctx context.Context, msg *postgremq.Message) {
-			select {
-			case <-consumer1Started:
-			default:
-				close(consumer1Started)
+	makeHandler := func(consumerIdx int) func(ctx context.Context, msg *postgremq.Message) {
+		return func(ctx context.Context, msg *postgremq.Message) {
+			mu.Lock()
+			startedTotal++
+			if consumerIdx == 1 {
+				c1Started = true
+			} else {
+				c2Started = true
 			}
+			if startedTotal == 1 {
+				close(allStarted)
+			}
+			mu.Unlock()
+
 			<-ctx.Done()
-			msg.Nack(ctx)
-			select {
-			case <-consumer1Done:
-			default:
-				close(consumer1Done)
-			}
-		},
+			_ = msg.Nack(ctx)
+
+			mu.Lock()
+			doneTotal++
+			mu.Unlock()
+		}
+	}
+
+	// Publish 4 messages so the busier consumer doesn't exhaust the queue
+	// before the other one even tries to fetch — gives both a fair chance
+	// without making the test depend on the distribution outcome.
+	for i := 0; i < 4; i++ {
+		_, err = conn.Publish(ctx, topicName, []byte(`{"msg": 1}`))
+		require.NoError(t, err)
+	}
+
+	_, err = conn.ConsumeHandler(ctx, queueName, makeHandler(1),
 		postgremq.WithVT(30),
+		postgremq.WithBatchSize(1), // discourage one consumer from sweeping the queue
 	)
 	require.NoError(t, err, "First ConsumeHandler failed")
 
-	_, err = conn.ConsumeHandler(ctx, queueName,
-		func(ctx context.Context, msg *postgremq.Message) {
-			select {
-			case <-consumer2Started:
-			default:
-				close(consumer2Started)
-			}
-			<-ctx.Done()
-			msg.Nack(ctx)
-			select {
-			case <-consumer2Done:
-			default:
-				close(consumer2Done)
-			}
-		},
+	_, err = conn.ConsumeHandler(ctx, queueName, makeHandler(2),
 		postgremq.WithVT(30),
+		postgremq.WithBatchSize(1),
 	)
 	require.NoError(t, err, "Second ConsumeHandler failed")
 
-	// Wait for at least one handler from each consumer to start
 	select {
-	case <-consumer1Started:
+	case <-allStarted:
 	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for consumer1 to start")
+		t.Fatal("Timeout waiting for any handler to start")
 	}
 
-	// Close connection - both consumers should be stopped
 	conn.Close()
 
-	// Verify both handlers completed
-	select {
-	case <-consumer1Done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for consumer1 to complete")
-	}
+	// Every handler that started must have unblocked via StoppedCtx and
+	// finished. If conn.Close drained both consumers correctly, doneTotal
+	// equals startedTotal and at least one consumer ran.
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Greater(t, startedTotal, 0, "Expected at least one handler to start")
+	assert.Equal(t, startedTotal, doneTotal, "Every started handler must complete after conn.Close")
+	t.Logf("started: total=%d, c1=%v, c2=%v", startedTotal, c1Started, c2Started)
 }

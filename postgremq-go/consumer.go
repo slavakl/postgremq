@@ -229,10 +229,20 @@ func (c *Consumer) fetchMessages() time.Time {
 }
 
 func (c *Consumer) handleMessageComplete(m *Message) {
-	c.messageUpdates <- messageUpdate{op: messageRemoved, msg: m}
+	// vtMessageUpdates first, messageUpdates second. The tracking loop
+	// uses messageUpdates to decide it's drained (decrement inFlight, then
+	// close inFlightFlag once cancelled+empty). Once inFlightFlag closes,
+	// the main loop closes both update channels — including
+	// vtMessageUpdates. If we sent to messageUpdates first, that send
+	// could race with the close: the tracking loop receives, drops
+	// inFlight to 0, signals shutdown, channels close, and the still-in-
+	// progress send to vtMessageUpdates panics. Sending to
+	// vtMessageUpdates before messageUpdates makes the second send the
+	// gate, so the close can only happen after both writes have completed.
 	if !c.noAutoExtension {
 		c.vtMessageUpdates <- messageUpdate{op: messageRemoved, msg: m}
 	}
+	c.messageUpdates <- messageUpdate{op: messageRemoved, msg: m}
 }
 
 func (c *Consumer) startMessageTrackingLoop() {
