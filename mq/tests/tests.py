@@ -360,19 +360,29 @@ def test_pmq_maintenance_fast(cur: psycopg2.extensions.cursor) -> None:
     """pmq_maintenance_fast retires crashed-final-attempt rows to DLQ and
     reaps expired exclusive queues, returning counters for both. Both
     branches must fire when the conditions are met, and the function must
-    be idempotent (counters drop to 0 on a second call)."""
+    be idempotent (counters drop to 0 on a second call).
+
+    A "crashed-final-attempt" row has status='processing' AND vt <= NOW()
+    AND delivery_attempts >= max — i.e. a consumer started the final
+    attempt, the lease has expired, and nobody acked/nacked. The retire
+    predicate is gated on all three conditions; merely hitting the attempt
+    cap with a still-valid lease (the consumer is mid-handler) must NOT
+    retire the row — see test_maintenance_fast_skips_healthy_in_flight."""
     cur.execute("SELECT create_topic('MaintTopic')")
     # Queue with max_attempts=2 so we can manufacture a crashed-final-attempt
-    # row by setting delivery_attempts past the threshold without going through
-    # nack — mimicking a consumer that died after consuming the last allowed
-    # attempt. consume_message refuses to re-pick those rows (delivery_attempts
-    # >= max), so they'd stay stuck in 'processing' without this recovery path.
+    # row by bumping delivery_attempts past the threshold AND expiring vt
+    # without going through nack — mimicking a consumer that died after
+    # consuming the last allowed attempt. consume_message refuses to re-pick
+    # those rows (delivery_attempts >= max), so they'd stay stuck in
+    # 'processing' without this recovery path.
     cur.execute("SELECT create_queue('MaintQueue', 'MaintTopic', 2, false)")
     cur.execute("SELECT publish_message('MaintTopic', '{\"x\": 1}'::jsonb)")
     cur.execute("SELECT message_id FROM consume_message('MaintQueue', 30, 1)")
     msg_id = cur.fetchone()[0]
     cur.execute(
-        "UPDATE queue_messages SET delivery_attempts = 2 WHERE queue_name = 'MaintQueue' AND message_id = %s",
+        """UPDATE queue_messages
+           SET delivery_attempts = 2, vt = NOW() - interval '1 second'
+           WHERE queue_name = 'MaintQueue' AND message_id = %s""",
         (msg_id,),
     )
 
@@ -396,6 +406,101 @@ def test_pmq_maintenance_fast(cur: psycopg2.extensions.cursor) -> None:
     # The expired exclusive queue is gone.
     cur.execute("SELECT count(*) FROM queues WHERE name = 'ExpiredEx'")
     assert cur.fetchone()[0] == 0
+
+def test_maintenance_fast_skips_healthy_in_flight(cur: psycopg2.extensions.cursor) -> None:
+    """A consumer mid-handler on its FINAL attempt (delivery_attempts == max,
+    status='processing', vt > NOW()) must NOT be retired by pmq_maintenance_fast.
+    Otherwise the consumer's handler commits its side-effects, then ack returns
+    PMQ01 because the row was deleted underneath it, and the message ALSO lands
+    in the DLQ — silent inconsistency between application and queue state.
+
+    Reproduces the bug reported in REVIEW.md §1.2/§2.1."""
+    cur.execute("SELECT create_topic('HealthyMaintTopic')")
+    cur.execute("SELECT create_queue('HealthyMaintQueue', 'HealthyMaintTopic', 1, false)")
+    cur.execute("SELECT publish_message('HealthyMaintTopic', '{\"x\": 1}'::jsonb)")
+
+    # Consume with a comfortable VT so the lease is solidly in the future.
+    # max_delivery_attempts=1 so this single consume puts us at the limit.
+    cur.execute("""
+        SELECT message_id, consumer_token, delivery_attempts, vt
+        FROM consume_message('HealthyMaintQueue', 60, 1)
+    """)
+    row = cur.fetchone()
+    msg_id, token, attempts, vt = row
+    assert attempts == 1, f"expected delivery_attempts=1 (== max), got {attempts}"
+
+    # Run maintenance: the row hits delivery_attempts >= max but the lease is
+    # still valid. Must NOT be retired.
+    cur.execute("SELECT retired_to_dlq FROM pmq_maintenance_fast()")
+    retired = cur.fetchone()[0]
+    assert retired == 0, "healthy in-flight final-attempt row must not be retired"
+
+    # Row is still processing, still owned by the original consumer.
+    cur.execute("""
+        SELECT status, consumer_token FROM queue_messages
+        WHERE queue_name = 'HealthyMaintQueue' AND message_id = %s
+    """, (msg_id,))
+    status, current_token = cur.fetchone()
+    assert status == 'processing'
+    assert current_token == token, "consumer_token must be unchanged (lease still held)"
+
+    # And not in DLQ.
+    cur.execute("SELECT count(*) FROM dead_letter_queue WHERE queue_name = 'HealthyMaintQueue'")
+    assert cur.fetchone()[0] == 0
+
+    # Consumer can still ack successfully — the original goal of the lease.
+    cur.execute("SELECT ack_message('HealthyMaintQueue', %s, %s)", (msg_id, token))
+
+def test_maintenance_fast_retires_only_when_vt_expired(cur: psycopg2.extensions.cursor) -> None:
+    """Boundary test: same setup as the healthy-in-flight test, but force vt
+    into the past. Now the row IS abandoned and must be retired."""
+    cur.execute("SELECT create_topic('ExpVtTopic')")
+    cur.execute("SELECT create_queue('ExpVtQueue', 'ExpVtTopic', 1, false)")
+    cur.execute("SELECT publish_message('ExpVtTopic', '{\"x\": 1}'::jsonb)")
+    cur.execute("SELECT message_id FROM consume_message('ExpVtQueue', 60, 1)")
+    msg_id = cur.fetchone()[0]
+
+    # Expire the lease — simulates "consumer crashed mid-handler".
+    cur.execute(
+        "UPDATE queue_messages SET vt = NOW() - interval '1 second' "
+        "WHERE queue_name = 'ExpVtQueue' AND message_id = %s",
+        (msg_id,),
+    )
+
+    cur.execute("SELECT retired_to_dlq FROM pmq_maintenance_fast()")
+    assert cur.fetchone()[0] == 1
+
+    cur.execute("SELECT count(*) FROM dead_letter_queue WHERE queue_name = 'ExpVtQueue'")
+    assert cur.fetchone()[0] == 1
+    cur.execute("SELECT count(*) FROM queue_messages WHERE queue_name = 'ExpVtQueue'")
+    assert cur.fetchone()[0] == 0
+
+def test_maintenance_fast_skips_pending_at_limit(cur: psycopg2.extensions.cursor) -> None:
+    """Defensive: a row with status='pending' AND delivery_attempts >= max
+    can only exist via a direct UPDATE (not via the public API) but should
+    still be ignored by maintenance — retirement is reserved for the
+    expired-lease abandonment case."""
+    cur.execute("SELECT create_topic('PendingLimitTopic')")
+    cur.execute("SELECT create_queue('PendingLimitQueue', 'PendingLimitTopic', 1, false)")
+    cur.execute("SELECT publish_message('PendingLimitTopic', '{\"x\": 1}'::jsonb)")
+    cur.execute("SELECT message_id FROM consume_message('PendingLimitQueue', 60, 1)")
+    msg_id = cur.fetchone()[0]
+
+    # Pathological state: pending but at the attempt cap (and lease expired
+    # for good measure — only the status filter should keep this row alive).
+    cur.execute(
+        """UPDATE queue_messages
+           SET status = 'pending',
+               vt = NOW() - interval '1 second',
+               consumer_token = NULL
+           WHERE queue_name = 'PendingLimitQueue' AND message_id = %s""",
+        (msg_id,),
+    )
+
+    cur.execute("SELECT retired_to_dlq FROM pmq_maintenance_fast()")
+    assert cur.fetchone()[0] == 0, "pending rows are out of scope of maintenance retirement"
+    cur.execute("SELECT count(*) FROM queue_messages WHERE queue_name = 'PendingLimitQueue'")
+    assert cur.fetchone()[0] == 1
 
 def test_release_floor_at_zero(cur: psycopg2.extensions.cursor) -> None:
     """release_message must floor delivery_attempts at 0. Without the GREATEST

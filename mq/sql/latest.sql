@@ -681,7 +681,9 @@ $$ LANGUAGE plpgsql;
  *      so this only catches rows whose consumer crashed mid-handler before
  *      acking/nacking the final attempt — those would otherwise stay stuck
  *      in 'processing' (consume_message refuses to re-pick them because
- *      delivery_attempts >= max_delivery_attempts).
+ *      delivery_attempts >= max_delivery_attempts). The retire predicate is
+ *      gated on status='processing' AND vt <= NOW() so we never yank a
+ *      healthy in-flight row out from under a still-running consumer.
  *   2. Reap exclusive queues whose keep_alive_until has expired.
  *
  *   Intended to run every 30-60 seconds (≤ ½ × the shortest
@@ -711,12 +713,25 @@ BEGIN
         WHERE qm.queue_name = q.name
           AND q.max_delivery_attempts > 0
           AND qm.delivery_attempts >= q.max_delivery_attempts
+          -- Only retire rows that are genuinely abandoned: a consumer
+          -- holding a still-valid lease (status='processing' AND vt > NOW())
+          -- might be mid-handler on its final attempt; yanking the row out
+          -- from under it would let its side-effects commit while the
+          -- message also lands in DLQ. Restrict to expired processing rows.
+          AND qm.status = 'processing'
+          AND qm.vt <= NOW()
         RETURNING qm.queue_name, qm.message_id, qm.delivery_attempts
     ),
     inserted AS (
+        -- ON CONFLICT for parity with nack_message's inline retirement.
+        -- Today's predicate makes a double-insert impossible (nack flips
+        -- status to 'pending' before deleting; maintenance only matches
+        -- 'processing' rows), but the guard hardens against future code
+        -- paths that might re-fire on the same (queue_name, message_id).
         INSERT INTO dead_letter_queue(queue_name, message_id, retry_count)
         SELECT queue_name, message_id, delivery_attempts
         FROM deleted_messages
+        ON CONFLICT (queue_name, message_id) DO NOTHING
         RETURNING 1
     )
     SELECT count(*) INTO v_retired FROM inserted;
