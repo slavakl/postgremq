@@ -298,6 +298,38 @@ describe('Connection', () => {
       stats = await connection.getQueueStatistics('msg-queue');
       expect(stats.totalCount).toBe(0);
     });
+
+    // Regression: setMessagesVtBatch was reading row.new_vt, but set_vt_batch
+    // returns the column as `vt` — so every Date in the result was
+    // `Invalid Date`. Auto-extension uses these Dates to schedule the next
+    // round, so messages silently dropped out of the extension queue after
+    // their first batch extension.
+    test('setMessagesVtBatch returns valid Dates approximately at now+vt', async () => {
+      const id1 = await connection.publish('msg-topic', { test: 'batch-vt-1' });
+      const id2 = await connection.publish('msg-topic', { test: 'batch-vt-2' });
+      await sleep(100);
+
+      // Consume both messages so we have valid consumer tokens to extend with.
+      const consumed = await connection.consumeMessages('msg-queue', 30, 2);
+      expect(consumed.length).toBe(2);
+      const ids = consumed.map(m => m.message_id);
+      const tokens = consumed.map(m => m.consumer_token);
+      expect(new Set(ids)).toEqual(new Set([id1, id2]));
+
+      const before = Date.now();
+      const extended = await connection.setMessagesVtBatch('msg-queue', ids, tokens, 60);
+      const after = Date.now();
+
+      expect(extended.length).toBe(2);
+      for (const [, newVt] of extended) {
+        expect(newVt).toBeInstanceOf(Date);
+        expect(Number.isNaN(newVt.getTime())).toBe(false);
+        // The new VT should be in the future, around now + 60s.
+        // Allow a generous window to absorb test latency / clock skew.
+        expect(newVt.getTime()).toBeGreaterThan(before + 50_000);
+        expect(newVt.getTime()).toBeLessThan(after + 70_000);
+      }
+    });
   });
 
   describe('Dead Letter Queue', () => {

@@ -1169,9 +1169,13 @@ export class Connection implements IConnection {
           'SELECT * FROM set_vt_batch($1, $2, $3, $4)',
           [queueName, messageIds, consumerTokens, visibilityTimeout]
         );
+        // set_vt_batch returns columns (message_id, vt). The single-row
+        // setMessageVt above uses an explicit AS new_vt alias; the batch
+        // version doesn't, so read row.vt directly. (Reading row.new_vt
+        // here silently produced Invalid Date for every returned tuple.)
         return result.rows.map(row => [
           row.message_id,
-          new Date(row.new_vt)
+          new Date(row.vt)
         ]);
       });
     } catch (err) {
