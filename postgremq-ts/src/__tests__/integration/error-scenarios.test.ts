@@ -102,10 +102,12 @@ describe('Error Scenarios', () => {
       await connection.deleteTopic('mismatch-topic');
     });
 
-    test('should reject queue creation for non-existent topic', async () => {
-      await assertThrows(
-        () => connection.createQueue('test-queue', 'non-existent-topic', false)
-      );
+    test('createQueue on non-existent topic surfaces as QueueNotFoundError (PMQ02)', async () => {
+      // create_queue raises PMQ02 — same shape as publish_message — so the
+      // typed error mapping works on both call sites.
+      await expect(
+        connection.createQueue('test-queue', 'non-existent-topic', false)
+      ).rejects.toMatchObject({ code: 'PMQ02' });
     });
 
     test('should reject invalid queue options', async () => {

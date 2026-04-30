@@ -258,10 +258,9 @@ $$ LANGUAGE plpgsql;
  * Returns: VOID.
  *
  * Raises:
- *   - PMQ03 if name fails validation, or if a queue with this name already
- *     exists with different parameters.
- *   - 23503 (foreign_key_violation) if p_topic_name doesn't exist (raw FK
- *     error from the queues.topic_name FK).
+ *   - PMQ02 if p_topic_name doesn't exist.
+ *   - PMQ03 if the name fails validation, p_max_attempts is negative, or
+ *     a queue with this name already exists with different parameters.
  */
 CREATE OR REPLACE FUNCTION create_queue(
     p_queue_name VARCHAR(255),
@@ -285,6 +284,13 @@ BEGIN
     IF p_max_attempts < 0 THEN
         RAISE EXCEPTION 'p_max_attempts must be >= 0 (got %)', p_max_attempts
           USING ERRCODE = 'PMQ03';
+    END IF;
+    -- Surface a missing topic as PMQ02 (parity with publish_message). Without
+    -- this check the INSERT below would still fail, but with a raw 23503 FK
+    -- violation that doesn't map to ErrQueueNotFound on the client side.
+    IF NOT EXISTS (SELECT 1 FROM topics WHERE name = p_topic_name) THEN
+        RAISE EXCEPTION 'Topic "%" does not exist', p_topic_name
+          USING ERRCODE = 'PMQ02';
     END IF;
     INSERT INTO queues (
         name,

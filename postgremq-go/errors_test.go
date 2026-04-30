@@ -172,6 +172,24 @@ func TestErrQueueNotFound_PublishUnknownTopic(t *testing.T) {
 		"publish to unknown topic should be ErrQueueNotFound; got %v", err)
 }
 
+// TestErrQueueNotFound_CreateQueueUnknownTopic verifies that creating a
+// queue against a missing topic surfaces as ErrQueueNotFound (PMQ02) —
+// parity with publish_message rather than a raw FK violation.
+func TestErrQueueNotFound_CreateQueueUnknownTopic(t *testing.T) {
+	t.Parallel()
+	pool, ctx := setupTestConnection(t)
+	defer pool.Close()
+
+	conn, err := postgremq.DialFromPool(ctx, pool)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = conn.CreateQueue(ctx, "OrphanQueue", "GhostTopic", false)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, postgremq.ErrQueueNotFound),
+		"create_queue against missing topic should be ErrQueueNotFound; got %v", err)
+}
+
 // TestErrValidation_SetVTNegative verifies SetVT(-1) surfaces as
 // ErrValidation (PMQ03).
 func TestErrValidation_SetVTNegative(t *testing.T) {

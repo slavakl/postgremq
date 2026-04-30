@@ -239,6 +239,16 @@ def test_create_queue_rejects_negative_max_attempts(cur: psycopg2.extensions.cur
     assert exc_info.value.pgcode == 'PMQ03'
     assert "must be >= 0" in str(exc_info.value)
 
+def test_create_queue_missing_topic_raises_pmq02(cur: psycopg2.extensions.cursor) -> None:
+    """create_queue must raise PMQ02 (not raw 23503 FK violation) when the
+    referenced topic doesn't exist, so the client can map it to its
+    QueueNotFoundError sentinel — same shape as publish_message."""
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT create_queue('Q', 'NoSuchTopic', 0, false)")
+    assert exc_info.value.pgcode == 'PMQ02', \
+        f"expected PMQ02, got {exc_info.value.pgcode}: {exc_info.value}"
+    assert "does not exist" in str(exc_info.value)
+
 def test_unlimited_delivery_attempts(cur: psycopg2.extensions.cursor) -> None:
     """Test queue with unlimited delivery attempts (max_delivery_attempts = 0)."""
     # Setup
