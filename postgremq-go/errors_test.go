@@ -237,9 +237,11 @@ func TestErrValidation_CreateQueueInvalidName(t *testing.T) {
 		"create_queue with invalid name should be ErrValidation; got %v", err)
 }
 
-// TestErrValidation_DuplicateExclusiveQueue verifies a second create on the
-// same exclusive queue surfaces as ErrValidation.
-func TestErrValidation_DuplicateExclusiveQueue(t *testing.T) {
+// TestErrValidation_QueueParamMismatch verifies that re-creating a queue
+// with parameters that differ from the existing row surfaces as
+// ErrValidation. (Re-creating with identical parameters is idempotent
+// success — covered by TestCreateQueue_Idempotent.)
+func TestErrValidation_QueueParamMismatch(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
@@ -249,12 +251,39 @@ func TestErrValidation_DuplicateExclusiveQueue(t *testing.T) {
 	defer conn.Close()
 
 	require.NoError(t, conn.CreateTopic(ctx, "DupTopic"))
-	require.NoError(t, conn.CreateQueue(ctx, "DupExcl", "DupTopic", true))
+	require.NoError(t, conn.CreateQueue(ctx, "DupExcl", "DupTopic", true,
+		postgremq.WithMaxDeliveryAttempts(2)))
 
-	err = conn.CreateQueue(ctx, "DupExcl", "DupTopic", true)
+	// Same name, different max_delivery_attempts → PMQ03 / ErrValidation.
+	err = conn.CreateQueue(ctx, "DupExcl", "DupTopic", true,
+		postgremq.WithMaxDeliveryAttempts(5))
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, postgremq.ErrValidation),
-		"duplicate exclusive queue should be ErrValidation; got %v", err)
+		"queue param mismatch should be ErrValidation; got %v", err)
+	assert.Contains(t, err.Error(), "already exists with different parameters")
+}
+
+// TestCreateQueue_Idempotent verifies that re-creating a queue with the
+// exact same parameters is a no-op success — RabbitMQ-style idempotent
+// queue.declare.
+func TestCreateQueue_Idempotent(t *testing.T) {
+	t.Parallel()
+	pool, ctx := setupTestConnection(t)
+	defer pool.Close()
+
+	conn, err := postgremq.DialFromPool(ctx, pool)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	require.NoError(t, conn.CreateTopic(ctx, "IdemTopic"))
+	// Two identical exclusive creates → both succeed.
+	require.NoError(t, conn.CreateQueue(ctx, "IdemExcl", "IdemTopic", true,
+		postgremq.WithKeepAliveInterval(60*time.Second)))
+	require.NoError(t, conn.CreateQueue(ctx, "IdemExcl", "IdemTopic", true,
+		postgremq.WithKeepAliveInterval(60*time.Second)))
+	// Two identical non-exclusive creates → both succeed.
+	require.NoError(t, conn.CreateQueue(ctx, "IdemNx", "IdemTopic", false))
+	require.NoError(t, conn.CreateQueue(ctx, "IdemNx", "IdemTopic", false))
 }
 
 // TestErrValidation_DeleteTopicWithMessages verifies that deleting a topic

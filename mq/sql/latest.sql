@@ -231,9 +231,18 @@ $$ LANGUAGE plpgsql;
 /* Function: create_queue
  *
  * Description:
- *   Creates a new queue that subscribes to a topic. If the queue is exclusive,
- *   it will be automatically deleted when its keep_alive_until timestamp expires.
- *   Only one exclusive queue with a given name can exist at a time.
+ *   Idempotently creates a queue that subscribes to a topic. Re-creating a
+ *   queue with the same parameters is a no-op success. If the queue exists
+ *   with different parameters (different topic, max_delivery_attempts,
+ *   exclusive flag, or keep_alive_interval), raises PMQ03 with the existing
+ *   values surfaced for diagnosis — modelled on RabbitMQ's queue.declare
+ *   "passive match-or-error" semantics.
+ *
+ *   For exclusive queues, an idempotent re-create also refreshes
+ *   keep_alive_until to NOW() + keep_alive_interval. This means a re-create
+ *   on an expired exclusive queue effectively revives it (the caller is
+ *   asserting ownership now), consistent with consume_message's implicit
+ *   refresh on the same column.
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue to create.
@@ -249,15 +258,20 @@ $$ LANGUAGE plpgsql;
  * Returns: VOID.
  *
  * Raises:
- *   - Exception if attempting to create a duplicate exclusive queue.
+ *   - PMQ03 if name fails validation, or if a queue with this name already
+ *     exists with different parameters.
+ *   - 23503 (foreign_key_violation) if p_topic_name doesn't exist (raw FK
+ *     error from the queues.topic_name FK).
  */
 CREATE OR REPLACE FUNCTION create_queue(
     p_queue_name VARCHAR(255),
     p_topic_name VARCHAR(255),
-    p_max_attempts INTEGER DEFAULT 0,  -- Changed to 0 for unlimited retries
+    p_max_attempts INTEGER DEFAULT 0,  -- 0 = unlimited retries
     p_exclusive BOOLEAN DEFAULT false,
     p_keep_alive_interval INTERVAL DEFAULT '30 seconds'
 ) RETURNS VOID AS $$
+DECLARE
+    v_existing queues%ROWTYPE;
 BEGIN
     IF p_queue_name IS NULL OR p_queue_name !~ '^[A-Za-z0-9_:.\-]+$' THEN
         RAISE EXCEPTION 'Invalid queue name "%": must match ^[A-Za-z0-9_:.\-]+$', p_queue_name
@@ -280,15 +294,40 @@ BEGIN
             WHEN p_exclusive THEN NOW() + p_keep_alive_interval
             ELSE NULL
         END
-    );
-EXCEPTION
-    WHEN unique_violation THEN
-        IF p_exclusive THEN
-            RAISE EXCEPTION 'An exclusive queue with name "%" already exists', p_queue_name
-              USING ERRCODE = 'PMQ03';
-        ELSE
-            RAISE;
-        END IF;
+    )
+    ON CONFLICT (name) DO NOTHING;
+
+    IF FOUND THEN
+        RETURN;  -- inserted on the fast path
+    END IF;
+
+    -- Conflict path: queue with this name already exists. Verify the caller's
+    -- parameters match the existing row; otherwise raise so accidental config
+    -- drift is caught loudly rather than silently ignored.
+    SELECT * INTO v_existing FROM queues WHERE name = p_queue_name;
+    IF v_existing.topic_name IS DISTINCT FROM p_topic_name
+       OR v_existing.max_delivery_attempts IS DISTINCT FROM p_max_attempts
+       OR v_existing.exclusive IS DISTINCT FROM p_exclusive
+       OR v_existing.keep_alive_interval IS DISTINCT FROM p_keep_alive_interval THEN
+        RAISE EXCEPTION 'Queue "%" already exists with different parameters '
+                        '(existing: topic=%, max_attempts=%, exclusive=%, keep_alive_interval=%)',
+            p_queue_name,
+            v_existing.topic_name,
+            v_existing.max_delivery_attempts,
+            v_existing.exclusive,
+            v_existing.keep_alive_interval
+          USING ERRCODE = 'PMQ03';
+    END IF;
+
+    -- Params match → idempotent success. For exclusive queues, refresh
+    -- keep_alive_until so a re-create on an expired queue resurrects it.
+    -- (Non-exclusive queues never have keep_alive_until, so this is a no-op
+    -- for them.)
+    IF p_exclusive THEN
+        UPDATE queues
+        SET keep_alive_until = NOW() + keep_alive_interval
+        WHERE name = p_queue_name;
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
 

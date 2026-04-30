@@ -42,14 +42,15 @@ func main() {
 	topicName := "orders"
 	queueName := "order-processor"
 
+	// CreateTopic and CreateQueue are idempotent: a re-create with the same
+	// parameters is a no-op success. A genuine error (param mismatch on
+	// re-create, invalid name, etc.) is fatal here so it surfaces loudly.
 	if err := conn.CreateTopic(ctx, topicName); err != nil {
-		log.Printf("Topic might already exist: %v", err)
+		log.Fatalf("CreateTopic failed: %v", err)
 	}
-
 	if err := conn.CreateQueue(ctx, queueName, topicName, false); err != nil {
-		log.Printf("Queue might already exist: %v", err)
+		log.Fatalf("CreateQueue failed: %v", err)
 	}
-
 	log.Printf("Topic '%s' and queue '%s' are ready", topicName, queueName)
 
 	// Publish some messages
@@ -63,7 +64,6 @@ func main() {
 		log.Printf("Published message %d with ID: %d", i, messageID)
 	}
 
-	// Create consumer
 	consumer, err := conn.Consume(ctx, queueName,
 		postgremq.WithBatchSize(5),
 		postgremq.WithVT(30))

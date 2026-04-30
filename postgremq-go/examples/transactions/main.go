@@ -40,12 +40,12 @@ func main() {
 	topicName := "orders"
 	queueName := "order-processor"
 
+	// CreateTopic and CreateQueue are idempotent on identical parameters.
 	if err := conn.CreateTopic(ctx, topicName); err != nil {
-		log.Printf("Topic might already exist: %v", err)
+		log.Fatalf("CreateTopic failed: %v", err)
 	}
-
 	if err := conn.CreateQueue(ctx, queueName, topicName, false); err != nil {
-		log.Printf("Queue might already exist: %v", err)
+		log.Fatalf("CreateQueue failed: %v", err)
 	}
 
 	// Example 1: Publish within transaction

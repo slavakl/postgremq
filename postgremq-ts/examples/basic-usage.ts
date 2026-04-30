@@ -8,7 +8,9 @@ import { connect } from '../src';
 async function main() {
   // Connect to PostgreSQL
   const client = await connect({
-    connectionString: 'postgresql://postgres:postgres@localhost:5432/postgres',
+    connectionString:
+      process.env.DATABASE_URL ??
+      'postgresql://postgres:postgres@localhost:5432/postgres',
     // Or specify connection details individually:
     // host: 'localhost',
     // port: 5432,

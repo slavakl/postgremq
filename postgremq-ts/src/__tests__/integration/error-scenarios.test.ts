@@ -59,30 +59,43 @@ describe('Error Scenarios', () => {
       );
     });
 
-    test('should reject duplicate topic creation', async () => {
+    test('createTopic is idempotent (duplicate name is a no-op success)', async () => {
       await connection.createTopic('duplicate-topic');
-
-      // Second creation should fail
-      await assertThrows(
-        () => connection.createTopic('duplicate-topic')
-      );
-
+      // Second creation must succeed silently — create_topic uses
+      // INSERT ... ON CONFLICT DO NOTHING.
+      await connection.createTopic('duplicate-topic');
       // Cleanup
       await connection.deleteTopic('duplicate-topic');
     });
 
-    test('should reject duplicate queue creation', async () => {
+    test('createQueue is idempotent for matching params', async () => {
       await connection.createTopic('queue-topic');
-      await connection.createQueue('duplicate-queue', 'queue-topic', false);
-
-      // Second creation should fail
-      await assertThrows(
-        () => connection.createQueue('duplicate-queue', 'queue-topic', false)
-      );
-
-      // Cleanup
-      await connection.deleteQueue('duplicate-queue');
+      await connection.createQueue('idem-queue', 'queue-topic', false, {
+        maxDeliveryAttempts: 3,
+      });
+      // Same params → success.
+      await connection.createQueue('idem-queue', 'queue-topic', false, {
+        maxDeliveryAttempts: 3,
+      });
+      await connection.deleteQueue('idem-queue');
       await connection.deleteTopic('queue-topic');
+    });
+
+    test('createQueue rejects parameter mismatch with ValidationError', async () => {
+      await connection.createTopic('mismatch-topic');
+      await connection.createQueue('mismatch-queue', 'mismatch-topic', false, {
+        maxDeliveryAttempts: 3,
+      });
+
+      // Different max_delivery_attempts → ValidationError (PMQ03).
+      await expect(
+        connection.createQueue('mismatch-queue', 'mismatch-topic', false, {
+          maxDeliveryAttempts: 5,
+        })
+      ).rejects.toThrow(/already exists with different parameters/);
+
+      await connection.deleteQueue('mismatch-queue');
+      await connection.deleteTopic('mismatch-topic');
     });
 
     test('should reject queue creation for non-existent topic', async () => {

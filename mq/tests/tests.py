@@ -157,29 +157,75 @@ def test_queue_keep_alive_extension(cur: psycopg2.extensions.cursor) -> None:
     assert new_keep_alive > now + timedelta(minutes=14)
     assert new_keep_alive < now + timedelta(minutes=16)
 
-def test_exclusive_queue_uniqueness(cur: psycopg2.extensions.cursor) -> None:
-    """Test that exclusive queues must have unique names."""
+def test_create_queue_idempotent_and_strict(cur: psycopg2.extensions.cursor) -> None:
+    """create_queue follows RabbitMQ-style 'match-or-error' semantics:
+    re-creating with identical parameters is a no-op success; re-creating
+    with any parameter different raises PMQ03 so accidental config drift
+    surfaces loudly."""
     cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT create_topic('OtherTopic')")
 
-    # Create first exclusive queue
-    cur.execute("""
-        SELECT create_queue('ExQueue1', 'TestTopic', 2, true, interval '300 seconds')
-    """)
+    # 1. Identical exclusive params → both calls succeed (no error).
+    cur.execute("SELECT create_queue('ExQueue', 'TestTopic', 2, true, interval '300 seconds')")
+    cur.execute("SELECT create_queue('ExQueue', 'TestTopic', 2, true, interval '300 seconds')")
 
-    # Attempt to create second exclusive queue with same name; raises PMQ03.
-    with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("""
-            SELECT create_queue('ExQueue1', 'TestTopic', 2, true, interval '300 seconds')
-        """)
-    assert "already exists" in str(exc_info.value)
-    assert exc_info.value.pgcode == 'PMQ03', f"expected PMQ03, got {exc_info.value.pgcode}"
-    cur.connection.rollback()
-    
-    # Verify we can call create twice for non-exclusive queues
-    cur.execute("""
-        SELECT create_queue('NonExQueue1', 'TestTopic', 2, false);
-        SELECT create_queue('NonExQueue2', 'TestTopic', 2, false);
-    """)
+    # 2. Identical non-exclusive params → idempotent.
+    cur.execute("SELECT create_queue('NxQueue', 'TestTopic', 2, false)")
+    cur.execute("SELECT create_queue('NxQueue', 'TestTopic', 2, false)")
+
+    # 3. Param mismatches each raise PMQ03 with the existing values surfaced.
+    mismatches = [
+        # Different topic
+        "SELECT create_queue('ExQueue', 'OtherTopic', 2, true, interval '300 seconds')",
+        # Different max_delivery_attempts
+        "SELECT create_queue('ExQueue', 'TestTopic', 5, true, interval '300 seconds')",
+        # Different exclusive flag
+        "SELECT create_queue('ExQueue', 'TestTopic', 2, false, interval '300 seconds')",
+        # Different keep_alive_interval
+        "SELECT create_queue('ExQueue', 'TestTopic', 2, true, interval '60 seconds')",
+    ]
+    for stmt in mismatches:
+        with pytest.raises(psycopg2.Error) as exc_info:
+            cur.execute(stmt)
+        assert exc_info.value.pgcode == 'PMQ03', \
+            f"expected PMQ03 for {stmt!r}, got {exc_info.value.pgcode}: {exc_info.value}"
+        assert "already exists with different parameters" in str(exc_info.value)
+        cur.connection.rollback()
+
+def test_create_queue_idempotent_refreshes_exclusive_keep_alive(cur: psycopg2.extensions.cursor) -> None:
+    """Re-creating an exclusive queue with matching params refreshes
+    keep_alive_until so an expired queue is revived (the caller is asserting
+    ownership now)."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT create_queue('Revive', 'TestTopic', 0, true, interval '60 seconds')")
+
+    # Force the queue's keep_alive_until into the past.
+    cur.execute("UPDATE queues SET keep_alive_until = NOW() - interval '1 hour' WHERE name = 'Revive'")
+    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'Revive'")
+    expired_at = cur.fetchone()[0]
+    now_pre = datetime.now(pytz.UTC)
+    assert expired_at < now_pre
+
+    # Idempotent re-create with same params → revives the queue.
+    cur.execute("SELECT create_queue('Revive', 'TestTopic', 0, true, interval '60 seconds')")
+
+    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'Revive'")
+    after = cur.fetchone()[0]
+    now_post = datetime.now(pytz.UTC)
+    assert after > now_post, f"keep_alive_until must be in the future after revive: {after}"
+    # Should land at ~now+60s; allow a comfortable window for clock granularity.
+    assert after > now_post + timedelta(seconds=55)
+    assert after < now_post + timedelta(seconds=65)
+
+def test_create_queue_idempotent_does_not_touch_nonexclusive(cur: psycopg2.extensions.cursor) -> None:
+    """The keep_alive_until refresh in the idempotent path is gated on
+    p_exclusive; non-exclusive queues' keep_alive_until stays NULL across
+    re-creates."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT create_queue('Plain', 'TestTopic', 0, false)")
+    cur.execute("SELECT create_queue('Plain', 'TestTopic', 0, false)")
+    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'Plain'")
+    assert cur.fetchone()[0] is None
 
 def test_unlimited_delivery_attempts(cur: psycopg2.extensions.cursor) -> None:
     """Test queue with unlimited delivery attempts (max_delivery_attempts = 0)."""

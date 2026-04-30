@@ -135,11 +135,18 @@ describe('Typed errors (SQLSTATE → class mapping)', () => {
       ).rejects.toBeInstanceOf(ValidationError);
     });
 
-    test('exclusive queue duplicate surfaces as ValidationError', async () => {
+    test('createQueue with mismatched params on existing queue surfaces as ValidationError', async () => {
+      // Re-creating with identical params is a no-op success (idempotent).
+      // Re-creating with any parameter different raises PMQ03 with the
+      // existing values surfaced.
       await connection.createTopic('VtTopic3');
-      await connection.createQueue('Excl', 'VtTopic3', true);
+      await connection.createQueue('Excl', 'VtTopic3', true, {
+        maxDeliveryAttempts: 2,
+      });
       await expect(
-        connection.createQueue('Excl', 'VtTopic3', true)
+        connection.createQueue('Excl', 'VtTopic3', true, {
+          maxDeliveryAttempts: 5,
+        })
       ).rejects.toBeInstanceOf(ValidationError);
     });
   });
