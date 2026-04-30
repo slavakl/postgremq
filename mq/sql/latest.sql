@@ -277,6 +277,15 @@ BEGIN
         RAISE EXCEPTION 'Invalid queue name "%": must match ^[A-Za-z0-9_:.\-]+$', p_queue_name
           USING ERRCODE = 'PMQ03';
     END IF;
+    -- Negative max_delivery_attempts silently breaks consume_message's filter
+    -- (qm.delivery_attempts < tq.max_delivery_attempts is never true once the
+    -- attempts counter passes the negative threshold) and never retires to DLQ
+    -- (nack_message and pmq_maintenance_fast both gate on max_attempts > 0).
+    -- Reject upfront so callers see PMQ03 instead of an invisibly-broken queue.
+    IF p_max_attempts < 0 THEN
+        RAISE EXCEPTION 'p_max_attempts must be >= 0 (got %)', p_max_attempts
+          USING ERRCODE = 'PMQ03';
+    END IF;
     INSERT INTO queues (
         name,
         topic_name,

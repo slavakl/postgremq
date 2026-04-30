@@ -227,6 +227,18 @@ def test_create_queue_idempotent_does_not_touch_nonexclusive(cur: psycopg2.exten
     cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'Plain'")
     assert cur.fetchone()[0] is None
 
+def test_create_queue_rejects_negative_max_attempts(cur: psycopg2.extensions.cursor) -> None:
+    """create_queue must reject p_max_attempts < 0 with PMQ03. A negative
+    value silently breaks consume_message (the filter
+    qm.delivery_attempts < tq.max_delivery_attempts becomes never-true once
+    delivery_attempts climbs past the negative threshold) and skips DLQ
+    retirement (nack_message + pmq_maintenance_fast both gate on > 0)."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT create_queue('Bad', 'TestTopic', -1, false)")
+    assert exc_info.value.pgcode == 'PMQ03'
+    assert "must be >= 0" in str(exc_info.value)
+
 def test_unlimited_delivery_attempts(cur: psycopg2.extensions.cursor) -> None:
     """Test queue with unlimited delivery attempts (max_delivery_attempts = 0)."""
     # Setup

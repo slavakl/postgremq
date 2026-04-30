@@ -339,20 +339,29 @@ export async function getSharedTestDatabase(): Promise<TestDatabase> {
 }
 
 /**
- * Assert that an async function throws an error
+ * Assert that an async function throws an error.
+ *
+ * Captures the thrown value out-of-band rather than throwing the sentinel
+ * "Expected function to throw" inside the same try/catch — that previous
+ * shape silently swallowed its own sentinel, so any call site whose `fn`
+ * stopped throwing kept passing for the wrong reason.
  */
 export async function assertThrows(
   fn: () => Promise<any>,
   expectedMessage?: string
 ): Promise<void> {
+  let thrown: any;
   try {
     await fn();
+  } catch (e) {
+    thrown = e;
+  }
+  if (thrown === undefined) {
     throw new Error('Expected function to throw, but it did not');
-  } catch (error: any) {
-    if (expectedMessage && !error.message.includes(expectedMessage)) {
-      throw new Error(
-        `Expected error message to include "${expectedMessage}", but got: "${error.message}"`
-      );
-    }
+  }
+  if (expectedMessage && !String(thrown.message ?? thrown).includes(expectedMessage)) {
+    throw new Error(
+      `Expected error message to include "${expectedMessage}", but got: "${thrown.message ?? thrown}"`
+    );
   }
 }
