@@ -577,3 +577,47 @@ func assertChannelClosed(t *testing.T, ch <-chan int64, msg string) {
 		}
 	}
 }
+
+// TestEventListener_StartAfterCloseIsNoOp regresses a Start/Close race: a
+// Connection.Consume() call that passed checkClosed could land at
+// EventListener.Start() after Connection.Close() had already drained
+// el.stopped and returned. Without the post-Close guard inside startOnce.Do,
+// Start would replace el.stopped with a fresh open channel and launch
+// goroutines that exit promptly on the cancelled ctx — leaked past Close
+// (which never waited for the new stopped channel to close).
+//
+// The deterministic check: newEventListener seeds el.stopped with an
+// already-closed channel. After Close, calling Start() must NOT replace it
+// with a different channel — the same reference must come back.
+func TestEventListener_StartAfterCloseIsNoOp(t *testing.T) {
+	t.Parallel()
+	pool, ctx := setupTestConnection(t)
+	defer pool.Close()
+
+	conn, err := postgremq.DialFromPool(ctx, pool)
+	require.NoError(t, err)
+
+	el := conn.EventListener()
+	initialStopped := el.StoppedChan()
+	require.NotNil(t, initialStopped)
+
+	// Close the connection BEFORE any Consume — so EventListener.Start has
+	// never been called. After Close, ctx is cancelled.
+	require.NoError(t, conn.Close())
+
+	// Now simulate the race: a stale Consume call (or anything else) hitting
+	// Start after Close has fully run.
+	el.Start()
+
+	require.True(t, initialStopped == el.StoppedChan(),
+		"Start after Close must not replace el.stopped — body should bail on cancelled ctx")
+
+	// Sanity: the channel is still closed (so a future hypothetical Close
+	// wouldn't deadlock waiting on <-el.stopped).
+	select {
+	case <-el.StoppedChan():
+		// closed, as expected
+	default:
+		t.Fatal("el.stopped should remain closed after the post-Close Start no-op")
+	}
+}

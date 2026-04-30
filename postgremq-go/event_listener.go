@@ -223,8 +223,21 @@ func (el *EventListener) notifyDrainer() {
 }
 
 // Start launches the listener and drainer goroutines if not already started.
+//
+// If Close has already run (ctx is cancelled), Start is a no-op even on the
+// cold path. Without this guard, a Connection.Consume() call that races a
+// Connection.Close() — Consume passes checkClosed before Close grabs the
+// closedFlag — could land here after Close has already drained el.stopped
+// and returned. Letting startOnce.Do replace el.stopped with a fresh open
+// channel and launch goroutines would leak them past Close: they exit
+// promptly because ctx is cancelled, but Close never waited for the new
+// stopped channel to close, so the wg goroutines linger briefly without
+// synchronization.
 func (el *EventListener) Start() {
 	el.startOnce.Do(func() {
+		if el.ctx.Err() != nil {
+			return
+		}
 		el.stopped = make(chan struct{})
 		el.wg.Add(1)
 		go el.notifyDrainer()

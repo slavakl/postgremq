@@ -17,3 +17,12 @@ func (el *EventListener) SubscriberCount(channel string) int {
 	defer el.mu.Unlock()
 	return el.desired[channel]
 }
+
+// StoppedChan returns the current el.stopped channel for identity comparison
+// in tests. newEventListener seeds it with an already-closed channel; Start
+// replaces it with a fresh open one when it actually launches goroutines.
+// Tests rely on this to assert "Start was a no-op" by checking the channel
+// reference is unchanged. Tests only.
+func (el *EventListener) StoppedChan() <-chan struct{} {
+	return el.stopped
+}
