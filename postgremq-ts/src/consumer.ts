@@ -159,6 +159,17 @@ export class Consumer {
   /** Flag indicating if the consumer is actively fetching messages */
   private fetching: boolean = false;
 
+  /** Promise that resolves when the currently in-flight fetch completes
+   *  (success or error), or null when no fetch is running. Set
+   *  synchronously at triggerFetch() — before any await — so stop() can
+   *  reliably wait for messages a fetch already claimed server-side to
+   *  reach the buffer/inFlight tracking, even if the SQL call takes
+   *  longer than the old 1s spin cap. Without this, a fetch in progress
+   *  during stop() leaks: consume_message has already moved rows to
+   *  'processing', but the consumer is gone before the messages get
+   *  released, so the rows sit until vt expires. */
+  private fetchInFlight: Promise<void> | null = null;
+
   /** Notification unsubscribe function */
   private unsubscribe: (() => void) | null = null;
   
@@ -313,6 +324,12 @@ export class Consumer {
    *  Avoids tight-looping against a dead DB. */
   private static readonly TRANSIENT_RETRY_MS = 1000;
 
+  /** Maximum time stop() will wait for an in-flight fetch to complete
+   *  before giving up. The fetch may have already claimed messages
+   *  server-side; if it doesn't return in time, those messages are
+   *  re-delivered after vt expiry. 30s matches the default vt. */
+  private static readonly FETCH_DRAIN_TIMEOUT_MS = 30_000;
+
   /**
    * Process extensions that are due. Always uses set_vt_batch — even for
    * a single message — to keep one code path. set_vt_batch silently omits
@@ -424,17 +441,21 @@ export class Consumer {
       return;
     }
     
-    // Execute fetch with inline error handling
-    (async () => {
+    // Execute fetch with inline error handling. Capture the promise
+    // synchronously so stop() can await it before tearing down — see the
+    // fetchInFlight comment.
+    this.fetchInFlight = (async () => {
       try {
         await this.fetchMessages();
       } catch (error) {
         console.error(`Error fetching messages: ${error}`);
-        
+
         // On error, retry in one second
         if (this.running) {
           this.nextFetchTimer = setTimeout(() => this.triggerFetch(), 1000);
         }
+      } finally {
+        this.fetchInFlight = null;
       }
     })();
   }
@@ -590,15 +611,25 @@ export class Consumer {
       this.iteratorSignal = null;
     }
 
-    // Wait briefly for any in-flight fetchMessages to complete. Without
-    // this, a fetch that just consumed a message but hasn't yet added it
-    // to the buffer would orphan that message after stop() returns: it
-    // would be locked in the database (status='processing') with no one
-    // to release it. The wait is bounded so we don't block shutdown
-    // indefinitely if the fetch is stuck on a slow query.
-    const fetchDeadline = Date.now() + 1000;
-    while (this.fetching && Date.now() < fetchDeadline) {
-      await sleep(20);
+    // Wait for any in-flight fetchMessages to complete so its messages
+    // reach the buffer / inFlight tracking before we drain. Without
+    // this, a fetch that already claimed rows server-side would orphan
+    // them: they'd be locked in 'processing' with no one to release.
+    // Bounded by FETCH_DRAIN_TIMEOUT_MS so a wedged fetch can't block
+    // shutdown indefinitely.
+    if (this.fetchInFlight) {
+      try {
+        await Promise.race([
+          this.fetchInFlight,
+          sleep(Consumer.FETCH_DRAIN_TIMEOUT_MS).then(() => {
+            throw new Error('fetch did not complete within drain timeout');
+          }),
+        ]);
+      } catch (err) {
+        if (!this.connection.isClientShuttingDown()) {
+          console.warn(`Consumer stop: ${err}; messages claimed by the in-flight fetch may be redelivered after vt expiry`);
+        }
+      }
     }
 
     // Release any buffered messages (similar to Go closing the channel and releasing buffered messages)

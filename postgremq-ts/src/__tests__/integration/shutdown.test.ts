@@ -3,7 +3,7 @@
  * Tests graceful shutdown behavior and cleanup
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, jest } from '@jest/globals';
 import {
   TestDatabase,
   createIsolatedTestConnection,
@@ -214,6 +214,79 @@ describe('Shutdown Behavior', () => {
       await stopPromise;
 
       await connection.close();
+    });
+
+    /**
+     * Reproduces REVIEW.md §4.3 / KNOWN_BUGS.md item 1: a fetch
+     * in-flight when stop() runs whose SQL takes longer than the old
+     * 1000ms spin cap orphans messages — consume_message has already
+     * claimed them server-side, but stop() returns before they reach
+     * the buffer / inFlight tracking.
+     *
+     * Stub the connection's consumeMessages to delay 2s, kick off a
+     * fetch, then call stop() immediately. Pre-fix: stop returns at
+     * ~1s, fetch resolves at 2s with messages stuck in 'processing'.
+     * Post-fix: stop awaits the fetch promise and the messages flow
+     * through normal release/ack on shutdown.
+     */
+    test('stop awaits a slow in-flight fetch and releases its messages', async () => {
+      const connection: Connection = (global as any).__conn;
+
+      await connection.createTopic('slow-fetch-topic');
+      await connection.createQueue('slow-fetch-queue', 'slow-fetch-topic', false);
+      const ids: number[] = [];
+      for (let i = 0; i < 3; i++) {
+        ids.push(await connection.publish('slow-fetch-topic', { i }));
+      }
+
+      // Wrap consumeMessages with a 2s artificial delay (longer than
+      // the legacy 1s spin cap). spyOn lets a future rename surface.
+      const realConsume = connection.consumeMessages.bind(connection);
+      const spy = jest.spyOn(connection, 'consumeMessages')
+        .mockImplementation(async (...args: Parameters<typeof connection.consumeMessages>) => {
+          await sleep(2000);
+          return realConsume(...args);
+        });
+
+      try {
+        const consumer = connection.consume('slow-fetch-queue', {
+          batchSize: 3,
+          visibilityTimeoutSec: 30,
+          autoExtension: { enabled: false }
+        });
+
+        // Drive the fetch by calling messages() — this triggers an
+        // initial fetch under the hood.
+        const messages = consumer.messages();
+        // Don't actually receive any messages; just give the fetch a
+        // moment to start its 2s delay.
+        await sleep(50);
+
+        // Stop must wait for the in-flight fetch to deliver its rows
+        // before tearing down. Total stop time is bounded above by
+        // FETCH_DRAIN_TIMEOUT_MS but should be ~2s in practice.
+        const t0 = Date.now();
+        await consumer.stop();
+        const stopElapsed = Date.now() - t0;
+        expect(stopElapsed).toBeGreaterThanOrEqual(1500); // had to wait for the fetch
+
+        // Critical assertion: every claimed message reached release
+        // path. Pre-fix: 3 rows would be in 'processing' until vt.
+        // Post-fix: 3 rows are back in 'pending', ready to consume.
+        const stats = await connection.getQueueStatistics('slow-fetch-queue');
+        expect(stats.processingCount).toBe(0);
+        expect(stats.pendingCount).toBe(3);
+
+        // discard the iterator
+        await messages.return?.(undefined);
+      } finally {
+        spy.mockRestore();
+      }
+
+      await connection.cleanUpQueue('slow-fetch-queue');
+      await connection.deleteQueue('slow-fetch-queue');
+      await connection.cleanUpTopic('slow-fetch-topic');
+      await connection.deleteTopic('slow-fetch-topic');
     });
   });
 
