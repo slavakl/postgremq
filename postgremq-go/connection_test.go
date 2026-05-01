@@ -144,6 +144,35 @@ func TestConnectionEstablishment(t *testing.T) {
 	require.Error(t, err, "Connection should reject operations after close")
 }
 
+// TestConsumeAfterCloseReturnsError verifies that Consume and ConsumeHandler
+// reject calls made after Connection.Close. Pre-fix they happily registered
+// listener handles against a closed listener, appended to a slice that had
+// already been snapshotted by Close, and returned a Consumer whose
+// goroutines exited promptly on the cancelled ctx — leaving the listener
+// handles' wake channels hanging until process exit. (REVIEW.md §3.2)
+func TestConsumeAfterCloseReturnsError(t *testing.T) {
+	t.Parallel()
+	pool, ctx := setupTestConnection(t)
+	defer pool.Close()
+
+	conn, err := postgremq.DialFromPool(ctx, pool)
+	require.NoError(t, err)
+
+	require.NoError(t, conn.CreateTopic(ctx, "afterclose_topic"))
+	require.NoError(t, conn.CreateQueue(ctx, "afterclose_queue", "afterclose_topic", false))
+
+	require.NoError(t, conn.Close())
+
+	_, err = conn.Consume(ctx, "afterclose_queue")
+	require.ErrorIs(t, err, postgremq.ErrConnectionClosed,
+		"Consume after Close must return ErrConnectionClosed")
+
+	_, err = conn.ConsumeHandler(ctx, "afterclose_queue",
+		func(ctx context.Context, msg *postgremq.Message) {})
+	require.ErrorIs(t, err, postgremq.ErrConnectionClosed,
+		"ConsumeHandler after Close must return ErrConnectionClosed")
+}
+
 // TestConnectionConfigOptions verifies connection config options work correctly
 func TestConnectionConfigOptions(t *testing.T) {
 	t.Parallel()

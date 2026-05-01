@@ -339,6 +339,15 @@ func (c *Connection) Consume(ctx context.Context, queue string, opts ...ConsumeO
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// checkClosed under the write lock closes the TOCTOU window with
+	// Close: either Close has already set closedFlag (we return here) or
+	// Close hasn't started yet (and our append happens before Close's
+	// snapshot, so Stop() will reach this consumer). Without this guard
+	// a post-Close Consume would register listener handles, append to a
+	// slice that's already been snapshotted, and leak both.
+	if err := c.checkClosed(); err != nil {
+		return nil, err
+	}
 	topicHandle := c.eventListener.AddTopicListener(topic)
 	queueHandle := c.eventListener.AddQueueListener(queue)
 	consumer, err := newConsumerFromOptions(c.ctx, c, c.logger, queue, topicHandle, queueHandle, options)
@@ -419,6 +428,11 @@ func (c *Connection) ConsumeHandler(
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// See the comment in Consume — checkClosed under the write lock
+	// closes the TOCTOU with Close.
+	if err := c.checkClosed(); err != nil {
+		return nil, err
+	}
 
 	topicHandle := c.eventListener.AddTopicListener(topic)
 	queueHandle := c.eventListener.AddQueueListener(queue)
