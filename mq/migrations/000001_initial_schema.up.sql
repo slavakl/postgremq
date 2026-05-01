@@ -140,6 +140,29 @@ CREATE INDEX idx_queue_messages_next_visible
 ON queue_messages(queue_name, vt)
 WHERE status IN ('pending', 'processing');
 
+-- Index for distribute_message: every publish runs
+-- `WHERE topic_name = NEW.topic_name` over the queues table. Without this,
+-- a publish-heavy workload seqscans the queues table on every message —
+-- linear in the queue count, the publish hot path's first scaling cliff.
+CREATE INDEX idx_queues_topic_name
+ON queues(topic_name);
+
+-- Index for clean_up_topic and the messages → topics FK cascade.
+-- DELETE FROM messages WHERE topic_name = X without this index seqscans
+-- the entire messages table; the same is true for any cascade triggered
+-- by deleting a topic.
+CREATE INDEX idx_messages_topic_name
+ON messages(topic_name);
+
+-- Index for cleanup_completed_messages. The cleanup query filters by
+-- status='completed' AND processed_at < cutoff. The two pre-existing
+-- partial indexes cover only pending/processing rows, so the cleanup
+-- otherwise falls back to a heap seqscan over every queue_message —
+-- the kind of bulk DELETE that fails to keep up with a busy queue.
+CREATE INDEX idx_queue_messages_completed_processed_at
+ON queue_messages(processed_at)
+WHERE status = 'completed';
+
 /* Function: distribute_message
  *
  * Description:
