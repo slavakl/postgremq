@@ -18,6 +18,103 @@ interface MessageExtensionInfo {
 }
 
 /**
+ * Schedule of in-flight messages awaiting auto-extension, sorted by
+ * `nextExtensionTime` (primary) then `messageId` (secondary, for stable
+ * order). The class encapsulates the sorted-insert invariant and the
+ * "vt is too old" cap so the Consumer can think in terms of add / remove
+ * / replace / due / headTime instead of array math.
+ */
+class ExtensionQueue {
+  private items: MessageExtensionInfo[] = [];
+
+  /**
+   * @param visibilityTimeoutSec — the consumer's configured VT, used to
+   *        derive the next-extension time and the staleness cap.
+   * @param threshold — fraction of the VT to use as the safety margin
+   *        before extending. 0.5 means "extend at the halfway point".
+   */
+  constructor(
+    private readonly visibilityTimeoutSec: number,
+    private readonly threshold: number,
+  ) {}
+
+  get size(): number {
+    return this.items.length;
+  }
+
+  /** Time at which the soonest extension is scheduled, or null if empty. */
+  headTime(): Date | null {
+    return this.items.length > 0 ? this.items[0].nextExtensionTime : null;
+  }
+
+  /** Up to `limit` items whose `nextExtensionTime` is at or before `now`. */
+  due(now: Date, limit: number): MessageExtensionInfo[] {
+    const out: MessageExtensionInfo[] = [];
+    for (const item of this.items) {
+      if (item.nextExtensionTime > now) break;  // sorted: rest are later
+      out.push(item);
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
+  /**
+   * Schedule `message` for extension. The first attempt is at
+   * `vt - visibilityTimeoutSec * threshold * 1000` (typically halfway
+   * through the lease). No-op if the message's vt is older than 3× the
+   * lease window (likely already expired or stuck) or if the planned
+   * extension time is already past — in the latter case the caller's
+   * normal scheduling/retry path will pick it up.
+   */
+  add(message: Message): void {
+    const thresholdMs = this.visibilityTimeoutSec * this.threshold * 1000;
+    const now = Date.now();
+    const MAX_AGE_MS = this.visibilityTimeoutSec * 3 * 1000;
+    if (message.vt.getTime() < now - MAX_AGE_MS) return;
+    const extensionTime = new Date(message.vt.getTime() - thresholdMs);
+    if (extensionTime.getTime() <= now) return;
+
+    const idx = this.findInsertionIndex(extensionTime, message.id);
+    this.items.splice(idx, 0, {
+      messageId: message.id,
+      consumerToken: message.consumerToken,
+      nextExtensionTime: extensionTime,
+    });
+  }
+
+  /** Drop the entry for `messageId`. No-op if absent. */
+  remove(messageId: number): void {
+    this.items = this.items.filter(i => i.messageId !== messageId);
+  }
+
+  /** Replace the entry for `message.id` with one carrying `message`'s
+   *  current vt. Equivalent to `remove(message.id)` + `add(message)`. */
+  replace(message: Message): void {
+    this.remove(message.id);
+    this.add(message);
+  }
+
+  /** Binary-search the insertion index that preserves the sort order. */
+  private findInsertionIndex(extensionTime: Date, messageId: number): number {
+    let low = 0;
+    let high = this.items.length;
+    const targetTime = extensionTime.getTime();
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      const midTime = this.items[mid].nextExtensionTime.getTime();
+      // Primary: nextExtensionTime ascending. Secondary: messageId ascending.
+      if (midTime > targetTime ||
+          (midTime === targetTime && this.items[mid].messageId > messageId)) {
+        high = mid;
+      } else {
+        low = mid + 1;
+      }
+    }
+    return low;
+  }
+}
+
+/**
  * Consumer class for consuming messages from a queue.
  *
  * - Implements an asynchronous iterator pattern for message consumption
@@ -80,11 +177,18 @@ export class Consumer {
   /** Threshold for triggering new fetches (1/3 of batchSize) */
   private readonly fetchThreshold: number;
   
-  /** Sorted array of messages by next extension time */
-  private extensionQueue: MessageExtensionInfo[] = [];
-  
+  /** Schedule of in-flight messages awaiting auto-extension. */
+  private readonly queue: ExtensionQueue;
+
   /** Flag to indicate if an extension operation is currently in progress */
   private extending: boolean = false;
+
+  /** Earliest moment at which the next extension call may run, regardless
+   *  of what the head of the queue says. Set by processExtensions on a
+   *  transient failure to defer the next attempt by ~1s and avoid
+   *  tight-looping against a dead DB. Cleared on entry to the next call.
+   *  Mirrors Go's `tryAfter` in extendLoop. */
+  private tryAfter: Date | null = null;
 
   /**
    * Create a new Consumer
@@ -112,6 +216,11 @@ export class Consumer {
     
     // Calculate the fetch threshold once (1/3 of batch size)
     this.fetchThreshold = Math.max(1, Math.floor(this.options.batchSize / 3));
+
+    this.queue = new ExtensionQueue(
+      this.options.visibilityTimeoutSec,
+      this.options.autoExtension.extensionThreshold ?? 0.5,
+    );
   }
 
   /**
@@ -159,227 +268,132 @@ export class Consumer {
     this.triggerFetch();
   }
 
-  /**
-   * Add a message to the extension queue
-   * @param message - The message to add to the extension queue
-   */
-  private addMessageToExtensionQueue(message: Message): void {
-    if (!this.options.autoExtension.enabled) {
-      return;
-    }
-
-    // Calculate when this message needs to be extended
-    const extensionThreshold = this.options.autoExtension.extensionThreshold ?? 0.5;
-    const thresholdMs = this.options.visibilityTimeoutSec * extensionThreshold * 1000;
-    const now = new Date();
-
-    // Calculate the time when the message should be extended
-    const extensionTime = new Date(message.vt.getTime() - thresholdMs);
-
-    // Prevent unbounded growth: don't add messages that are too old
-    // Maximum age is 3x the visibility timeout
-    const MAX_EXTENSION_AGE_MS = this.options.visibilityTimeoutSec * 3 * 1000;
-    if (message.vt.getTime() < now.getTime() - MAX_EXTENSION_AGE_MS) {
-      // Message VT is too old, likely already expired or stuck
-      return;
-    }
-
-    // Only add if extension time is in the future
-    if (extensionTime > now) {
-      const newItem = {
-        messageId: message.id,
-        consumerToken: message.consumerToken,
-        nextExtensionTime: extensionTime
-      };
-
-      // Use binary search to find the correct insertion position
-      // This maintains sorted order with O(log n) search complexity
-      // instead of O(n log n) for a full array sort
-      const insertIndex = this.findInsertionIndex(extensionTime, message.id);
-
-      // Insert at the correct position
-      this.extensionQueue.splice(insertIndex, 0, newItem);
-
-      // Update the extension schedule
-      this.scheduleNextExtension();
-    }
+  /** Track `message` for auto-extension, then update the timer. No-op
+   *  if auto-extension is disabled. */
+  private addToQueue(message: Message): void {
+    if (!this.options.autoExtension.enabled) return;
+    this.queue.add(message);
+    this.scheduleNextExtension();
   }
-  
-  /**
-   * Binary search to find the correct insertion index in the sorted extension queue
-   * Uses message ID as secondary sort key to ensure stable ordering
-   * @param extensionTime - The next extension time to insert
-   * @param messageId - The message ID (used as secondary sort key)
-   * @returns The index where the new element should be inserted
-   */
-  private findInsertionIndex(extensionTime: Date, messageId: number): number {
-    let low = 0;
-    let high = this.extensionQueue.length;
 
-    while (low < high) {
-      const mid = Math.floor((low + high) / 2);
-      const midTime = this.extensionQueue[mid].nextExtensionTime.getTime();
-      const targetTime = extensionTime.getTime();
-
-      // Primary sort: by extension time
-      // Secondary sort: by message ID for stable ordering
-      if (midTime > targetTime ||
-          (midTime === targetTime && this.extensionQueue[mid].messageId > messageId)) {
-        high = mid;
-      } else {
-        low = mid + 1;
-      }
-    }
-
-    return low;
-  }
-  
-  /**
-   * Remove a message from the extension queue
-   * @param messageId - The ID of the message to remove
-   */
-  private removeMessageFromExtensionQueue(messageId: number): void {
-    const initialLength = this.extensionQueue.length;
-    
-    // Remove the message from the extension queue
-    this.extensionQueue = this.extensionQueue.filter(info => info.messageId !== messageId);
-    
-    // If we actually removed something and auto-extension is enabled, reschedule
-    if (initialLength !== this.extensionQueue.length && this.options.autoExtension.enabled) {
-      this.scheduleNextExtension();
-    }
+  /** Drop tracking for `messageId`. No-op if auto-extension is disabled
+   *  or the message isn't tracked. */
+  private removeFromQueue(messageId: number): void {
+    if (!this.options.autoExtension.enabled) return;
+    this.queue.remove(messageId);
   }
   
   /**
    * Schedule the next extension based on the extension queue
    */
   private scheduleNextExtension(): void {
-    // Clear any existing extension timer
     if (this.nextExtensionTimer) {
       clearTimeout(this.nextExtensionTimer);
       this.nextExtensionTimer = null;
     }
-    
-    // If no messages need extension or we're not running, just return
-    if (this.extensionQueue.length === 0 || !this.running) {
-      return;
+
+    const head = this.queue.headTime();
+    if (!head || !this.running) return;
+
+    // Target = max(head's planned time, tryAfter). tryAfter is set on a
+    // transient failure to defer the next attempt; otherwise null.
+    let targetTime = head;
+    if (this.tryAfter && this.tryAfter > targetTime) {
+      targetTime = this.tryAfter;
     }
-    
-    // Get the soonest message that needs extension
-    const nextExtension = this.extensionQueue[0];
-    const now = new Date();
-    
-    // Calculate how long to wait
-    let waitTime = nextExtension.nextExtensionTime.getTime() - now.getTime();
-    
-    // If it's already past due, process extensions immediately
-    if (waitTime <= 0) {
+    const waitTime = Math.max(0, targetTime.getTime() - Date.now());
+
+    if (waitTime === 0) {
       this.processExtensions();
       return;
     }
-    
-    // Schedule the timer for the next extension
+
     this.nextExtensionTimer = setTimeout(() => {
       this.processExtensions();
     }, waitTime);
   }
   
+  /** How long to defer the next extension call after a transient failure.
+   *  Avoids tight-looping against a dead DB. */
+  private static readonly TRANSIENT_RETRY_MS = 1000;
+
   /**
-   * Process message extensions that are due
+   * Process extensions that are due. Always uses set_vt_batch — even for
+   * a single message — to keep one code path. set_vt_batch silently omits
+   * rows that no longer match the (token, status='processing', vt>NOW())
+   * predicate, so missing rows are interpreted as "lease lost server-side"
+   * and we cancel their handlers.
+   *
+   * Outcomes:
+   *   - Success: each returned id has its vt updated and is re-scheduled.
+   *     Each requested id missing from the response is "lease lost
+   *     server-side" — cancel its handler, drop from tracking.
+   *   - Thrown error (transient — DB blip past Connection's retry budget):
+   *     keep items in the queue, set tryAfter so the next call defers
+   *     ~1s. The next attempt will either succeed or report rows missing
+   *     (→ cancel + drop).
    */
   private async processExtensions(): Promise<void> {
-    // If already extending or not running, return
-    if (this.extending || !this.running) {
-      return;
-    }
-    
+    if (this.extending || !this.running) return;
     this.extending = true;
-    
+
     try {
+      // We're running now — reset any deferral; a fresh failure below
+      // will set it again.
+      this.tryAfter = null;
+
       const now = new Date();
       const extensionSec = this.options.autoExtension.extensionSec ?? 30;
       const maxBatchSize = this.options.autoExtension.maxBatchSize ?? 100;
-      
-      // Find messages that are due for extension
-      const dueForExtension = this.extensionQueue
-        .filter(info => info.nextExtensionTime <= now)
-        .slice(0, maxBatchSize);
-      
-      // If no messages are due, reschedule and return
-      if (dueForExtension.length === 0) {
-        this.scheduleNextExtension();
+
+      const dueForExtension = this.queue.due(now, maxBatchSize);
+      if (dueForExtension.length === 0) return;
+
+      const messageIds = dueForExtension.map(info => info.messageId);
+      const consumerTokens = dueForExtension.map(info => info.consumerToken);
+
+      let results: Array<[number, Date]>;
+      try {
+        results = await this.connection.setMessagesVtBatch(
+          this.queueName, messageIds, consumerTokens, extensionSec,
+        );
+      } catch (error) {
+        // Transient: leave items in queue, defer next attempt globally.
+        this.tryAfter = new Date(Date.now() + Consumer.TRANSIENT_RETRY_MS);
+        if (!this.connection.isClientShuttingDown()) {
+          console.warn(`Transient error extending ${dueForExtension.length} messages: ${error}; will retry`);
+        }
         return;
       }
-      
-      // Remove the due messages from the queue
-      this.extensionQueue = this.extensionQueue.filter(info => 
-        info.nextExtensionTime > now || 
-        !dueForExtension.some(due => due.messageId === info.messageId)
-      );
-      
-      // If there's only one message, use the single message API
-      if (dueForExtension.length === 1) {
-        const info = dueForExtension[0];
-        const message = this.inFlightMessages.get(info.messageId);
-        
+
+      const extendedIds = new Set<number>();
+      for (const [messageId, newVt] of results) {
+        const message = this.inFlightMessages.get(messageId);
         if (message) {
-          try {
-            const newVt = await message.setVt(extensionSec);
-            console.debug(`Extended visibility for message ${info.messageId} until ${newVt}`);
-            
-            // Re-add the message to the extension queue with updated time
-            this.addMessageToExtensionQueue(message);
-          } catch (error) {
-            // Only log if not shutting down
-            if (!this.connection.isClientShuttingDown()) {
-              console.debug(`Failed to extend visibility for message ${info.messageId}: ${error}`);
-            }
-            // Don't re-add to queue if extension failed - it might be completed already
-          }
-        }
-      } 
-      // For multiple messages, use the batch extension API
-      else if (dueForExtension.length > 1) {
-        try {
-          const messageIds = dueForExtension.map(info => info.messageId);
-          const consumerTokens = dueForExtension.map(info => info.consumerToken);
-          
-          const results = await this.connection.setMessagesVtBatch(
-            this.queueName,
-            messageIds,
-            consumerTokens,
-            extensionSec
-          );
-          
-          // Update message VT values and re-add to extension queue
-          for (const [messageId, newVt] of results) {
-            const message = this.inFlightMessages.get(messageId);
-            if (message) {
-              message.vt = newVt;
-              this.addMessageToExtensionQueue(message);
-            }
-          }
-          
-          console.debug(`Extended visibility for ${results.length} messages`);
-          
-          // For messages that failed to extend, they're not returned in results
-          // We won't re-add them to the queue
-        } catch (error) {
-          console.error(`Error extending visibility for batch of messages: ${error}`);
-          // Don't re-add batch if the entire operation failed
+          message.vt = newVt;
+          this.queue.replace(message);
+          extendedIds.add(messageId);
         }
       }
-      
-      // If we still have messages past due (e.g., more than maxBatchSize),
-      // process them immediately (but only if still running)
-      if (this.running && this.extensionQueue.length > 0 && this.extensionQueue[0].nextExtensionTime <= now) {
-        setTimeout(() => this.processExtensions(), 0);
-      } else if (this.running) {
-        // Otherwise, schedule the next extension (but only if still running)
-        this.scheduleNextExtension();
+
+      // Missing from results = lease lost server-side.
+      let leaseLost = 0;
+      for (const info of dueForExtension) {
+        if (extendedIds.has(info.messageId)) continue;
+        const msg = this.inFlightMessages.get(info.messageId);
+        if (msg) {
+          msg._cancel();
+          leaseLost++;
+        }
+        this.queue.remove(info.messageId);
+      }
+
+      if (leaseLost > 0 && !this.connection.isClientShuttingDown()) {
+        console.debug(`Extended ${extendedIds.size}/${dueForExtension.length} (${leaseLost} lease lost; handlers cancelled)`);
       }
     } finally {
       this.extending = false;
+      if (this.running) this.scheduleNextExtension();
     }
   }
 
@@ -388,14 +402,10 @@ export class Consumer {
    * @param messageId - The ID of the completed message
    */
   private handleMessageComplete(messageId: number): void {
-    // Remove from in-flight tracking
     this.inFlightMessages.delete(messageId);
-    
-    // Remove from extension queue
-    this.removeMessageFromExtensionQueue(messageId);
-    
-    // We don't trigger fetch here anymore - message completion is
-    // not the same as message consumption from the buffer
+    this.removeFromQueue(messageId);
+    // We don't trigger fetch here — message completion is not the same
+    // as message consumption from the buffer.
   }
 
   /**
@@ -486,11 +496,7 @@ export class Consumer {
         // Add to buffer and in-flight tracking
         this.messageBuffer.push(message);
         this.inFlightMessages.set(message.id, message);
-        
-        // Add to extension queue if auto-extension is enabled
-        if (this.options.autoExtension.enabled) {
-          this.addMessageToExtensionQueue(message);
-        }
+        this.addToQueue(message);
       }
       
       // Check if we received a full batch
@@ -553,6 +559,15 @@ export class Consumer {
     }
 
     this.running = false;
+
+    // Signal every in-flight handler that the consumer is shutting down so
+    // it can short-circuit work — the application can still finish acking,
+    // nacking, or releasing a message after the signal fires (the abort is
+    // advisory). Mirrors Go's Consumer.Stop() which cancels every
+    // in-flight message's StoppedCtx during shutdown.
+    for (const message of this.inFlightMessages.values()) {
+      message._cancel();
+    }
 
     // Clear the next fetch timer
     if (this.nextFetchTimer) {

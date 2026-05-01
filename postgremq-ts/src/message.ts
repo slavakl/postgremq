@@ -39,6 +39,15 @@ export class Message {
   /** Internal flag to track if onComplete has been called */
   private completeCalled: boolean = false;
 
+  /** AbortController used by the Consumer to signal that this message
+   *  can no longer be acked successfully — the lease was lost server-side
+   *  (auto-extension found the row missing from set_vt_batch's result, or
+   *  set_vt raised PMQ01). Handlers can check `message.signal.aborted` /
+   *  listen for 'abort' to short-circuit work that would otherwise be
+   *  wasted (and may commit non-idempotent side-effects). Mirrors the Go
+   *  client's `msg.StoppedCtx`. */
+  private readonly _abortController: AbortController = new AbortController();
+
   /** Callback to invoke when message is completed */
   private onComplete: (messageId: number) => void;
   
@@ -125,6 +134,39 @@ export class Message {
     this.publishedAt = publishedAt;
     this.onComplete = onComplete;
     this.dbOperations = dbOperations;
+  }
+
+  /**
+   * AbortSignal that fires when the message's lease is lost — auto-extension
+   * could not extend the visibility timeout server-side, so any further ack /
+   * nack / setVt call from this consumer will fail with LeaseLostError.
+   * Handlers should check `message.signal.aborted` (or listen for 'abort')
+   * and short-circuit work that would otherwise be wasted or commit
+   * non-idempotent side effects after the lease has already been lost.
+   *
+   *   for await (const msg of consumer) {
+   *     for (let i = 0; i < workItems.length; i++) {
+   *       if (msg.signal.aborted) break;
+   *       await doWork(workItems[i]);
+   *     }
+   *     if (!msg.signal.aborted) await msg.ack();
+   *   }
+   *
+   * Mirrors the Go client's `msg.StoppedCtx`.
+   */
+  get signal(): AbortSignal {
+    return this._abortController.signal;
+  }
+
+  /**
+   * Cancel this message's signal — invoked by the Consumer when it
+   * determines the lease can no longer be extended.
+   * @internal — for Consumer use only.
+   */
+  _cancel(): void {
+    if (!this._abortController.signal.aborted) {
+      this._abortController.abort();
+    }
   }
 
   /**

@@ -248,6 +248,81 @@ func TestConsumerVisibilityTimeoutExtension(t *testing.T) {
 	assert.True(t, updatedVT.After(msg.GetVT()), "Visibility timeout should be extended automatically. Logs: \n\t%s", strings.Join(logger.GetMessages(), "\n\t"))
 }
 
+// TestConsumerExtensionCancelsHandlerOnLeaseLost verifies that when the
+// auto-extension routine discovers a message's lease is lost server-side
+// (set_vt_batch returns the row missing from its result), the consumer
+// cancels msg.StoppedCtx so the handler can stop work that's no longer
+// ackable. Pre-fix the consumer just logged a warning — the handler ran
+// to completion, possibly committing non-idempotent side-effects, before
+// hitting PMQ01 on ack.
+func TestConsumerExtensionCancelsHandlerOnLeaseLost(t *testing.T) {
+	t.Parallel()
+	pool, ctx := setupTestConnection(t)
+	defer pool.Close()
+
+	const topicName = "test_extension_cancel_topic"
+	const queueName = "test_extension_cancel_queue"
+	logger := MockLogger{}
+	conn, err := postgremq.DialFromPool(ctx, pool, postgremq.WithLogger(&logger))
+	require.NoError(t, err)
+	defer conn.Close()
+
+	require.NoError(t, conn.CreateTopic(ctx, topicName))
+	require.NoError(t, conn.CreateQueue(ctx, queueName, topicName, false))
+
+	// Publish two messages: we'll steal one's lease and verify only that
+	// one's StoppedCtx fires, while the other stays valid.
+	_, err = conn.Publish(ctx, topicName, []byte(`{"i":1}`))
+	require.NoError(t, err)
+	_, err = conn.Publish(ctx, topicName, []byte(`{"i":2}`))
+	require.NoError(t, err)
+
+	// VT=2s so the extend routine fires fast (extendAt = vt/2 = ~1s).
+	consumer, err := conn.Consume(ctx, queueName, postgremq.WithVT(2))
+	require.NoError(t, err)
+	defer consumer.Stop()
+
+	msg1 := <-consumer.Messages()
+	msg2 := <-consumer.Messages()
+
+	// Steal msg1's lease server-side: rewrite consumer_token. The next
+	// set_vt_batch will omit msg1 from its result (token mismatch in the
+	// WHERE clause) — that's the lease-lost signal we want to test.
+	_, err = pool.Exec(ctx,
+		`UPDATE queue_messages SET consumer_token = 'stolen-by-other'
+		 WHERE queue_name = $1 AND message_id = $2`,
+		queueName, msg1.ID)
+	require.NoError(t, err)
+
+	// Wait long enough for at least one auto-extend cycle (extendAt is
+	// ~1s after consume; 2.5s gives comfortable headroom).
+	select {
+	case <-msg1.StoppedCtx.Done():
+		// expected — extension detected lease loss and cancelled
+	case <-time.After(2500 * time.Millisecond):
+		t.Fatalf("msg1.StoppedCtx not cancelled after lease loss; logs:\n\t%s",
+			strings.Join(logger.GetMessages(), "\n\t"))
+	}
+
+	// msg2 must NOT be cancelled — its lease is still valid.
+	select {
+	case <-msg2.StoppedCtx.Done():
+		t.Fatalf("msg2.StoppedCtx unexpectedly cancelled; logs:\n\t%s",
+			strings.Join(logger.GetMessages(), "\n\t"))
+	default:
+		// expected
+	}
+
+	// msg2 should still be ackable.
+	require.NoError(t, msg2.Ack(ctx))
+
+	// msg1's lease was stolen — Release will return PMQ01 but always
+	// fires onComplete, draining it from tracking so Stop() doesn't
+	// hang waiting for it. Real handlers must do the same when they
+	// observe StoppedCtx fire.
+	_ = msg1.Release(ctx)
+}
+
 // TestConsumerBufferedMessagesReleased verifies that buffered messages
 // are released when a consumer stops.
 func TestConsumerBufferedMessagesReleased(t *testing.T) {

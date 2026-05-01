@@ -290,6 +290,14 @@ type vtInfo struct {
 	messageID     int64
 	consumerToken string
 	extendAt      time.Time
+	// cancel is called by extendVTs when set_vt_batch returns the row
+	// missing from its result set — the lease has been lost server-side.
+	// Cancelling the message's StoppedCtx lets the handler stop work that
+	// will never be ackable, instead of running to completion and
+	// committing non-idempotent side-effects before the eventual PMQ01 on
+	// ack. We hold only the CancelFunc — not the whole *Message — to keep
+	// the dependency narrow.
+	cancel context.CancelFunc
 }
 
 // calculateExtendAt calculates when to extend the message's visibility timeout.
@@ -366,6 +374,7 @@ func (c *Consumer) startExtendLoop() {
 						messageID:     update.msg.ID,
 						consumerToken: update.msg.consumerToken,
 						extendAt:      calculateExtendAt(update.msg.GetVT()),
+						cancel:        update.msg.cancel,
 					})
 				case messageRemoved:
 					vts.remove(update.msg.ID)
@@ -417,22 +426,52 @@ func (c *Consumer) extendVTs(vts *vtHeap) (tryAfter time.Time) {
 	}
 	extendedVTs, err := c.conn.SetVTBatch(c.dbCtx, c.queue, extending, int(c.vtSec))
 	if err != nil {
-		c.logger.Errorf("Failed to extend message vts batch: %v", err)
-		tryAfter = time.Now().Add(1 * time.Second) // take a break before trying again
+		// Connection.SetVTBatch already retried transient errors via
+		// withRetry; an error here means a persistent problem (DB down,
+		// validation failure, etc.). Re-push the popped items so the
+		// next cycle tries again — extendAt is a soft deadline (halfway
+		// point), so we still have time before the server-side lease
+		// actually expires. tryAfter delays the next call by 1s to avoid
+		// tight-looping. If by the next attempt the lease has actually
+		// expired, set_vt_batch will return the row missing and we
+		// cancel cleanly on that path.
+		c.logger.Errorf("Failed to extend message vts batch: %v; will retry next cycle", err)
+		for _, info := range extendingMap {
+			vts.push(info)
+		}
+		tryAfter = time.Now().Add(1 * time.Second)
 		return
 	}
-	if len(extendedVTs) != len(extending) {
-		c.logger.Warnf("Some messages were not extended: expected %d, got %d",
-			len(extending), len(extendedVTs))
-	}
-	// add new VTs back to the heap
+
+	// Track which IDs got extended; the rest are lease-lost server-side.
+	extended := make(map[int64]bool, len(extendedVTs))
 	for _, vt := range extendedVTs {
+		extended[vt.ID] = true
 		oldVT, ok := extendingMap[vt.ID]
 		if !ok {
 			c.logger.Warnf("Extending message returned some unknown message : %d", vt.ID)
+			continue
 		}
 		oldVT.extendAt = calculateExtendAt(vt.VT)
 		vts.push(oldVT)
+	}
+
+	// Items in the request but missing from the response are no longer
+	// ours: set_vt_batch's WHERE filters by status='processing', vt > NOW(),
+	// and consumer_token; any mismatch silently omits the row. From our
+	// perspective these are all "lease lost". Cancel each handler's
+	// StoppedCtx so it can stop work — the eventual ack will fail with
+	// PMQ01 anyway, and silently letting the handler run to completion
+	// risks committing non-idempotent side-effects on a row that's now
+	// owned by another consumer (or already in DLQ).
+	for id, info := range extendingMap {
+		if extended[id] {
+			continue
+		}
+		c.logger.Warnf("Lease lost for message %d during extension; signalling handler", id)
+		if info.cancel != nil {
+			info.cancel()
+		}
 	}
 	return
 }
