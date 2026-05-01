@@ -61,6 +61,39 @@ func (m *MockPool) Acquire(ctx context.Context) (*pgxpool.Conn, error) {
 // Add Close method to MockPool
 func (m *MockPool) Close() {}
 
+// MockRows is a minimal pgx.Rows used in tests to drive consumeMessages
+// through scan/iteration paths. It returns one row per ScanFunc until
+// the last one, then exposes ErrAfter as rows.Err(). pgx.Rows has many
+// methods we don't use; the unused ones return zero values.
+type MockRows struct {
+	ScanFuncs []func(dest ...any) error // one per row, in order
+	ErrAfter  error                     // value returned by Err() after exhaustion
+	idx       int
+	closed    bool
+}
+
+func (r *MockRows) Close()                                  { r.closed = true }
+func (r *MockRows) Err() error                              { return r.ErrAfter }
+func (r *MockRows) CommandTag() pgconn.CommandTag           { return pgconn.CommandTag{} }
+func (r *MockRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *MockRows) Next() bool {
+	if r.idx >= len(r.ScanFuncs) {
+		return false
+	}
+	return true
+}
+func (r *MockRows) Scan(dest ...any) error {
+	if r.idx >= len(r.ScanFuncs) {
+		return fmt.Errorf("Scan past end of rows")
+	}
+	fn := r.ScanFuncs[r.idx]
+	r.idx++
+	return fn(dest...)
+}
+func (r *MockRows) Values() ([]any, error)                  { return nil, nil }
+func (r *MockRows) RawValues() [][]byte                     { return nil }
+func (r *MockRows) Conn() *pgx.Conn                         { return nil }
+
 // MockLogger implements Logger interface for testing
 type MockLogger struct {
 	mu       sync.Mutex

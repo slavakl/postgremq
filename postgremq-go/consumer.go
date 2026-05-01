@@ -182,9 +182,14 @@ func (c *Consumer) fetchMessages() time.Time {
 	msgs, err := c.conn.consumeMessages(c.dbCtx, c.queue, c.batchSize, c.vtSec)
 	if err != nil {
 		c.logger.Errorf("Failed to consume messages: %v", err)
-		return time.Now().Add(1 * time.Second) // retry after 1 second
 	}
-	c.logger.Debugf("Consumer - fetched %d messages", len(msgs))
+	c.logger.Debugf("Consumer - fetched %d messages (err=%v)", len(msgs), err)
+
+	// Process whatever messages we got — even on a partial-batch error.
+	// Successfully-scanned rows are already claimed server-side
+	// (status='processing', vt set, consumer_token assigned); dropping
+	// them here would just make us wait for vt expiry to see them again.
+	// The error path below still schedules a retry for the next fetch.
 	for _, msg := range msgs {
 		// Create a new context for each message. Use Background context as parent so that clients can't read any values from the parent context.
 		msg.StoppedCtx, msg.cancel = context.WithCancel(context.Background())
@@ -219,6 +224,9 @@ func (c *Consumer) fetchMessages() time.Time {
 			}
 			continue
 		}
+	}
+	if err != nil {
+		return time.Now().Add(1 * time.Second) // retry after 1 second
 	}
 	if len(msgs) == c.batchSize && c.ctx.Err() == nil {
 		return time.Now() // we consumed max available messages, try to fetch more immediately

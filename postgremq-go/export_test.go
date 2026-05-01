@@ -1,5 +1,7 @@
 package postgremq_go
 
+import "context"
+
 // This file is compiled only during `go test`. It exposes a few unexported
 // pieces of state to the external `postgremq_go_test` package so internal
 // invariants (refcounted LISTEN sharing, etc.) can be asserted without
@@ -25,4 +27,11 @@ func (el *EventListener) SubscriberCount(channel string) int {
 // reference is unchanged. Tests only.
 func (el *EventListener) StoppedChan() <-chan struct{} {
 	return el.stopped
+}
+
+// ConsumeMessages exposes the unexported consumeMessages so tests can
+// drive it directly with a MockPool — useful for asserting retry
+// behavior without spinning up a Consumer goroutine. Tests only.
+func (c *Connection) ConsumeMessages(ctx context.Context, queue string, limit, vt int) ([]*Message, error) {
+	return c.consumeMessages(ctx, queue, limit, vt)
 }

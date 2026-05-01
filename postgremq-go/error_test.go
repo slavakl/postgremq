@@ -5,6 +5,7 @@ package postgremq_go_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -219,6 +220,95 @@ func TestTransactionErrorHandling(t *testing.T) {
 	err = conn.CreateTopic(ctx, "test_retry_fail_topic")
 	require.Error(t, err, "Operation should fail after max retries")
 	require.Equal(t, int32(5), callCount.Load(), "Should have made exactly 5 attempts")
+}
+
+// TestConsumeMessagesDoesNotRetry verifies that consumeMessages calls
+// pool.Query exactly once even when withRetry is configured for many
+// attempts. consume_message has a side effect — it transitions matched
+// rows to status='processing' and assigns a fresh consumer_token. If
+// we retried after a partial-result error (e.g. row-iteration network
+// drop) we'd claim a SECOND batch from the server while the first sat
+// orphaned in 'processing' until vt expired. (REVIEW.md §3.3)
+func TestConsumeMessagesDoesNotRetry(t *testing.T) {
+	t.Parallel()
+
+	var queryCalls atomic.Int32
+	mockPool := &MockPool{
+		QueryFunc: func(ctx context.Context, sql string, args ...interface{}) (pgx.Rows, error) {
+			queryCalls.Add(1)
+			// Simulate the kind of failure that would otherwise be
+			// classed as retryable by withRetry: SQLSTATE 08006
+			// (connection_failure) — class 08 is in the retryable set.
+			return nil, &pgconn.PgError{
+				Code:    "08006",
+				Message: "simulated connection failure",
+			}
+		},
+	}
+
+	ctx := context.Background()
+	conn, err := postgremq.DialFromPool(ctx, mockPool,
+		postgremq.WithRetryConfig(postgremq.RetryConfig{
+			MaxAttempts:       5,
+			InitialBackoff:    1 * time.Millisecond,
+			MaxBackoff:        5 * time.Millisecond,
+			BackoffMultiplier: 2.0,
+		}))
+	require.NoError(t, err)
+	defer conn.Close()
+
+	_, err = conn.ConsumeMessages(ctx, "anyqueue", 10, 30)
+	require.Error(t, err, "expected the simulated connection failure to surface")
+	require.Equal(t, int32(1), queryCalls.Load(),
+		"consumeMessages must call Query exactly once; retrying re-claims messages from the server")
+}
+
+// TestConsumeMessagesReturnsPartialOnError verifies that when row
+// iteration fails partway through a batch, consumeMessages returns the
+// rows that WERE successfully scanned alongside the error. Those rows
+// are already claimed server-side (status='processing'); discarding them
+// would just force the caller to wait for vt expiry to see them again.
+func TestConsumeMessagesReturnsPartialOnError(t *testing.T) {
+	t.Parallel()
+
+	// Build a Rows that yields 2 successful scans then surfaces an error
+	// via Err() (the path pgx takes for a network drop after Next()
+	// returned false at end-of-stream).
+	makeScan := func(id int64, payload string, token string, attempts int, vt, pubAt time.Time) func(dest ...any) error {
+		return func(dest ...any) error {
+			*dest[0].(*int64) = id
+			*dest[1].(*json.RawMessage) = json.RawMessage(payload)
+			*dest[2].(*string) = token
+			*dest[3].(*int) = attempts
+			*dest[4].(*time.Time) = vt
+			*dest[5].(*time.Time) = pubAt
+			return nil
+		}
+	}
+	now := time.Now()
+	rows := &MockRows{
+		ScanFuncs: []func(dest ...any) error{
+			makeScan(1, `{"a":1}`, "tok-1", 1, now.Add(30*time.Second), now),
+			makeScan(2, `{"a":2}`, "tok-2", 1, now.Add(30*time.Second), now),
+		},
+		ErrAfter: &pgconn.PgError{Code: "08006", Message: "stream lost mid-batch"},
+	}
+	mockPool := &MockPool{
+		QueryFunc: func(ctx context.Context, sql string, args ...interface{}) (pgx.Rows, error) {
+			return rows, nil
+		},
+	}
+
+	ctx := context.Background()
+	conn, err := postgremq.DialFromPool(ctx, mockPool)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	msgs, err := conn.ConsumeMessages(ctx, "anyqueue", 10, 30)
+	require.Error(t, err, "the simulated stream-loss error must surface to the caller")
+	require.Len(t, msgs, 2, "successfully-scanned rows must be returned alongside the error")
+	require.Equal(t, int64(1), msgs[0].ID)
+	require.Equal(t, int64(2), msgs[1].ID)
 }
 
 // TestRetryBackoffBehavior verifies that backoff timing between retry attempts follows the expected pattern

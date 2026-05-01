@@ -593,47 +593,55 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 		return nil, ErrConnectionClosed
 	}
 
+	// Deliberately NOT wrapped in withRetry: consume_message has a side
+	// effect (it transitions matched rows to status='processing' with a
+	// new consumer_token and vt). If pool.Query succeeds and rows.Scan or
+	// rows.Err fails partway through (08-class network drop while reading
+	// the result stream), retrying would re-execute consume_message and
+	// claim a SECOND batch — orphaning the first batch in 'processing'
+	// until vt expires. The fetch loop in Consumer.startMessageLoop
+	// already retries the next tick on error, which is the correct
+	// recovery path: don't double-consume, let vt expiry redeliver the
+	// stranded batch. (REVIEW.md §3.3)
+	rows, err := c.pool.Query(ctx,
+		"SELECT message_id, payload, consumer_token, delivery_attempts, vt, published_at FROM consume_message($1, $2, $3)",
+		queue, vt, limit)
+	if err != nil {
+		return nil, mapPgError(fmt.Errorf("failed to consume messages: %w", err))
+	}
+	defer rows.Close()
+
 	var messages []*Message
-	err := c.withRetry(ctx, func(ctx context.Context) error {
-		rows, err := c.pool.Query(ctx,
-			"SELECT message_id, payload, consumer_token, delivery_attempts, vt, published_at FROM consume_message($1, $2, $3)",
-			queue, vt, limit)
-		if err != nil {
-			return mapPgError(fmt.Errorf("failed to consume messages: %w", err))
+	for rows.Next() {
+		var (
+			id               int64
+			payload          json.RawMessage
+			consumerToken    string
+			deliveryAttempts int
+			vt               time.Time
+			publishedAt      time.Time
+		)
+		if err := rows.Scan(&id, &payload, &consumerToken, &deliveryAttempts, &vt, &publishedAt); err != nil {
+			// Return successfully-scanned messages alongside the error.
+			// They're already claimed server-side; the caller can deliver
+			// them while still seeing the error and scheduling a retry.
+			return messages, mapPgError(fmt.Errorf("failed to scan message: %w", err))
 		}
-		defer rows.Close()
 
-		messages = nil // Reset on retry
-		for rows.Next() {
-			var (
-				id               int64
-				payload          json.RawMessage
-				consumerToken    string
-				deliveryAttempts int
-				vt               time.Time
-				publishedAt      time.Time
-			)
-			if err := rows.Scan(&id, &payload, &consumerToken, &deliveryAttempts, &vt, &publishedAt); err != nil {
-				return mapPgError(fmt.Errorf("failed to scan message: %w", err))
-			}
-
-			// Create a new Message and ensure all internal fields are initialized.
-			msg := &Message{
-				ID:              id,
-				Payload:         payload,
-				consumerToken:   consumerToken,
-				DeliveryAttempt: deliveryAttempts,
-				PublishedAt:     publishedAt,
-				conn:            c,     // Set connection so methods like Ack() will work.
-				queue:           queue, // Save the originating queue name.
-				VT:              vt,
-			}
-			messages = append(messages, msg)
+		// Create a new Message and ensure all internal fields are initialized.
+		msg := &Message{
+			ID:              id,
+			Payload:         payload,
+			consumerToken:   consumerToken,
+			DeliveryAttempt: deliveryAttempts,
+			PublishedAt:     publishedAt,
+			conn:            c,     // Set connection so methods like Ack() will work.
+			queue:           queue, // Save the originating queue name.
+			VT:              vt,
 		}
-		return mapPgError(rows.Err())
-	})
-
-	return messages, err
+		messages = append(messages, msg)
+	}
+	return messages, mapPgError(rows.Err())
 }
 
 func (c *Connection) sendKeepAlive(ctx context.Context, queue string, interval time.Duration) error {
