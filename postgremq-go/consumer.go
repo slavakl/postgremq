@@ -207,10 +207,17 @@ func (c *Consumer) fetchMessages() time.Time {
 		select {
 		case c.messages <- msg: // deliver message to client
 		case <-c.ctx.Done():
-			if err := msg.Release(c.dbCtx); err != nil { // release message if client is not ready to receive it
+			// Release the current message AND fall through to the next
+			// iteration so all remaining msgs in this batch are
+			// released. Returning here would leave them stranded —
+			// they were already added to tracking via messageAdded but
+			// never delivered or released, so handleMessageComplete
+			// would never fire for them and Stop() would deadlock
+			// waiting for inFlight to drain.
+			if err := msg.Release(c.dbCtx); err != nil {
 				c.logger.Errorf("Failed to release message %d: %v", msg.ID, err)
 			}
-			return time.Time{}
+			continue
 		}
 	}
 	if len(msgs) == c.batchSize && c.ctx.Err() == nil {
@@ -324,6 +331,16 @@ func (c *Consumer) startExtendLoop() {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
+		// Drain vtMessageUpdates on EVERY exit path. handleMessageComplete
+		// (driven by ack/nack/release) sends here first; if no one drains,
+		// those sends block on the buffer limit, the message-tracking loop
+		// never decrements inFlight, inFlightFlag never closes, and Stop()
+		// deadlocks. startMessageLoop closes the channel once tracking has
+		// drained, at which point this `for range` returns.
+		defer func() {
+			for range c.vtMessageUpdates {
+			}
+		}()
 		var nextExtension <-chan time.Time
 		vts := newVTHeap()
 
@@ -345,7 +362,7 @@ func (c *Consumer) startExtendLoop() {
 			nextExtension = time.After(wait)
 		}
 		for {
-			// First phase: check if we need to do an extension
+			// First phase: check if we need to do an extension immediately
 			if nextExtension != nil {
 				select {
 				case <-c.ctx.Done():
@@ -361,11 +378,11 @@ func (c *Consumer) startExtendLoop() {
 			// Second phase: handle updates or wait for extension
 			select {
 			case <-c.ctx.Done():
-				break //nolint:staticcheck // SA4011: Break exits select, line 348 checks ctx.Err() and exits loop
+				return
 			case update, ok := <-c.vtMessageUpdates:
 				if !ok {
-					// Channel closed during shutdown: bail rather than
-					// dereferencing a zero-value messageUpdate.
+					// Channel closed by startMessageLoop after tracking
+					// drained — graceful shutdown.
 					return
 				}
 				switch update.op {
@@ -384,14 +401,7 @@ func (c *Consumer) startExtendLoop() {
 				tryAfter = c.extendVTs(vts)
 				updateTimer()
 			}
-			if c.ctx.Err() != nil {
-				break
-			}
 		}
-		// on shutdown drain updates channel
-		for range c.vtMessageUpdates {
-		}
-
 	}()
 }
 

@@ -311,6 +311,87 @@ func TestHandlerConsumerMaxInFlight(t *testing.T) {
 	assert.GreaterOrEqual(t, maxObservedInFlight.Load(), int32(2), "Should have at least 2 concurrent handlers at some point")
 }
 
+// TestHandlerConsumerStopUnderLoadDoesNotDeadlock verifies that a busy
+// HandlerConsumer can be stopped without deadlocking on shutdown.
+//
+// Pre-fix: extendLoop's phase-1 select on ctx.Done() returned without
+// draining vtMessageUpdates. Subsequent handleMessageComplete sends from
+// finishing handlers blocked on the buffer (capacity batchSize*2 = 20),
+// the message-tracking loop never decremented inFlight, inFlightFlag
+// never closed, and Stop() blocked forever on the WaitGroup.
+//
+// We saturate in-flight beyond vtMessageUpdates' buffer capacity so a
+// missed drain causes immediate back-pressure, and then call Stop().
+func TestHandlerConsumerStopUnderLoadDoesNotDeadlock(t *testing.T) {
+	t.Parallel()
+	pool, ctx := setupTestConnection(t)
+	defer pool.Close()
+
+	const topicName = "test_handler_stop_deadlock_topic"
+	const queueName = "test_handler_stop_deadlock_queue"
+
+	conn, err := postgremq.DialFromPool(ctx, pool)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	require.NoError(t, conn.CreateTopic(ctx, topicName))
+	require.NoError(t, conn.CreateQueue(ctx, queueName, topicName, true))
+
+	// Publish enough messages to saturate maxInFlight several times over.
+	const totalMessages = 100
+	for i := 0; i < totalMessages; i++ {
+		payload := []byte(fmt.Sprintf(`{"i":%d}`, i))
+		_, err := conn.Publish(ctx, topicName, payload)
+		require.NoError(t, err)
+	}
+
+	// maxInFlight=50 with default batchSize=10 ⇒ vtMessageUpdates capacity
+	// is 20 (batchSize*2), well below the steady-state in-flight count.
+	// Any failure to drain on shutdown blocks handler completions
+	// immediately.
+	var startedHandlers atomic.Int32
+	hc, err := conn.ConsumeHandler(ctx, queueName,
+		func(handlerCtx context.Context, msg *postgremq.Message) {
+			startedHandlers.Add(1)
+			// Hold briefly so handlers are in-flight when Stop fires.
+			select {
+			case <-time.After(100 * time.Millisecond):
+			case <-handlerCtx.Done():
+			}
+			_ = msg.Ack(handlerCtx)
+		},
+		postgremq.WithVT(30),
+		postgremq.WithMaxInFlight(50),
+		postgremq.WithBatchSize(10),
+	)
+	require.NoError(t, err)
+
+	// Wait for handlers to ramp up so Stop hits mid-batch.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && startedHandlers.Load() < 30 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.GreaterOrEqual(t, startedHandlers.Load(), int32(30),
+		"handlers didn't ramp up; can't reproduce the deadlock condition")
+
+	// Stop() must return without hanging. Cancellation propagates through
+	// hc.ctx → consumer.ctx and the consumer's internal goroutines must
+	// shut down cleanly. If extendLoop fails to drain vtMessageUpdates,
+	// handleMessageComplete sends from finishing handlers block forever.
+	stopDone := make(chan struct{})
+	go func() {
+		hc.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+		// success
+	case <-time.After(20 * time.Second):
+		t.Fatalf("HandlerConsumer.Stop() did not return within 20s — goroutines likely deadlocked (started=%d)",
+			startedHandlers.Load())
+	}
+}
+
 // TestHandlerConsumerPanicRecovery verifies that panics in handlers are recovered and message is nacked.
 func TestHandlerConsumerPanicRecovery(t *testing.T) {
 	t.Parallel()
