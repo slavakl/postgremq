@@ -35,8 +35,10 @@ import { Consumer as ConsumerImpl } from './consumer';
 import { EventEmitter, DEFAULT_RETRY_POLICY, shouldRetry, sleep, withRetry } from './utils';
 import { mapDbError } from './errors';
 
-/** Subscriber callback receives the message id parsed from the NOTIFY payload. */
-type SubscriberCallback = (messageId: number) => void;
+/** Subscriber callback fires whenever a NOTIFY arrives on the subscribed
+ *  channel. NOTIFYs from PostgreMQ carry no payload — the channel name is
+ *  the wake-up signal, and the consumer re-fetches via consume_message. */
+type SubscriberCallback = () => void;
 
 interface ChannelState {
   refCount: number;
@@ -290,21 +292,21 @@ export class Connection implements IConnection {
         const client = await this.pool.connect();
         this.notifyClient = client;
 
-        // Dispatch by channel name; payload is the affected message id as
-        // plain text (`pmq:t:<topic>` for publishes, `pmq:q:<queue>` for
-        // nack/release). LISTEN/UNLISTEN are issued directly on this same
-        // client by subscribeChannel, so no control channel is needed.
+        // Dispatch by channel name. PostgreMQ NOTIFYs carry no payload;
+        // the channel (`pmq:t:<topic>` for publishes, `pmq:q:<queue>` for
+        // nack/release/requeue) is itself the wake-up signal and the
+        // subscriber re-fetches via consume_message on receipt.
+        // LISTEN/UNLISTEN are issued directly on this same client by
+        // subscribeChannel, so no control channel is needed.
         client.on('notification', (msg) => {
           if (!msg.channel) return;
           const state = this.channelStates.get(msg.channel);
           if (!state || state.subscribers.size === 0) {
             return;
           }
-          const id = parseInt(msg.payload ?? '', 10);
-          const messageId = Number.isFinite(id) ? id : 0;
           for (const cb of state.subscribers) {
             try {
-              cb(messageId);
+              cb();
             } catch (err) {
               console.error('Subscriber callback error:', err);
             }

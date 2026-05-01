@@ -255,16 +255,12 @@ export class Consumer {
   }
 
   /**
-   * Handle a notification event
-   * Triggered by the connection's per-topic or per-queue NOTIFY listener.
+   * Handle a notification event from the connection's per-topic or
+   * per-queue NOTIFY listener. PostgreMQ NOTIFYs carry no payload — the
+   * arrival itself is the signal to re-fetch.
    */
-  private handleNotification(_messageId: number): void {
-    // If consumer is not running, ignore the notification
-    if (!this.running) {
-      return;
-    }
-
-    // Events always trigger fetch immediately
+  private handleNotification(): void {
+    if (!this.running) return;
     this.triggerFetch();
   }
 

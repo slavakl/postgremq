@@ -906,8 +906,95 @@ def test_requeue_dlq_messages_resets_delivery_attempts(cur):
     dlq_count = cur.fetchone()[0]
     assert dlq_count == 0, "DLQ should be empty after requeue"
 
+def test_requeue_dlq_messages_emits_notify(cur: psycopg2.extensions.cursor) -> None:
+    """requeue_dlq_messages emits one NOTIFY on `pmq:q:<queue>` per call
+    (regardless of how many messages were requeued). Without this signal
+    consumers wait for their poll fallback (1s in TS, 10s in Go) before
+    re-fetching, defeating the point of using requeue for fast recovery.
+    Reported in REVIEW.md §2.2.
+
+    Also asserts no NOTIFY fires when the DLQ is empty for the queue —
+    avoids spurious wake-ups."""
+    cur.execute("SELECT create_topic('RequeueNotifyTopic')")
+    cur.execute("SELECT create_queue('RequeueNotifyQueue', 'RequeueNotifyTopic', 1, false)")
+    cur.execute('LISTEN "pmq:q:RequeueNotifyQueue"')
+
+    # Empty DLQ: requeue should be a silent no-op.
+    cur.execute("SELECT requeue_dlq_messages('RequeueNotifyQueue')")
+    cur.connection.poll()
+    assert len(cur.connection.notifies) == 0, "no-op requeue must not NOTIFY"
+
+    # Stage 3 messages in the DLQ via the inline-retire path (max_attempts=1
+    # means the first nack moves them straight to DLQ).
+    for i in range(3):
+        cur.execute("SELECT publish_message('RequeueNotifyTopic', %s::jsonb)",
+                    (json.dumps({"i": i}),))
+        cur.execute("SELECT message_id, consumer_token FROM consume_message('RequeueNotifyQueue', 30)")
+        msg_id, token = cur.fetchone()
+        cur.execute("SELECT nack_message('RequeueNotifyQueue', %s, %s)", (msg_id, token))
+
+    cur.execute("SELECT count(*) FROM dead_letter_queue WHERE queue_name = 'RequeueNotifyQueue'")
+    assert cur.fetchone()[0] == 3
+
+    # Drain any stray notifications from the staging steps so we measure
+    # only what requeue itself emits.
+    cur.connection.poll()
+    cur.connection.notifies.clear()
+
+    cur.execute("SELECT requeue_dlq_messages('RequeueNotifyQueue')")
+    cur.connection.poll()
+
+    # Exactly one NOTIFY per requeue call, empty payload.
+    assert len(cur.connection.notifies) == 1, \
+        f"expected exactly 1 NOTIFY, got {len(cur.connection.notifies)}"
+    n = cur.connection.notifies[0]
+    assert n.channel == 'pmq:q:RequeueNotifyQueue'
+    assert n.payload == ''
+    cur.connection.notifies.clear()
+
+def test_requeue_dlq_messages_idempotent_on_existing_row(cur: psycopg2.extensions.cursor) -> None:
+    """If a queue_messages row already exists for a (queue, message_id) we
+    are about to requeue, the function must reset that row to a clean
+    pending state instead of aborting the entire requeue with a unique
+    constraint violation. This protects against partial-state recovery
+    scenarios. Reported in REVIEW.md §2.2."""
+    cur.execute("SELECT create_topic('RequeueIdempotentTopic')")
+    cur.execute("SELECT create_queue('RequeueIdempotentQueue', 'RequeueIdempotentTopic', 1, false)")
+
+    cur.execute("SELECT publish_message('RequeueIdempotentTopic', '{\"x\":1}'::jsonb)")
+    cur.execute("SELECT message_id, consumer_token FROM consume_message('RequeueIdempotentQueue', 30)")
+    msg_id, token = cur.fetchone()
+    cur.execute("SELECT nack_message('RequeueIdempotentQueue', %s, %s)", (msg_id, token))
+
+    # Now the message is in DLQ. Manually re-insert a stale queue_messages
+    # row in 'completed' state to simulate the conflict scenario.
+    cur.execute("""
+        INSERT INTO queue_messages (queue_name, message_id, status, delivery_attempts, processed_at, vt)
+        VALUES ('RequeueIdempotentQueue', %s, 'completed', 5, NOW(), NOW())
+    """, (msg_id,))
+
+    # Requeue must NOT fail with a unique violation; it must reset the
+    # stale row to pending.
+    cur.execute("SELECT requeue_dlq_messages('RequeueIdempotentQueue')")
+
+    cur.execute("""
+        SELECT status, delivery_attempts, consumer_token, processed_at
+        FROM queue_messages
+        WHERE queue_name = 'RequeueIdempotentQueue' AND message_id = %s
+    """, (msg_id,))
+    status, attempts, ctoken, processed_at = cur.fetchone()
+    assert status == 'pending'
+    assert attempts == 0
+    assert ctoken is None
+    assert processed_at is None
+
+    cur.execute("SELECT count(*) FROM dead_letter_queue WHERE queue_name = 'RequeueIdempotentQueue'")
+    assert cur.fetchone()[0] == 0, "DLQ should be drained after requeue"
+
 def test_delayed_message_delivery_notifications(cur: psycopg2.extensions.cursor) -> None:
-    """Publish-side NOTIFY now fires on per-topic channel pmq:t:<topic> with the message id as plain-text payload."""
+    """Publish fires NOTIFY on per-topic channel `pmq:t:<topic>`. Payload is
+    empty — the channel name is the wake-up signal; clients re-fetch from
+    the queue on receipt."""
     cur.execute("SELECT create_topic('TestTopic')")
     cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 2, false)")
 
@@ -919,7 +1006,6 @@ def test_delayed_message_delivery_notifications(cur: psycopg2.extensions.cursor)
     cur.execute("""
         SELECT publish_message('TestTopic', '{"test":"data"}'::jsonb, %s)
     """, (delay_time,))
-    msg_id = cur.fetchone()[0]
 
     # Get notification
     conn = cur.connection
@@ -927,7 +1013,7 @@ def test_delayed_message_delivery_notifications(cur: psycopg2.extensions.cursor)
     notify = conn.notifies.pop(0)
 
     assert notify.channel == 'pmq:t:TestTopic'
-    assert int(notify.payload) == msg_id
+    assert notify.payload == ''
 
     # Try to consume immediately - should get no messages
     cur.execute("""
@@ -945,7 +1031,8 @@ def test_delayed_message_delivery_notifications(cur: psycopg2.extensions.cursor)
     assert cur.fetchone() is not None
 
 def test_delayed_nack_notifications(cur: psycopg2.extensions.cursor) -> None:
-    """Nack now fires NOTIFY on the per-queue channel pmq:q:<queue> with the message id as payload."""
+    """Nack fires NOTIFY on the per-queue channel `pmq:q:<queue>`. Payload
+    is empty — the channel name is the wake-up signal."""
     cur.execute("SELECT create_topic('TestTopic')")
     cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 2, false)")
 
@@ -972,7 +1059,7 @@ def test_delayed_nack_notifications(cur: psycopg2.extensions.cursor) -> None:
     notify = conn.notifies.pop(0)
 
     assert notify.channel == 'pmq:q:TestQueue'
-    assert int(notify.payload) == msg_id
+    assert notify.payload == ''
 
     # Try to consume immediately - should get no messages
     cur.execute("""
@@ -992,7 +1079,8 @@ def test_delayed_nack_notifications(cur: psycopg2.extensions.cursor) -> None:
     assert msg[1] == msg_id  # message_id matches
 
 def test_release_message_emits_per_queue_notify(cur: psycopg2.extensions.cursor) -> None:
-    """release_message now fires NOTIFY on pmq:q:<queue> with the message id as payload."""
+    """release_message fires NOTIFY on `pmq:q:<queue>` with empty payload —
+    the channel is the wake-up signal; clients re-fetch on receipt."""
     cur.execute("SELECT create_topic('TestTopic')")
     cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 0, false)")
 
@@ -1007,7 +1095,7 @@ def test_release_message_emits_per_queue_notify(cur: psycopg2.extensions.cursor)
     conn.poll()
     notify = conn.notifies.pop(0)
     assert notify.channel == 'pmq:q:TestQueue'
-    assert int(notify.payload) == msg_id
+    assert notify.payload == ''
 
 def test_create_topic_validates_name(cur: psycopg2.extensions.cursor) -> None:
     """create_topic rejects names with characters that wouldn't be safe as NOTIFY channel suffixes."""

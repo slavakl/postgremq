@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 
@@ -73,15 +72,15 @@ type EventListener struct {
 type ListenerHandle struct {
 	el      *EventListener
 	channel string
-	ch      chan int64
+	ch      chan struct{}
 }
 
-// Wake returns a channel that receives the message id whenever a NOTIFY for
-// this handle's channel fires. The receive value is informational; consumers
-// generally only care about the wake event itself. The channel is closed
-// when the handle is closed (either explicitly via Close or implicitly by
-// EventListener.Close).
-func (h *ListenerHandle) Wake() <-chan int64 {
+// Wake returns a channel that fires whenever a NOTIFY for this handle's
+// channel arrives. It carries no payload — NOTIFYs are wake-up signals;
+// consumers re-fetch via consume_message on receipt. The channel is
+// closed when the handle is closed (either explicitly via Close or
+// implicitly by EventListener.Close).
+func (h *ListenerHandle) Wake() <-chan struct{} {
 	return h.ch
 }
 
@@ -126,7 +125,7 @@ func (el *EventListener) addListener(channel string) *ListenerHandle {
 	h := &ListenerHandle{
 		el:      el,
 		channel: channel,
-		ch:      make(chan int64, 8),
+		ch:      make(chan struct{}, 8),
 	}
 	el.mu.Lock()
 	el.desired[channel]++
@@ -310,13 +309,9 @@ func (el *EventListener) session() error {
 			continue
 		}
 
-		var msgID int64
-		if notification.Payload != "" {
-			if v, perr := strconv.ParseInt(notification.Payload, 10, 64); perr == nil {
-				msgID = v
-			}
-		}
-		el.dispatch(notification.Channel, msgID)
+		// NOTIFYs from PostgreMQ carry no payload — the channel name is the
+		// wake-up signal, and the consumer re-fetches via consume_message.
+		el.dispatch(notification.Channel)
 	}
 }
 
@@ -362,12 +357,12 @@ func (el *EventListener) reconcile(ctx context.Context, conn *pgxpool.Conn, actu
 // the lock, the handle has already been removed (we never see it) or it
 // hasn't been removed yet (we sent on an open channel). Either way, the
 // close happens after our send returns.
-func (el *EventListener) dispatch(channel string, msgID int64) {
+func (el *EventListener) dispatch(channel string) {
 	el.mu.Lock()
 	defer el.mu.Unlock()
 	for _, h := range el.handles[channel] {
 		select {
-		case h.ch <- msgID:
+		case h.ch <- struct{}{}:
 		default:
 		}
 	}

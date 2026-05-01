@@ -36,9 +36,10 @@
  * Event Notifications
  * -------------------
  * Several operations emit LISTEN/NOTIFY events on per-topic and per-queue
- * channels. The payload is the affected message id as plain text.
- *   - publishes:           channel `pmq:t:<topic>`, payload `<message_id>`
- *   - nack/release:        channel `pmq:q:<queue>`, payload `<message_id>`
+ * channels as a wake-up signal — the payload is empty; clients use the
+ * channel name alone to decide what to fetch next.
+ *   - publishes:           channel `pmq:t:<topic>`
+ *   - nack/release/requeue: channel `pmq:q:<queue>`
  * Clients LISTEN to the channels they care about; refcounted LISTEN/UNLISTEN
  * is the client's responsibility. Channel names are derived from topic and
  * queue names, which are validated at create time to be safe NOTIFY identifiers
@@ -191,7 +192,9 @@ BEGIN
    WHERE q.topic_name = NEW.topic_name
      AND (NOT q.exclusive OR q.keep_alive_until > NOW());
 
-   PERFORM pg_notify('pmq:t:' || NEW.topic_name, NEW.id::text);
+   -- Wake-up signal only; payload is empty. Clients use the channel name
+   -- alone to decide what to fetch next.
+   PERFORM pg_notify('pmq:t:' || NEW.topic_name, '');
 
    RETURN NEW;
 END;
@@ -591,7 +594,8 @@ BEGIN
         -- No NOTIFY here: there's nothing to consume on this queue any more.
     ELSE
         -- Wake up consumers of this queue so redelivery is prompt.
-        PERFORM pg_notify('pmq:q:' || p_queue_name, p_message_id::text);
+        -- Payload empty; channel name is the signal.
+        PERFORM pg_notify('pmq:q:' || p_queue_name, '');
     END IF;
 
     RETURN;
@@ -638,7 +642,8 @@ BEGIN
           USING ERRCODE = 'PMQ01';
     END IF;
 
-    PERFORM pg_notify('pmq:q:' || p_queue_name, p_message_id::text);
+    -- Wake-up signal only; payload empty.
+    PERFORM pg_notify('pmq:q:' || p_queue_name, '');
 
     RETURN;
 END;
@@ -936,6 +941,16 @@ $$ LANGUAGE plpgsql;
  *   Moves messages from the dead letter queue back to their original queues.
  *   The delivery_attempts counter is reset to 0 for these messages.
  *
+ *   Emits one NOTIFY per requeued message on `pmq:q:<queue>` so consumers
+ *   that are LISTENing wake up immediately rather than waiting for their
+ *   poll-fallback (1s in TS, 10s in Go).
+ *
+ *   ON CONFLICT DO UPDATE: if a `queue_messages` row already exists for
+ *   the (queue_name, message_id) pair (operator intervention, manual
+ *   seed, or future code path), reset it to a clean pending state rather
+ *   than aborting the entire requeue. This keeps the function idempotent
+ *   under partial-state recovery.
+ *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue to requeue messages for.
  *
@@ -943,15 +958,35 @@ $$ LANGUAGE plpgsql;
  */
 CREATE OR REPLACE FUNCTION requeue_dlq_messages(p_queue_name VARCHAR(255))
 RETURNS VOID AS $$
+DECLARE
+    v_requeued INT;
 BEGIN
-  WITH moved_messages AS (
-    DELETE FROM dead_letter_queue dlq
-    WHERE dlq.queue_name = p_queue_name
-    RETURNING dlq.queue_name, dlq.message_id
-  )
-  INSERT INTO queue_messages(queue_name, message_id, status, delivery_attempts)
-  SELECT queue_name, message_id, 'pending', 0
-  FROM moved_messages;
+    WITH moved_messages AS (
+        DELETE FROM dead_letter_queue dlq
+        WHERE dlq.queue_name = p_queue_name
+        RETURNING dlq.queue_name, dlq.message_id
+    )
+    INSERT INTO queue_messages(queue_name, message_id, status, delivery_attempts, vt)
+    SELECT queue_name, message_id, 'pending', 0, NOW()
+    FROM moved_messages
+    ON CONFLICT (queue_name, message_id) DO UPDATE
+      SET status = 'pending',
+          delivery_attempts = 0,
+          consumer_token = NULL,
+          vt = NOW(),
+          processed_at = NULL;
+
+    -- Reads ROW_COUNT of the immediately-preceding INSERT (which counts
+    -- both inserted and ON-CONFLICT-updated rows). If a future change
+    -- inserts another SQL between the INSERT and this line, move the
+    -- diagnostics read to keep referring to the requeue count.
+    GET DIAGNOSTICS v_requeued = ROW_COUNT;
+    -- Emit a single wake-up so consumers re-fetch. NOTIFY payload is empty
+    -- (matches the rest of the codebase — clients use the channel as the
+    -- signal). Skipped when nothing was requeued to avoid spurious wakes.
+    IF v_requeued > 0 THEN
+        PERFORM pg_notify('pmq:q:' || p_queue_name, '');
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
 

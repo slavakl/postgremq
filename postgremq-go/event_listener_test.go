@@ -210,12 +210,12 @@ func TestEventListener_DeliversTopicNotify(t *testing.T) {
 	waitForListen(t, pool, handle, "pmq:t:"+topic)
 	drainHandle(handle)
 
-	_, err = pool.Exec(ctx, "SELECT pg_notify($1, $2)", "pmq:t:"+topic, "42")
+	_, err = pool.Exec(ctx, "SELECT pg_notify($1, '')", "pmq:t:"+topic)
 	require.NoError(t, err)
 
 	select {
-	case msgID := <-handle.Wake():
-		require.Equal(t, int64(42), msgID)
+	case <-handle.Wake():
+		// success — wake fired; payload is empty by contract
 	case <-time.After(2 * time.Second):
 		t.Fatal("did not receive NOTIFY on per-topic channel")
 	}
@@ -241,20 +241,21 @@ func TestEventListener_DeliversQueueNotify(t *testing.T) {
 	waitForListen(t, pool, handle, "pmq:q:"+queue)
 	drainHandle(handle)
 
-	_, err = pool.Exec(ctx, "SELECT pg_notify($1, $2)", "pmq:q:"+queue, "777")
+	_, err = pool.Exec(ctx, "SELECT pg_notify($1, '')", "pmq:q:"+queue)
 	require.NoError(t, err)
 
 	select {
-	case msgID := <-handle.Wake():
-		require.Equal(t, int64(777), msgID)
+	case <-handle.Wake():
+		// success — wake fired; payload is empty by contract
 	case <-time.After(2 * time.Second):
 		t.Fatal("did not receive NOTIFY on per-queue channel")
 	}
 }
 
 // TestEventListener_PublishTriggersTopicNotify verifies that the SQL
-// distribute_message trigger emits NOTIFY on `pmq:t:<topic>` carrying the
-// new message id, and that it reaches a directly-attached handle.
+// distribute_message trigger emits NOTIFY on `pmq:t:<topic>` and that it
+// reaches a directly-attached handle. The NOTIFY carries no payload —
+// the channel name alone is the wake-up signal.
 func TestEventListener_PublishTriggersTopicNotify(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
@@ -275,12 +276,12 @@ func TestEventListener_PublishTriggersTopicNotify(t *testing.T) {
 	waitForListen(t, pool, handle, "pmq:t:PubTopic")
 	drainHandle(handle)
 
-	msgID, err := conn.Publish(ctx, "PubTopic", []byte(`{}`))
+	_, err = conn.Publish(ctx, "PubTopic", []byte(`{}`))
 	require.NoError(t, err)
 
 	select {
-	case got := <-handle.Wake():
-		require.Equal(t, int64(msgID), got)
+	case <-handle.Wake():
+		// success
 	case <-time.After(2 * time.Second):
 		t.Fatal("publish_message did not produce NOTIFY on per-topic channel")
 	}
@@ -326,8 +327,8 @@ func TestEventListener_NackTriggersPerQueueNotify(t *testing.T) {
 	require.NoError(t, err)
 
 	select {
-	case got := <-handle.Wake():
-		require.Equal(t, int64(msgID), got)
+	case <-handle.Wake():
+		// success
 	case <-time.After(2 * time.Second):
 		t.Fatal("nack_message did not produce NOTIFY on per-queue channel")
 	}
@@ -367,8 +368,8 @@ func TestEventListener_ReleaseTriggersPerQueueNotify(t *testing.T) {
 	require.NoError(t, err)
 
 	select {
-	case got := <-handle.Wake():
-		require.Equal(t, int64(msgID), got)
+	case <-handle.Wake():
+		// success
 	case <-time.After(2 * time.Second):
 		t.Fatal("release_message did not produce NOTIFY on per-queue channel")
 	}
@@ -549,7 +550,7 @@ func TestEventListener_MultipleSubscribersAllReceive(t *testing.T) {
 	_, err = conn.Publish(ctx, topic, []byte(`{}`))
 	require.NoError(t, err)
 
-	receiveOne := func(ch <-chan int64, name string) {
+	receiveOne := func(ch <-chan struct{}, name string) {
 		select {
 		case <-ch:
 		case <-time.After(2 * time.Second):
@@ -562,7 +563,7 @@ func TestEventListener_MultipleSubscribersAllReceive(t *testing.T) {
 
 // assertChannelClosed asserts that a wake channel has been closed (a receive
 // returns immediately with ok=false). Drains any pending values first.
-func assertChannelClosed(t *testing.T, ch <-chan int64, msg string) {
+func assertChannelClosed(t *testing.T, ch <-chan struct{}, msg string) {
 	t.Helper()
 	deadline := time.After(1 * time.Second)
 	for {
