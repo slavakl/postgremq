@@ -288,6 +288,59 @@ describe('Shutdown Behavior', () => {
       await connection.cleanUpTopic('slow-fetch-topic');
       await connection.deleteTopic('slow-fetch-topic');
     });
+
+    /**
+     * Reproduces REVIEW.md §4.7: releaseBufferedMessages used
+     * `Promise.race([Promise.all(...), new Promise((_, reject) =>
+     * setTimeout(() => reject(...), 2000))])`. When Promise.all wins,
+     * the setTimeout still fires later and rejects a Promise nobody is
+     * listening to → UnhandledPromiseRejection. Node crashes under
+     * `--unhandled-rejections=strict`.
+     *
+     * Install a process-level rejection listener for the duration of a
+     * normal shutdown and assert no rejections fired. Done with the
+     * fix in place; previously a fast-success shutdown would still log
+     * the timeout rejection ~2s later.
+     */
+    test('shutdown does not produce UnhandledPromiseRejection', async () => {
+      const connection: Connection = (global as any).__conn;
+
+      await connection.createTopic('no-leak-topic');
+      await connection.createQueue('no-leak-queue', 'no-leak-topic', false);
+      // Pre-stage some messages so releaseBufferedMessages has work to do.
+      for (let i = 0; i < 5; i++) {
+        await connection.publish('no-leak-topic', { i });
+      }
+
+      const rejections: any[] = [];
+      const handler = (reason: any) => rejections.push(reason);
+      process.on('unhandledRejection', handler);
+      try {
+        const consumer = connection.consume('no-leak-queue', {
+          batchSize: 5,
+          visibilityTimeoutSec: 30,
+          autoExtension: { enabled: false },
+        });
+        const it = consumer.messages();
+        // Let the fetch settle so the buffer has rows.
+        await sleep(200);
+        await consumer.stop();
+        await it.return?.(undefined);
+
+        // Wait long enough that any leaked setTimeout (the 2s release
+        // timeout) would have fired with the legacy implementation.
+        await sleep(2500);
+
+        expect(rejections).toEqual([]);
+      } finally {
+        process.removeListener('unhandledRejection', handler);
+      }
+
+      await connection.cleanUpQueue('no-leak-queue');
+      await connection.deleteQueue('no-leak-queue');
+      await connection.cleanUpTopic('no-leak-topic');
+      await connection.deleteTopic('no-leak-topic');
+    });
   });
 
   describe('Connection Shutdown', () => {

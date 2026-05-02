@@ -616,19 +616,24 @@ export class Consumer {
     // this, a fetch that already claimed rows server-side would orphan
     // them: they'd be locked in 'processing' with no one to release.
     // Bounded by FETCH_DRAIN_TIMEOUT_MS so a wedged fetch can't block
-    // shutdown indefinitely.
+    // shutdown indefinitely. The timer is cleared on the success path
+    // to avoid an UnhandledPromiseRejection on the discarded branch.
     if (this.fetchInFlight) {
+      let timeoutId: NodeJS.Timeout | null = null;
       try {
-        await Promise.race([
-          this.fetchInFlight,
-          sleep(Consumer.FETCH_DRAIN_TIMEOUT_MS).then(() => {
-            throw new Error('fetch did not complete within drain timeout');
-          }),
-        ]);
+        const timeout = new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(
+            () => reject(new Error('fetch did not complete within drain timeout')),
+            Consumer.FETCH_DRAIN_TIMEOUT_MS,
+          );
+        });
+        await Promise.race([this.fetchInFlight, timeout]);
       } catch (err) {
         if (!this.connection.isClientShuttingDown()) {
           console.warn(`Consumer stop: ${err}; messages claimed by the in-flight fetch may be redelivered after vt expiry`);
         }
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
       }
     }
 
@@ -670,14 +675,19 @@ export class Consumer {
             }
           });
 
-          // Wait for all releases with a short timeout
+          // Wait for all releases with a short timeout (capped at 500ms).
+          // Use a clearable timer so we don't leak an active setTimeout
+          // past shutdown when the releases finish first.
+          let releaseTimeoutId: NodeJS.Timeout | null = null;
           try {
-            await Promise.race([
-              Promise.all(releasePromises),
-              sleep(500) // 500ms max for releases
-            ]);
+            const cap = new Promise<void>((resolve) => {
+              releaseTimeoutId = setTimeout(resolve, 500);
+            });
+            await Promise.race([Promise.all(releasePromises), cap]);
           } catch {
             // Ignore errors during shutdown
+          } finally {
+            if (releaseTimeoutId) clearTimeout(releaseTimeoutId);
           }
 
           break;
@@ -724,19 +734,28 @@ export class Consumer {
     // Clear the buffer
     this.messageBuffer = [];
 
-    // Wait for all releases to complete with timeout
-    // Use shorter timeout (2s) to avoid hanging during shutdown
-    // Failed releases are expected when VT expires
+    // Wait for all releases to complete with a 2s cap. Failed releases
+    // are expected when VT expires; we just want to bound shutdown time.
+    //
+    // The previous implementation used `Promise.race([all, setTimeout(reject)])`
+    // — when `all` resolves first, the setTimeout still fires later and
+    // triggers an UnhandledPromiseRejection on a Promise nobody is
+    // listening to (Node crashes under --unhandled-rejections=strict).
+    // Capture the timer id and clear it on the success path.
+    let timeoutId: NodeJS.Timeout | null = null;
     try {
-      await Promise.race([
-        Promise.all(promises),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Release timeout')), 2000)
-        )
-      ]);
+      const timeout = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(
+          () => reject(new Error('Release timeout')),
+          2000,
+        );
+      });
+      await Promise.race([Promise.all(promises), timeout]);
     } catch (error) {
       console.debug(`Some buffered messages may not have been released (expected during shutdown): ${error}`);
       // Continue shutdown anyway - messages will become available after VT expires
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
     }
   }
 
