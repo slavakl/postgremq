@@ -1118,6 +1118,29 @@ def test_create_queue_validates_name(cur: psycopg2.extensions.cursor) -> None:
         except psycopg2.Error:
             cur.connection.rollback()
 
+def test_create_topic_rejects_long_name(cur: psycopg2.extensions.cursor) -> None:
+    """Topic names > 57 bytes would truncate the NOTIFY channel name and
+    risk silent cross-delivery between topics that share their first 57
+    bytes. Boundary check at exactly 57 / 58 bytes. (REVIEW.md §2.3)"""
+    name_57 = 'A' * 57
+    cur.execute("SELECT create_topic(%s)", (name_57,))  # boundary: 57 OK
+    name_58 = 'B' * 58
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT create_topic(%s)", (name_58,))
+    assert exc_info.value.pgcode == 'PMQ03'
+    assert 'too long' in str(exc_info.value)
+
+def test_create_queue_rejects_long_name(cur: psycopg2.extensions.cursor) -> None:
+    """Queue names > 57 bytes would truncate the NOTIFY channel name."""
+    cur.execute("SELECT create_topic('LenTopic')")
+    name_57 = 'a' * 57
+    cur.execute("SELECT create_queue(%s, 'LenTopic', 0, false)", (name_57,))
+    name_58 = 'b' * 58
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT create_queue(%s, 'LenTopic', 0, false)", (name_58,))
+    assert exc_info.value.pgcode == 'PMQ03'
+    assert 'too long' in str(exc_info.value)
+
 def test_sqlstate_codes_pmq01_lease_lost(cur: psycopg2.extensions.cursor) -> None:
     """ack/nack/release/set_vt all raise PMQ01 when token doesn't match or vt expired."""
     cur.execute("SELECT create_topic('SqlstateTopic')")

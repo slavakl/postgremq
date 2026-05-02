@@ -248,6 +248,16 @@ BEGIN
     RAISE EXCEPTION 'Invalid topic name "%": must match ^[A-Za-z0-9_:.\-]+$', p_topic
       USING ERRCODE = 'PMQ03';
   END IF;
+  -- NOTIFY channel names are silently truncated by Postgres at
+  -- NAMEDATALEN-1 = 63 bytes. The publish trigger emits on
+  -- 'pmq:t:'||topic_name (6 bytes of prefix), so a topic name longer
+  -- than 57 bytes would be truncated and could collide with another
+  -- topic that shares the same first 57 bytes — cross-delivering
+  -- wake events. Reject up front so the failure mode is loud.
+  IF octet_length(p_topic) > 57 THEN
+    RAISE EXCEPTION 'Topic name "%" is too long: maximum 57 bytes (limit imposed by NOTIFY channel length: 63 bytes minus the "pmq:t:" prefix)', p_topic
+      USING ERRCODE = 'PMQ03';
+  END IF;
   INSERT INTO topics(name) VALUES (p_topic)
   ON CONFLICT (name) DO NOTHING;
   RETURN p_topic;
@@ -300,6 +310,13 @@ DECLARE
 BEGIN
     IF p_queue_name IS NULL OR p_queue_name !~ '^[A-Za-z0-9_:.\-]+$' THEN
         RAISE EXCEPTION 'Invalid queue name "%": must match ^[A-Za-z0-9_:.\-]+$', p_queue_name
+          USING ERRCODE = 'PMQ03';
+    END IF;
+    -- Same length cap as create_topic: NOTIFY channels truncate at 63
+    -- bytes; nack/release/requeue emit on 'pmq:q:'||queue_name, leaving
+    -- 57 bytes for the queue name.
+    IF octet_length(p_queue_name) > 57 THEN
+        RAISE EXCEPTION 'Queue name "%" is too long: maximum 57 bytes (limit imposed by NOTIFY channel length: 63 bytes minus the "pmq:q:" prefix)', p_queue_name
           USING ERRCODE = 'PMQ03';
     END IF;
     -- Negative max_delivery_attempts silently breaks consume_message's filter
