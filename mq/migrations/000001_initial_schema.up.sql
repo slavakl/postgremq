@@ -118,9 +118,15 @@ CREATE TABLE queue_messages (
 
 -- Dead Letter Queue table.
 -- Composite primary key: (queue_name, message_id).
+-- ON DELETE RESTRICT on both FKs: DLQ entries are forensic data the
+-- operator may want to keep across queue/topic cleanups. Cascading
+-- deletes (the previous behavior) silently wiped DLQ history when
+-- clean_up_topic or delete_queue ran. Operators now have to make an
+-- explicit choice — purge_dlq() or requeue_dlq_messages() — before
+-- removing the underlying messages or queue.
 CREATE TABLE dead_letter_queue (
-  queue_name VARCHAR(255) REFERENCES queues(name) ON DELETE CASCADE,
-  message_id BIGINT REFERENCES messages(id) ON DELETE CASCADE,
+  queue_name VARCHAR(255) REFERENCES queues(name) ON DELETE RESTRICT,
+  message_id BIGINT REFERENCES messages(id) ON DELETE RESTRICT,
   retry_count INT,
   published_at TIMESTAMPTZ DEFAULT NOW(),
   PRIMARY KEY (queue_name, message_id)
@@ -781,10 +787,18 @@ BEGIN
     )
     SELECT count(*) INTO v_retired FROM inserted;
 
+    -- Skip queues that have DLQ entries. dead_letter_queue.queue_name
+    -- has ON DELETE RESTRICT so deleting them would error and abort
+    -- the maintenance call. Operators can purge_dlq() or
+    -- requeue_dlq_messages() to release the queue, OR leave it as
+    -- forensic data — the queue stays until the operator decides.
     WITH dropped AS (
-        DELETE FROM queues
-        WHERE exclusive = true
-          AND (keep_alive_until IS NULL OR keep_alive_until <= NOW())
+        DELETE FROM queues q
+        WHERE q.exclusive = true
+          AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= NOW())
+          AND NOT EXISTS (
+              SELECT 1 FROM dead_letter_queue dlq WHERE dlq.queue_name = q.name
+          )
         RETURNING name
     )
     SELECT count(*) INTO v_dropped FROM dropped;
@@ -1075,7 +1089,18 @@ $$ LANGUAGE plpgsql;
  */
 CREATE OR REPLACE FUNCTION delete_queue(p_queue VARCHAR(255))
 RETURNS VOID AS $$
+DECLARE
+  v_dlq_count INT;
 BEGIN
+  -- Refuse if the queue has DLQ entries. Same reasoning as clean_up_topic:
+  -- forensic data the operator may want to keep. Force an explicit
+  -- decision (purge_dlq() or requeue_dlq_messages()) before deletion.
+  SELECT count(*) INTO v_dlq_count
+  FROM dead_letter_queue WHERE queue_name = p_queue;
+  IF v_dlq_count > 0 THEN
+    RAISE EXCEPTION 'Cannot delete queue "%": % messages are in the dead letter queue. Use requeue_dlq_messages() or purge_dlq() first.', p_queue, v_dlq_count
+      USING ERRCODE = 'PMQ03';
+  END IF;
   DELETE FROM queues WHERE name = p_queue;
 END;
 $$ LANGUAGE plpgsql;
@@ -1129,7 +1154,20 @@ $$ LANGUAGE plpgsql;
  */
 CREATE OR REPLACE FUNCTION clean_up_topic(p_topic VARCHAR(255))
 RETURNS VOID AS $$
+DECLARE
+  v_dlq_count INT;
 BEGIN
+  -- Refuse if any messages of this topic are in a DLQ — those entries
+  -- are forensic data the operator may want to keep. Force an explicit
+  -- decision (purge_dlq() or requeue_dlq_messages()) before clean_up.
+  SELECT count(*) INTO v_dlq_count
+  FROM dead_letter_queue dlq
+  JOIN messages m ON m.id = dlq.message_id
+  WHERE m.topic_name = p_topic;
+  IF v_dlq_count > 0 THEN
+    RAISE EXCEPTION 'Cannot clean up topic "%": % messages are in the dead letter queue. Use requeue_dlq_messages() or purge_dlq() first.', p_topic, v_dlq_count
+      USING ERRCODE = 'PMQ03';
+  END IF;
   DELETE FROM messages WHERE topic_name = p_topic;
 END;
 $$ LANGUAGE plpgsql;
@@ -1145,9 +1183,15 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION delete_inactive_queues()
 RETURNS VOID AS $$
 BEGIN
-  DELETE FROM queues
-  WHERE exclusive = true  -- Changed from durable = false
-    AND (keep_alive_until IS NULL OR keep_alive_until <= NOW());
+  -- See pmq_maintenance_fast: skip queues with DLQ entries; the FK
+  -- is ON DELETE RESTRICT and the operator should explicitly handle
+  -- DLQ before dropping the queue.
+  DELETE FROM queues q
+  WHERE q.exclusive = true  -- Changed from durable = false
+    AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= NOW())
+    AND NOT EXISTS (
+        SELECT 1 FROM dead_letter_queue dlq WHERE dlq.queue_name = q.name
+    );
 END;
 $$ LANGUAGE plpgsql;
 

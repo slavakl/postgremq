@@ -332,49 +332,41 @@ describe('Error Scenarios', () => {
       expect(true).toBe(true);
     });
 
-    test('should handle requeue for non-existent queue', async () => {
-      // Create a message in DLQ manually
-      await connection.createTopic('dlq-requeue-topic');
-      await connection.createQueue('dlq-requeue-queue', 'dlq-requeue-topic', false, {
+    test('deleteQueue refuses when the queue has DLQ entries', async () => {
+      // dead_letter_queue.queue_name FK is ON DELETE RESTRICT — DLQ
+      // entries are forensic data. Operators must explicitly purge or
+      // requeue before dropping the underlying queue.
+      await connection.createTopic('dlq-restrict-topic');
+      await connection.createQueue('dlq-restrict-queue', 'dlq-restrict-topic', false, {
         maxDeliveryAttempts: 1
       });
 
-      await connection.publish('dlq-requeue-topic', generateTestPayload());
-
-      const consumer = connection.consume('dlq-requeue-queue', {
+      await connection.publish('dlq-restrict-topic', generateTestPayload());
+      const consumer = connection.consume('dlq-restrict-queue', {
         batchSize: 1,
         visibilityTimeoutSec: 30
       });
-
       const messages = consumer.messages();
       const { value: message } = await messages.next();
-
-      await message.nack();
+      await message.nack(); // max=1, so nack retires inline to DLQ
       await consumer.stop();
-
-      await sleep(100);
-
-      // Explicitly move messages to DLQ
-      await connection.maintenanceFast();
 
       let dlqMessages = await connection.listDLQMessages();
       expect(dlqMessages.length).toBe(1);
 
-      // Delete the queue. dead_letter_queue.queue_name FK has ON DELETE
-      // CASCADE, so the DLQ row also goes — leaving requeueDLQMessages
-      // with nothing to do.
-      await connection.deleteQueue('dlq-requeue-queue');
+      // deleteQueue must REFUSE while DLQ has entries.
+      await assertThrows(
+        () => connection.deleteQueue('dlq-restrict-queue'),
+        'dead letter queue',
+      );
 
-      // requeueDLQMessages is a DELETE FROM dead_letter_queue WHERE
-      // queue_name = ... INSERT INTO queue_messages — both halves match
-      // zero rows after the cascade, so the call is a silent no-op.
-      // Verify it doesn't throw.
-      await connection.requeueDLQMessages('dlq-requeue-queue');
-
-      // Cleanup
+      // After purgeDLQ, deleteQueue succeeds.
       await connection.purgeDLQ();
-      await connection.cleanUpTopic('dlq-requeue-topic');
-      await connection.deleteTopic('dlq-requeue-topic');
+      await connection.deleteQueue('dlq-restrict-queue');
+
+      // Cleanup the topic.
+      await connection.cleanUpTopic('dlq-restrict-topic');
+      await connection.deleteTopic('dlq-restrict-topic');
     });
   });
 

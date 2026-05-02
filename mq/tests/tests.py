@@ -1118,6 +1118,84 @@ def test_create_queue_validates_name(cur: psycopg2.extensions.cursor) -> None:
         except psycopg2.Error:
             cur.connection.rollback()
 
+def test_clean_up_topic_refuses_when_dlq_has_messages(cur: psycopg2.extensions.cursor) -> None:
+    """clean_up_topic must refuse when any of the topic's messages are in
+    DLQ. DLQ entries are forensic data; operators must explicitly
+    purge_dlq() or requeue_dlq_messages() before cleaning up.
+    (REVIEW.md §2.8)"""
+    cur.execute("SELECT create_topic('CleanDlqTopic')")
+    cur.execute("SELECT create_queue('CleanDlqQueue', 'CleanDlqTopic', 1, false)")
+    cur.execute("SELECT publish_message('CleanDlqTopic', '{\"x\":1}'::jsonb)")
+    cur.execute("SELECT message_id, consumer_token FROM consume_message('CleanDlqQueue', 30)")
+    msg_id, token = cur.fetchone()
+    # max=1 → first nack retires inline to DLQ.
+    cur.execute("SELECT nack_message('CleanDlqQueue', %s, %s)", (msg_id, token))
+
+    cur.execute("SELECT count(*) FROM dead_letter_queue WHERE queue_name = 'CleanDlqQueue'")
+    assert cur.fetchone()[0] == 1
+
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT clean_up_topic('CleanDlqTopic')")
+    assert exc_info.value.pgcode == 'PMQ03'
+    assert 'dead letter queue' in str(exc_info.value)
+    cur.connection.rollback()
+
+    # After purge_dlq, clean_up_topic succeeds.
+    cur.execute("SELECT purge_dlq()")
+    cur.execute("SELECT clean_up_topic('CleanDlqTopic')")
+    cur.execute("SELECT count(*) FROM messages WHERE topic_name = 'CleanDlqTopic'")
+    assert cur.fetchone()[0] == 0
+
+def test_delete_queue_refuses_when_dlq_has_messages(cur: psycopg2.extensions.cursor) -> None:
+    """delete_queue must refuse when the queue has DLQ entries. Same
+    reason as clean_up_topic. (REVIEW.md §2.8)"""
+    cur.execute("SELECT create_topic('DeleteDlqTopic')")
+    cur.execute("SELECT create_queue('DeleteDlqQueue', 'DeleteDlqTopic', 1, false)")
+    cur.execute("SELECT publish_message('DeleteDlqTopic', '{\"x\":1}'::jsonb)")
+    cur.execute("SELECT message_id, consumer_token FROM consume_message('DeleteDlqQueue', 30)")
+    msg_id, token = cur.fetchone()
+    cur.execute("SELECT nack_message('DeleteDlqQueue', %s, %s)", (msg_id, token))
+
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT delete_queue('DeleteDlqQueue')")
+    assert exc_info.value.pgcode == 'PMQ03'
+    assert 'dead letter queue' in str(exc_info.value)
+    cur.connection.rollback()
+
+    # After purge_dlq, delete_queue succeeds.
+    cur.execute("SELECT purge_dlq()")
+    cur.execute("SELECT delete_queue('DeleteDlqQueue')")
+    cur.execute("SELECT count(*) FROM queues WHERE name = 'DeleteDlqQueue'")
+    assert cur.fetchone()[0] == 0
+
+def test_pmq_maintenance_fast_skips_inactive_queue_with_dlq(cur: psycopg2.extensions.cursor) -> None:
+    """pmq_maintenance_fast skips inactive exclusive queues that have
+    DLQ entries — those entries are forensic data the operator may want
+    to keep. The queue stays around until the operator handles its DLQ.
+    (REVIEW.md §2.8)"""
+    cur.execute("SELECT create_topic('MaintDlqTopic')")
+    cur.execute("SELECT create_queue('MaintDlqQueue', 'MaintDlqTopic', 1, true, interval '60 seconds')")
+    cur.execute("SELECT publish_message('MaintDlqTopic', '{\"x\":1}'::jsonb)")
+    cur.execute("SELECT message_id, consumer_token FROM consume_message('MaintDlqQueue', 30)")
+    msg_id, token = cur.fetchone()
+    cur.execute("SELECT nack_message('MaintDlqQueue', %s, %s)", (msg_id, token))
+
+    # Force the queue's keep_alive_until into the past — eligible for reaping.
+    cur.execute("UPDATE queues SET keep_alive_until = NOW() - interval '1 second' WHERE name = 'MaintDlqQueue'")
+
+    cur.execute("SELECT inactive_queues_dropped FROM pmq_maintenance_fast()")
+    assert cur.fetchone()[0] == 0, "queue with DLQ entries must not be reaped"
+
+    cur.execute("SELECT count(*) FROM queues WHERE name = 'MaintDlqQueue'")
+    assert cur.fetchone()[0] == 1, "queue must still exist"
+
+    # After purge_dlq, the next maintenance call reaps it.
+    cur.execute("SELECT purge_dlq()")
+    cur.execute("SELECT inactive_queues_dropped FROM pmq_maintenance_fast()")
+    assert cur.fetchone()[0] == 1
+    cur.execute("SELECT count(*) FROM queues WHERE name = 'MaintDlqQueue'")
+    assert cur.fetchone()[0] == 0
+
 def test_create_topic_rejects_long_name(cur: psycopg2.extensions.cursor) -> None:
     """Topic names > 57 bytes would truncate the NOTIFY channel name and
     risk silent cross-delivery between topics that share their first 57
