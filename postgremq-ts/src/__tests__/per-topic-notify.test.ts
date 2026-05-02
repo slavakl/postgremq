@@ -2,7 +2,7 @@
  * Tests for the per-topic / per-queue NOTIFY refactor.
  */
 
-import { describe, test, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, test, expect, beforeAll, afterAll, jest } from '@jest/globals';
 import { TestDatabase, createIsolatedTestConnection, getSharedTestDatabase, sleep, waitFor } from './helpers';
 import { Connection } from '../connection';
 
@@ -188,6 +188,89 @@ describe('Per-topic NOTIFY', () => {
       expect(msg).toBeDefined();
       await msg.ack();
       await consumer.stop();
+    } finally {
+      await dropDatabase();
+    }
+  });
+
+  /**
+   * Reproduces REVIEW.md §4.4: a fast subscribe-then-stop sequence
+   * could leak the notify-listener pg client. Mechanism pre-fix:
+   *   1. consume() kicks off startNotificationListener (fire-and-forget).
+   *   2. The IIFE awaits pool.connect() — slow, gives the test window.
+   *   3. consumer.stop() runs, unregisterConsumer fires, consumers.size
+   *      drops to 0, stopNotificationListener runs and finds notifyClient
+   *      still null, returns.
+   *   4. pool.connect() resolves; the IIFE assigns notifyClient, installs
+   *      handlers, issues LISTENs against zero subscribers — and never
+   *      releases the client.
+   *
+   * Post-fix: the IIFE re-checks consumers.size after the await and
+   * releases the client if nobody owns it; stopNotificationListener
+   * also awaits the in-flight notifyStartupPromise.
+   */
+  test('subscribe-then-stop does not leak the notify client', async () => {
+    const { connection, dropDatabase } = await createIsolatedTestConnection(db);
+    try {
+      await connection.createTopic('LeakTopic');
+      await connection.createQueue('LeakQueue', 'LeakTopic', false);
+
+      // Track every notify-listener client acquired and released. The
+      // spy adds a delay only to the FIRST pool.connect — the notify
+      // listener's — so the consumer's fetch (subsequent calls) doesn't
+      // also get artificially slow and complicate the timing.
+      const pool = (connection as any).pool;
+      const realConnect = pool.connect.bind(pool);
+      const acquired: any[] = [];
+      const released: any[] = [];
+      let firstCall = true;
+      pool.connect = jest.fn(async () => {
+        const isFirst = firstCall;
+        firstCall = false;
+        if (isFirst) await sleep(300); // gives stop() time to drop consumers.size to 0
+        const client = await realConnect();
+        if (isFirst) {
+          const realRelease = client.release.bind(client);
+          client.release = (...args: any[]) => {
+            released.push(client);
+            return realRelease(...args);
+          };
+          acquired.push(client);
+        }
+        return client;
+      });
+
+      try {
+        const consumer = connection.consume('LeakQueue', { visibilityTimeoutSec: 30 });
+        // Force consumer.start() to run by calling messages() — without
+        // it, consumer.stop() would early-return on `if (!this.running)`
+        // and never reach unregisterConsumer.
+        const it = consumer.messages();
+        await consumer.stop();
+        // Discard the iterator.
+        await it.return?.(undefined);
+
+        // unregisterConsumer fires stopNotificationListener as
+        // fire-and-forget. Wait for both the in-flight startup AND
+        // the teardown to fully resolve before asserting.
+        await waitFor(
+          () =>
+            (connection as any).notifyStartupPromise === null &&
+            !(connection as any).stoppingNotify,
+          3000,
+          20,
+        );
+
+        // The notify-client slot must be empty.
+        expect((connection as any).notifyClient).toBeNull();
+
+        // Every acquired client must have been released. Pre-fix the
+        // notify client we acquired during the race would be on the
+        // acquired list with no matching release.
+        expect(released.length).toBe(acquired.length);
+      } finally {
+        pool.connect = realConnect;
+      }
     } finally {
       await dropDatabase();
     }

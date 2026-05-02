@@ -118,6 +118,12 @@ export class Connection implements IConnection {
    */
   private notifyStartupPromise: Promise<void> | null = null;
 
+  /** Consecutive notify-listener reconnect failures, used to derive the
+   *  exponential backoff delay. Reset to 0 on a successful start. */
+  private notifyReconnectAttempts = 0;
+  private static readonly NOTIFY_RECONNECT_BASE_MS = 500;
+  private static readonly NOTIFY_RECONNECT_MAX_MS = 30_000;
+
   /**
    * Create a new connection manager
    * @param options - Connection options
@@ -290,6 +296,17 @@ export class Connection implements IConnection {
       try {
         // Acquire dedicated client for LISTEN/NOTIFY.
         const client = await this.pool.connect();
+
+        // Re-check after the await: if a consumer.stop() raced our
+        // pool.connect() and dropped consumers.size to 0 (or we're
+        // shutting down), the client we just acquired has nobody to
+        // own it. Releasing it here prevents a notify-client leak —
+        // pre-fix this path would happily install handlers, issue
+        // LISTENs against an empty subscriber set, and never release.
+        if (this.isShuttingDown || this.consumers.size === 0) {
+          try { client.release(); } catch {}
+          return;
+        }
         this.notifyClient = client;
 
         // Dispatch by channel name. PostgreMQ NOTIFYs carry no payload;
@@ -327,6 +344,8 @@ export class Connection implements IConnection {
         }
 
         this.notificationListenerActive = true;
+        // Successful start — clear the reconnect counter.
+        this.notifyReconnectAttempts = 0;
       } catch (error: any) {
         if (this.notifyClient) {
           try { this.notifyClient.release(); } catch {}
@@ -462,16 +481,29 @@ export class Connection implements IConnection {
       state.listening = false;
     }
     
-    // Use setTimeout to avoid potential recursion
-    if (!this.isShuttingDown && this.consumers.size > 0 && !this.stoppingNotify) {
-      setTimeout(() => {
-        if (!this.isShuttingDown && this.consumers.size > 0 && !this.stoppingNotify) {
-          this.startNotificationListener().catch(err => {
-            console.error('Failed to restart notification listener:', err);
-          });
-        }
-      }, 1000);
+    // Schedule a reconnect with exponential backoff. The setTimeout
+    // breaks any potential recursion through startNotificationListener
+    // and gives the failing pool/network time to recover. Backoff grows
+    // 500ms → 1s → 2s → 4s … capped at 30s. Reset on a successful
+    // start (see startNotificationListener). We bail entirely when no
+    // consumers remain or we're shutting down — pre-fix this loop ran
+    // every 1s forever even after the last consumer left.
+    if (this.isShuttingDown || this.consumers.size === 0 || this.stoppingNotify) {
+      return;
     }
+    const delay = Math.min(
+      Connection.NOTIFY_RECONNECT_BASE_MS * Math.pow(2, this.notifyReconnectAttempts),
+      Connection.NOTIFY_RECONNECT_MAX_MS,
+    );
+    this.notifyReconnectAttempts += 1;
+    setTimeout(() => {
+      if (this.isShuttingDown || this.consumers.size === 0 || this.stoppingNotify) {
+        return;
+      }
+      this.startNotificationListener().catch(err => {
+        console.error('Failed to restart notification listener:', err);
+      });
+    }, delay);
   }
 
   /**
@@ -507,6 +539,15 @@ export class Connection implements IConnection {
   private async stopNotificationListener(): Promise<void> {
     if (this.stoppingNotify) return;
     this.stoppingNotify = true;
+    // If a startup is in-flight, await it first. The startup IIFE checks
+    // consumers.size on resume and releases the client itself if we got
+    // here first, so this await handles both orderings: either start
+    // installs the client and we tear it down below, or start sees
+    // shutdown and releases on its own (notifyClient stays null and we
+    // return cleanly).
+    if (this.notifyStartupPromise) {
+      try { await this.notifyStartupPromise; } catch {}
+    }
     const client = this.notifyClient;
     if (!client) {
       this.notificationListenerActive = false;
