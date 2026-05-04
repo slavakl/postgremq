@@ -33,7 +33,7 @@ func TestConsumerStartAndReceive(t *testing.T) {
 	const topicName = "test_consumer_start_topic"
 	const queueName = "test_consumer_start_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -51,7 +51,7 @@ func TestConsumerStartAndReceive(t *testing.T) {
 	}
 
 	// conn.Consume automatically starts the consumer.
-	consumer, err := conn.Consume(ctx, queueName,
+	consumer, err := conn.Consume(queueName,
 		postgremq.WithBatchSize(2),
 		postgremq.WithVT(5),
 	)
@@ -83,7 +83,7 @@ func TestConsumerMessageRetryAfterNack(t *testing.T) {
 	const topicName = "test_consumer_nack_topic"
 	const queueName = "test_consumer_nack_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -98,7 +98,7 @@ func TestConsumerMessageRetryAfterNack(t *testing.T) {
 	_, err = conn.Publish(ctx, topicName, payload)
 	require.NoError(t, err, "Publish failed")
 
-	consumer, err := conn.Consume(ctx, queueName)
+	consumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Consume failed")
 	defer consumer.Stop()
 
@@ -137,7 +137,7 @@ func TestConsumerMultipleDistribution(t *testing.T) {
 	const topicName = "test_multiple_consumers_topic"
 	const queueName = "test_multiple_consumers_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -153,11 +153,11 @@ func TestConsumerMultipleDistribution(t *testing.T) {
 		assert.Greater(t, messageID, int64(0), "Expected valid message ID")
 	}
 
-	consumer1, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(3))
+	consumer1, err := conn.Consume(queueName, postgremq.WithBatchSize(3))
 	require.NoError(t, err, "Consume failed for consumer1")
 	defer consumer1.Stop()
 
-	consumer2, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(3))
+	consumer2, err := conn.Consume(queueName, postgremq.WithBatchSize(3))
 	require.NoError(t, err, "Consume failed for consumer2")
 	defer consumer2.Stop()
 
@@ -211,7 +211,7 @@ func TestConsumerVisibilityTimeoutExtension(t *testing.T) {
 	const topicName = "test_vt_extension_topic"
 	const queueName = "test_vt_extension_queue"
 	logger := MockLogger{}
-	conn, err := postgremq.DialFromPool(ctx, pool, postgremq.WithLogger(&logger))
+	conn, err := postgremq.DialFromPool(pool, postgremq.WithLogger(&logger))
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -226,7 +226,7 @@ func TestConsumerVisibilityTimeoutExtension(t *testing.T) {
 	require.NoError(t, err, "Publish failed")
 
 	// Create a consumer with a low VT and a fast auto extension interval.
-	consumer, err := conn.Consume(ctx, queueName, postgremq.WithVT(2))
+	consumer, err := conn.Consume(queueName, postgremq.WithVT(2))
 	require.NoError(t, err, "Consume failed")
 	defer consumer.Stop()
 
@@ -263,7 +263,7 @@ func TestConsumerExtensionCancelsHandlerOnLeaseLost(t *testing.T) {
 	const topicName = "test_extension_cancel_topic"
 	const queueName = "test_extension_cancel_queue"
 	logger := MockLogger{}
-	conn, err := postgremq.DialFromPool(ctx, pool, postgremq.WithLogger(&logger))
+	conn, err := postgremq.DialFromPool(pool, postgremq.WithLogger(&logger))
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -278,7 +278,7 @@ func TestConsumerExtensionCancelsHandlerOnLeaseLost(t *testing.T) {
 	require.NoError(t, err)
 
 	// VT=2s so the extend routine fires fast (extendAt = vt/2 = ~1s).
-	consumer, err := conn.Consume(ctx, queueName, postgremq.WithVT(2))
+	consumer, err := conn.Consume(queueName, postgremq.WithVT(2))
 	require.NoError(t, err)
 	defer consumer.Stop()
 
@@ -333,7 +333,7 @@ func TestConsumerBufferedMessagesReleased(t *testing.T) {
 	const topicName = "test_buffer_release_topic"
 	const queueName = "test_buffer_release_queue"
 	logger := MockLogger{}
-	conn, err := postgremq.DialFromPool(ctx, pool, postgremq.WithLogger(&logger))
+	conn, err := postgremq.DialFromPool(pool, postgremq.WithLogger(&logger))
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -351,7 +351,7 @@ func TestConsumerBufferedMessagesReleased(t *testing.T) {
 	}
 
 	// Create a consumer with a BatchSize of 5.
-	consumer, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(5), postgremq.WithVT(10))
+	consumer, err := conn.Consume(queueName, postgremq.WithBatchSize(5), postgremq.WithVT(10))
 	require.NoError(t, err, "Consume failed")
 
 	nackedMessages := make(map[int64]struct{})
@@ -400,7 +400,7 @@ func TestConsumerStopAndRestart(t *testing.T) {
 	const topicName = "test_consumer_restart_topic"
 	const queueName = "test_consumer_restart_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -410,7 +410,7 @@ func TestConsumerStopAndRestart(t *testing.T) {
 	require.NoError(t, err, "CreateQueue failed")
 
 	// Create first consumer before publishing with small batch size
-	consumer, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(1))
+	consumer, err := conn.Consume(queueName, postgremq.WithBatchSize(1))
 	require.NoError(t, err, "First consume failed")
 
 	// Give consumer time to set up LISTEN/NOTIFY and start fetch loop
@@ -441,7 +441,7 @@ func TestConsumerStopAndRestart(t *testing.T) {
 	consumer.Stop()
 
 	// Create second consumer before publishing
-	consumer2, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(1))
+	consumer2, err := conn.Consume(queueName, postgremq.WithBatchSize(1))
 	require.NoError(t, err, "Second consume failed")
 	defer consumer2.Stop()
 
@@ -491,7 +491,7 @@ func TestConsumerWithRetry(t *testing.T) {
 			},
 		}
 
-		conn, err := postgremq.DialFromPool(ctx, pool,
+		conn, err := postgremq.DialFromPool(pool,
 			postgremq.WithLogger(logger),
 			postgremq.WithRetryConfig(postgremq.RetryConfig{
 				MaxAttempts:       3,
@@ -516,7 +516,7 @@ func TestWithNoAutoExtension(t *testing.T) {
 	defer pool.Close()
 
 	// Create a connection
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -537,7 +537,7 @@ func TestWithNoAutoExtension(t *testing.T) {
 
 	// Create a consumer with a very short visibility timeout (3 seconds) and no auto-extension
 	shortVT := 3 // 3 seconds visibility timeout
-	consumer, err := conn.Consume(ctx, queueName,
+	consumer, err := conn.Consume(queueName,
 		postgremq.WithVT(shortVT),
 		postgremq.WithNoAutoExtension(),
 		postgremq.WithCheckTimeout(2*time.Second))

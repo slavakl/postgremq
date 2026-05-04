@@ -64,7 +64,7 @@ func main() {
 		log.Printf("Published message %d with ID: %d", i, messageID)
 	}
 
-	consumer, err := conn.Consume(ctx, queueName,
+	consumer, err := conn.Consume(queueName,
 		postgremq.WithBatchSize(5),
 		postgremq.WithVT(30))
 	if err != nil {

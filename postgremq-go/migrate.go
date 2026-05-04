@@ -1,7 +1,6 @@
 package postgremq_go
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"strconv"
@@ -34,7 +33,10 @@ type MigrationStatus struct {
 // Migrate runs database migrations using the provided pool.
 // This is a standalone function for schema management, separate from
 // the Connection type which is used for message queue operations.
-func Migrate(ctx context.Context, pool *pgxpool.Pool, opts MigrateOptions) error {
+//
+// No ctx parameter: golang-migrate's API doesn't accept one, so a ctx
+// would be ignored anyway.
+func Migrate(pool *pgxpool.Pool, opts MigrateOptions) error {
 	source, err := iofs.New(mq.MigrationsFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("failed to create migration source: %w", err)
@@ -79,7 +81,9 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool, opts MigrateOptions) error
 // GetMigrationStatus returns current migration status using the provided pool.
 // This is a standalone function for schema management, separate from
 // the Connection type which is used for message queue operations.
-func GetMigrationStatus(ctx context.Context, pool *pgxpool.Pool) (*MigrationStatus, error) {
+//
+// No ctx parameter: golang-migrate's Version() doesn't accept one.
+func GetMigrationStatus(pool *pgxpool.Pool) (*MigrationStatus, error) {
 	source, err := iofs.New(mq.MigrationsFS, "migrations")
 	if err != nil {
 		return nil, err

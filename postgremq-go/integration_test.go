@@ -27,7 +27,7 @@ func TestConcurrentMessageProcessing(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -62,13 +62,13 @@ func TestConcurrentMessageProcessing(t *testing.T) {
 		go func(consumerID int) {
 			defer wg.Done()
 
-			consumerConn, err := postgremq.DialFromPool(ctx, pool)
+			consumerConn, err := postgremq.DialFromPool(pool)
 			require.NoError(t, err, "Failed to create consumer connection")
 			defer consumerConn.Close()
 
 			// Each consumer uses its own Connection, so its topic cache is
 			// empty for queueName. Pass the topic explicitly.
-			consumer, err := consumerConn.Consume(ctx, queueName, postgremq.WithTopic(topicName))
+			consumer, err := consumerConn.Consume(queueName, postgremq.WithTopic(topicName))
 			require.NoError(t, err, "Failed to create consumer")
 			defer consumer.Stop()
 
@@ -154,7 +154,7 @@ func TestHighThroughputDelivery(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -191,7 +191,7 @@ func TestHighThroughputDelivery(t *testing.T) {
 
 	// Start multiple consumers
 	for i := 0; i < numConsumers; i++ {
-		consumer, err := conn.Consume(ctx, queueName,
+		consumer, err := conn.Consume(queueName,
 			postgremq.WithBatchSize(batchSize),
 			postgremq.WithVT(10))
 		require.NoError(t, err, "Failed to create consumer")
@@ -277,7 +277,7 @@ func TestRecoveryFromFailure(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -300,7 +300,7 @@ func TestRecoveryFromFailure(t *testing.T) {
 	}
 
 	// First consumer that will fail to process some messages
-	failingConsumer, err := conn.Consume(ctx, queueName)
+	failingConsumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Failed to create failing consumer")
 
 	// Process half the messages successfully, nack the rest
@@ -325,7 +325,7 @@ func TestRecoveryFromFailure(t *testing.T) {
 	failingConsumer.Stop()
 
 	// Verify that the nacked messages are redelivered to a new consumer
-	recoveryConsumer, err := conn.Consume(ctx, queueName)
+	recoveryConsumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Failed to create recovery consumer")
 	defer recoveryConsumer.Stop()
 

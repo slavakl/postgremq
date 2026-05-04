@@ -128,7 +128,7 @@ func TestConnectionEstablishment(t *testing.T) {
 	defer pool.Close()
 
 	// Create a new connection
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 
 	// Verify connection works by creating a topic
@@ -155,7 +155,7 @@ func TestConsumeAfterCloseReturnsError(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 
 	require.NoError(t, conn.CreateTopic(ctx, "afterclose_topic"))
@@ -163,11 +163,11 @@ func TestConsumeAfterCloseReturnsError(t *testing.T) {
 
 	require.NoError(t, conn.Close())
 
-	_, err = conn.Consume(ctx, "afterclose_queue")
+	_, err = conn.Consume("afterclose_queue")
 	require.ErrorIs(t, err, postgremq.ErrConnectionClosed,
 		"Consume after Close must return ErrConnectionClosed")
 
-	_, err = conn.ConsumeHandler(ctx, "afterclose_queue",
+	_, err = conn.ConsumeHandler("afterclose_queue",
 		func(ctx context.Context, msg *postgremq.Message) {})
 	require.ErrorIs(t, err, postgremq.ErrConnectionClosed,
 		"ConsumeHandler after Close must return ErrConnectionClosed")
@@ -185,7 +185,7 @@ func TestConnectionConfigOptions(t *testing.T) {
 	}
 
 	// Create connection with options
-	conn, err := postgremq.DialFromPool(ctx, pool,
+	conn, err := postgremq.DialFromPool(pool,
 		postgremq.WithLogger(logger),
 		postgremq.WithShutdownTimeout(2*time.Second),
 		postgremq.WithRetryConfig(postgremq.RetryConfig{
@@ -212,7 +212,7 @@ func TestTopicCreationAndDeletion(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -254,7 +254,7 @@ func TestQueueCreationAndDeletion(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -322,7 +322,7 @@ func TestConnectionKeepAlive(t *testing.T) {
 	defer pool.Close()
 
 	// Create connection
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -340,7 +340,7 @@ func TestConnectionKeepAlive(t *testing.T) {
 	msgID, err := conn.Publish(ctx, topicName, []byte(`{"test":"keepalive"}`))
 	require.NoError(t, err, "Failed to publish message")
 
-	consumer, err := conn.Consume(ctx, queueName,
+	consumer, err := conn.Consume(queueName,
 		postgremq.WithVT(5)) // Short visibility timeout that needs extension
 	require.NoError(t, err, "Failed to create consumer")
 	defer consumer.Stop()
@@ -379,7 +379,7 @@ func TestMessagePublishing(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -400,7 +400,7 @@ func TestMessagePublishing(t *testing.T) {
 	require.Greater(t, msgID, int64(0), "Message ID should be positive")
 
 	// Consume the message to verify it was published
-	consumer, err := conn.Consume(ctx, queueName)
+	consumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Failed to create consumer")
 	defer consumer.Stop()
 
@@ -437,7 +437,7 @@ func TestDLQOperations(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -459,7 +459,7 @@ func TestDLQOperations(t *testing.T) {
 
 	// Function to process and nack messages until they reach DLQ
 	processUntilDLQ := func() {
-		consumer, err := conn.Consume(ctx, queueName)
+		consumer, err := conn.Consume(queueName)
 		require.NoError(t, err, "Failed to create consumer")
 		defer consumer.Stop()
 
@@ -520,7 +520,7 @@ func TestDLQOperations(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// Verify the message is back in the original queue
-	consumer, err := conn.Consume(ctx, queueName)
+	consumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Failed to create consumer for original queue")
 	defer consumer.Stop()
 
@@ -556,7 +556,7 @@ func TestAdministrativeOperations(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -651,7 +651,7 @@ func TestAdministrativeOperations(t *testing.T) {
 	require.NoError(t, err, "Failed to publish message for DLQ test")
 
 	// Process the message and nack it to exceed max delivery attempts
-	consumer, err := conn.Consume(ctx, dlqQueueName)
+	consumer, err := conn.Consume(dlqQueueName)
 	require.NoError(t, err, "Failed to create consumer")
 
 	// Wait for and nack the message
@@ -716,7 +716,7 @@ func TestListTopics(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -761,7 +761,7 @@ func TestListQueues(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -849,7 +849,7 @@ func TestQueueStatistics(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -892,7 +892,7 @@ func TestQueueStatistics(t *testing.T) {
 	assert.Equal(t, int64(0), pendingStats.CompletedCount, "Should have no completed messages yet")
 
 	// Consume but don't ack some messages to move them to processing state
-	consumer, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(3))
+	consumer, err := conn.Consume(queueName, postgremq.WithBatchSize(3))
 	require.NoError(t, err, "Failed to create consumer")
 
 	var processedMsgs []*postgremq.Message
@@ -959,7 +959,7 @@ func TestMessageOperations(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1031,7 +1031,7 @@ func TestQueueCleanup(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1098,7 +1098,7 @@ func TestCleanupCompletedMessages(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1194,7 +1194,7 @@ func TestTopicCleanup(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1262,7 +1262,7 @@ func TestDLQOperationsAdmin(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1288,7 +1288,7 @@ func TestDLQOperationsAdmin(t *testing.T) {
 	assert.Empty(t, initialDLQ, "DLQ should be empty initially")
 
 	// Consume and nack the message to exceed max delivery attempts
-	consumer, err := conn.Consume(ctx, queueName)
+	consumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Failed to create consumer")
 
 	// Wait for and nack the message
@@ -1356,7 +1356,7 @@ func TestDLQOperationsAdmin(t *testing.T) {
 
 	// Test PurgeDLQ
 	// First, move the message back to DLQ
-	consumer, err = conn.Consume(ctx, queueName)
+	consumer, err = conn.Consume(queueName)
 	require.NoError(t, err, "Failed to create consumer")
 
 	// Wait for and nack the message again
@@ -1408,7 +1408,7 @@ func TestPurgeAllMessages(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1494,7 +1494,7 @@ func TestDeleteInactiveQueues(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1532,7 +1532,7 @@ func TestDeleteInactiveQueues(t *testing.T) {
 	conn.Close()
 	time.Sleep(3 * time.Second) // Wait for queues to expire
 
-	conn, err = postgremq.DialFromPool(ctx, pool)
+	conn, err = postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 
 	// Now call DeleteInactiveQueues
@@ -1555,7 +1555,7 @@ func TestPublishWithTx(t *testing.T) {
 
 	// Test Case 1: Successful commit
 	t.Run("CommitTransaction", func(t *testing.T) {
-		conn, err := postgremq.DialFromPool(ctx, pool)
+		conn, err := postgremq.DialFromPool(pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 
@@ -1584,7 +1584,7 @@ func TestPublishWithTx(t *testing.T) {
 		require.NoError(t, err, "Failed to commit transaction")
 
 		// Verify the message was published by consuming it
-		consumer, err := conn.Consume(ctx, queueName)
+		consumer, err := conn.Consume(queueName)
 		require.NoError(t, err, "Failed to create consumer")
 		defer consumer.Stop()
 
@@ -1617,7 +1617,7 @@ func TestPublishWithTx(t *testing.T) {
 	t.Run("RollbackTransaction", func(t *testing.T) {
 		cleanTestData(t, pool, ctx)
 
-		conn, err := postgremq.DialFromPool(ctx, pool)
+		conn, err := postgremq.DialFromPool(pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 

@@ -60,9 +60,9 @@ func setupEmptyTestDatabase(t *testing.T) (*pgxpool.Pool, context.Context) {
 }
 
 func TestMigration_StatusOnEmptyDatabase(t *testing.T) {
-	pool, ctx := setupEmptyTestDatabase(t)
+	pool, _ := setupEmptyTestDatabase(t)
 
-	status, err := postgremq.GetMigrationStatus(ctx, pool)
+	status, err := postgremq.GetMigrationStatus(pool)
 	require.NoError(t, err)
 
 	assert.Equal(t, uint(0), status.CurrentVersion, "Empty database should have version 0")
@@ -72,14 +72,14 @@ func TestMigration_StatusOnEmptyDatabase(t *testing.T) {
 }
 
 func TestMigration_MigrateEmptyDatabase(t *testing.T) {
-	pool, ctx := setupEmptyTestDatabase(t)
+	pool, _ := setupEmptyTestDatabase(t)
 
 	// Run migration
-	err := postgremq.Migrate(ctx, pool, postgremq.MigrateOptions{})
+	err := postgremq.Migrate(pool, postgremq.MigrateOptions{})
 	require.NoError(t, err)
 
 	// Verify migration succeeded
-	status, err := postgremq.GetMigrationStatus(ctx, pool)
+	status, err := postgremq.GetMigrationStatus(pool)
 	require.NoError(t, err)
 
 	assert.Equal(t, uint(1), status.CurrentVersion, "Should be at version 1 after migration")
@@ -88,18 +88,18 @@ func TestMigration_MigrateEmptyDatabase(t *testing.T) {
 }
 
 func TestMigration_Idempotency(t *testing.T) {
-	pool, ctx := setupEmptyTestDatabase(t)
+	pool, _ := setupEmptyTestDatabase(t)
 
 	// Run migration first time
-	err := postgremq.Migrate(ctx, pool, postgremq.MigrateOptions{})
+	err := postgremq.Migrate(pool, postgremq.MigrateOptions{})
 	require.NoError(t, err)
 
 	// Run migration second time - should be idempotent
-	err = postgremq.Migrate(ctx, pool, postgremq.MigrateOptions{})
+	err = postgremq.Migrate(pool, postgremq.MigrateOptions{})
 	require.NoError(t, err, "Running migrate twice should not fail")
 
 	// Verify still at correct version
-	status, err := postgremq.GetMigrationStatus(ctx, pool)
+	status, err := postgremq.GetMigrationStatus(pool)
 	require.NoError(t, err)
 
 	assert.Equal(t, uint(1), status.CurrentVersion)
@@ -110,11 +110,11 @@ func TestMigration_SchemaIsUsable(t *testing.T) {
 	pool, ctx := setupEmptyTestDatabase(t)
 
 	// Run migration first
-	err := postgremq.Migrate(ctx, pool, postgremq.MigrateOptions{})
+	err := postgremq.Migrate(pool, postgremq.MigrateOptions{})
 	require.NoError(t, err)
 
 	// Now create a connection to test message queue operations
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -136,7 +136,7 @@ func TestMigration_SchemaIsUsable(t *testing.T) {
 	assert.Greater(t, msgID, int64(0), "Message ID should be positive")
 
 	// Consume message
-	consumer, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(1), postgremq.WithVT(30))
+	consumer, err := conn.Consume(queueName, postgremq.WithBatchSize(1), postgremq.WithVT(30))
 	require.NoError(t, err, "Should be able to create consumer after migration")
 	defer consumer.Stop()
 
@@ -155,7 +155,7 @@ func TestMigration_MigrationsTableName(t *testing.T) {
 	pool, ctx := setupEmptyTestDatabase(t)
 
 	// Run migration
-	err := postgremq.Migrate(ctx, pool, postgremq.MigrateOptions{})
+	err := postgremq.Migrate(pool, postgremq.MigrateOptions{})
 	require.NoError(t, err)
 
 	// Verify the migrations table uses our custom name
@@ -180,15 +180,15 @@ func TestMigration_MigrationsTableName(t *testing.T) {
 }
 
 func TestMigration_TargetVersion(t *testing.T) {
-	pool, ctx := setupEmptyTestDatabase(t)
+	pool, _ := setupEmptyTestDatabase(t)
 
 	// Migrate to specific version (currently only version 1 exists)
-	err := postgremq.Migrate(ctx, pool, postgremq.MigrateOptions{
+	err := postgremq.Migrate(pool, postgremq.MigrateOptions{
 		TargetVersion: 1,
 	})
 	require.NoError(t, err)
 
-	status, err := postgremq.GetMigrationStatus(ctx, pool)
+	status, err := postgremq.GetMigrationStatus(pool)
 	require.NoError(t, err)
 	assert.Equal(t, uint(1), status.CurrentVersion)
 }

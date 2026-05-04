@@ -39,7 +39,7 @@ func main() {
 	log.Println("Connected to database")
 
 	// Check current migration status
-	status, err := postgremq.GetMigrationStatus(ctx, pool)
+	status, err := postgremq.GetMigrationStatus(pool)
 	if err != nil {
 		log.Fatalf("Failed to get migration status: %v", err)
 	}
@@ -64,12 +64,12 @@ func main() {
 	fmt.Println("Applying migrations...")
 
 	// Apply migrations
-	if err := postgremq.Migrate(ctx, pool, postgremq.MigrateOptions{}); err != nil {
+	if err := postgremq.Migrate(pool, postgremq.MigrateOptions{}); err != nil {
 		log.Fatalf("Migration failed: %v", err)
 	}
 
 	// Verify the migration succeeded
-	newStatus, err := postgremq.GetMigrationStatus(ctx, pool)
+	newStatus, err := postgremq.GetMigrationStatus(pool)
 	if err != nil {
 		log.Fatalf("Failed to verify migration: %v", err)
 	}
@@ -81,7 +81,7 @@ func main() {
 	log.Println("\nPostgreMQ is ready to use.")
 
 	// Example: Create a connection and verify everything works
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	if err != nil {
 		log.Fatalf("Failed to create connection: %v", err)
 	}

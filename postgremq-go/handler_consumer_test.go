@@ -26,7 +26,7 @@ func TestHandlerConsumerExplicitAck(t *testing.T) {
 	const topicName = "test_handler_explicit_ack_topic"
 	const queueName = "test_handler_explicit_ack_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -45,7 +45,7 @@ func TestHandlerConsumerExplicitAck(t *testing.T) {
 	var receivedCount atomic.Int32
 	done := make(chan struct{})
 
-	hc, err := conn.ConsumeHandler(ctx, queueName,
+	hc, err := conn.ConsumeHandler(queueName,
 		func(ctx context.Context, msg *postgremq.Message) {
 			count := receivedCount.Add(1)
 			msg.Ack(ctx)
@@ -86,7 +86,7 @@ func TestHandlerConsumerAutoAck(t *testing.T) {
 	const topicName = "test_handler_auto_ack_topic"
 	const queueName = "test_handler_auto_ack_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -105,7 +105,7 @@ func TestHandlerConsumerAutoAck(t *testing.T) {
 	var receivedCount atomic.Int32
 	done := make(chan struct{})
 
-	hc, err := conn.ConsumeHandler(ctx, queueName,
+	hc, err := conn.ConsumeHandler(queueName,
 		func(ctx context.Context, msg *postgremq.Message) {
 			// Don't call Ack or Nack - should auto-ack
 			count := receivedCount.Add(1)
@@ -143,7 +143,7 @@ func TestHandlerConsumerNack(t *testing.T) {
 	const topicName = "test_handler_nack_topic"
 	const queueName = "test_handler_nack_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -160,7 +160,7 @@ func TestHandlerConsumerNack(t *testing.T) {
 	var receivedCount atomic.Int32
 	done := make(chan struct{})
 
-	hc, err := conn.ConsumeHandler(ctx, queueName,
+	hc, err := conn.ConsumeHandler(queueName,
 		func(ctx context.Context, msg *postgremq.Message) {
 			count := receivedCount.Add(1)
 			if count == 2 {
@@ -194,7 +194,7 @@ func TestHandlerConsumerNackWithDelay(t *testing.T) {
 	const topicName = "test_handler_nack_delay_topic"
 	const queueName = "test_handler_nack_delay_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -212,7 +212,7 @@ func TestHandlerConsumerNackWithDelay(t *testing.T) {
 	var receivedCount atomic.Int32
 	done := make(chan struct{})
 
-	hc, err := conn.ConsumeHandler(ctx, queueName,
+	hc, err := conn.ConsumeHandler(queueName,
 		func(ctx context.Context, msg *postgremq.Message) {
 			count := receivedCount.Add(1)
 			if count == 1 {
@@ -250,7 +250,7 @@ func TestHandlerConsumerMaxInFlight(t *testing.T) {
 	const topicName = "test_handler_max_inflight_topic"
 	const queueName = "test_handler_max_inflight_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -271,7 +271,7 @@ func TestHandlerConsumerMaxInFlight(t *testing.T) {
 	var receivedCount atomic.Int32
 	done := make(chan struct{})
 
-	hc, err := conn.ConsumeHandler(ctx, queueName,
+	hc, err := conn.ConsumeHandler(queueName,
 		func(ctx context.Context, msg *postgremq.Message) {
 			current := currentInFlight.Add(1)
 			defer currentInFlight.Add(-1)
@@ -330,7 +330,7 @@ func TestHandlerConsumerStopUnderLoadDoesNotDeadlock(t *testing.T) {
 	const topicName = "test_handler_stop_deadlock_topic"
 	const queueName = "test_handler_stop_deadlock_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -350,7 +350,7 @@ func TestHandlerConsumerStopUnderLoadDoesNotDeadlock(t *testing.T) {
 	// Any failure to drain on shutdown blocks handler completions
 	// immediately.
 	var startedHandlers atomic.Int32
-	hc, err := conn.ConsumeHandler(ctx, queueName,
+	hc, err := conn.ConsumeHandler(queueName,
 		func(handlerCtx context.Context, msg *postgremq.Message) {
 			startedHandlers.Add(1)
 			// Hold briefly so handlers are in-flight when Stop fires.
@@ -402,7 +402,7 @@ func TestHandlerConsumerPanicRecovery(t *testing.T) {
 	const queueName = "test_handler_panic_queue"
 
 	logger := &MockLogger{}
-	conn, err := postgremq.DialFromPool(ctx, pool, postgremq.WithLogger(logger))
+	conn, err := postgremq.DialFromPool(pool, postgremq.WithLogger(logger))
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -419,7 +419,7 @@ func TestHandlerConsumerPanicRecovery(t *testing.T) {
 	var receivedCount atomic.Int32
 	done := make(chan struct{})
 
-	hc, err := conn.ConsumeHandler(ctx, queueName,
+	hc, err := conn.ConsumeHandler(queueName,
 		func(ctx context.Context, msg *postgremq.Message) {
 			count := receivedCount.Add(1)
 			if count == 1 {
@@ -452,7 +452,7 @@ func TestHandlerConsumerGracefulShutdown(t *testing.T) {
 	const topicName = "test_handler_shutdown_topic"
 	const queueName = "test_handler_shutdown_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -470,7 +470,7 @@ func TestHandlerConsumerGracefulShutdown(t *testing.T) {
 	var ctxCancelled atomic.Bool
 	handlerDone := make(chan struct{})
 
-	hc, err := conn.ConsumeHandler(ctx, queueName,
+	hc, err := conn.ConsumeHandler(queueName,
 		func(ctx context.Context, msg *postgremq.Message) {
 			close(handlerStarted)
 
@@ -526,7 +526,7 @@ func TestHandlerConsumerContextCancellation(t *testing.T) {
 	const topicName = "test_handler_ctx_cancel_topic"
 	const queueName = "test_handler_ctx_cancel_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -543,7 +543,7 @@ func TestHandlerConsumerContextCancellation(t *testing.T) {
 	handlerStarted := make(chan struct{})
 	contextCancelled := make(chan struct{})
 
-	hc, err := conn.ConsumeHandler(ctx, queueName,
+	hc, err := conn.ConsumeHandler(queueName,
 		func(ctx context.Context, msg *postgremq.Message) {
 			close(handlerStarted)
 			<-ctx.Done()
@@ -583,7 +583,7 @@ func TestHandlerConsumerMessageFields(t *testing.T) {
 	const topicName = "test_handler_msg_fields_topic"
 	const queueName = "test_handler_msg_fields_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -604,7 +604,7 @@ func TestHandlerConsumerMessageFields(t *testing.T) {
 	var receivedPayload []byte
 	var publishedAtSet, vtSet bool
 
-	hc, err := conn.ConsumeHandler(ctx, queueName,
+	hc, err := conn.ConsumeHandler(queueName,
 		func(ctx context.Context, msg *postgremq.Message) {
 			receivedID = msg.ID
 			receivedDeliveryAttempt = msg.DeliveryAttempt
@@ -646,7 +646,7 @@ func TestHandlerConsumerInvalidMaxInFlight(t *testing.T) {
 	const topicName = "test_handler_invalid_inflight_topic"
 	const queueName = "test_handler_invalid_inflight_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -655,7 +655,7 @@ func TestHandlerConsumerInvalidMaxInFlight(t *testing.T) {
 	err = conn.CreateQueue(ctx, queueName, topicName, true)
 	require.NoError(t, err, "CreateQueue failed")
 
-	_, err = conn.ConsumeHandler(ctx, queueName,
+	_, err = conn.ConsumeHandler(queueName,
 		func(ctx context.Context, msg *postgremq.Message) {
 			msg.Ack(ctx)
 		},
@@ -675,7 +675,7 @@ func TestHandlerConsumerConnectionClose(t *testing.T) {
 	const topicName = "test_handler_conn_close_topic"
 	const queueName = "test_handler_conn_close_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool, postgremq.WithShutdownTimeout(5*time.Second))
+	conn, err := postgremq.DialFromPool(pool, postgremq.WithShutdownTimeout(5*time.Second))
 	require.NoError(t, err, "DialFromPool failed")
 	// Safety net: if the test fatals before reaching the explicit conn.Close()
 	// below, EventListener.session would otherwise keep a pgx connection
@@ -697,7 +697,7 @@ func TestHandlerConsumerConnectionClose(t *testing.T) {
 	handlerStarted := make(chan struct{})
 	handlerDone := make(chan struct{})
 
-	_, err = conn.ConsumeHandler(ctx, queueName,
+	_, err = conn.ConsumeHandler(queueName,
 		func(ctx context.Context, msg *postgremq.Message) {
 			close(handlerStarted)
 			<-ctx.Done() // Wait for shutdown
@@ -748,7 +748,7 @@ func TestMultipleConsumersSameQueue(t *testing.T) {
 	const topicName = "test_multi_consumer_topic"
 	const queueName = "test_multi_consumer_queue"
 
-	conn, err := postgremq.DialFromPool(ctx, pool, postgremq.WithShutdownTimeout(5*time.Second))
+	conn, err := postgremq.DialFromPool(pool, postgremq.WithShutdownTimeout(5*time.Second))
 	require.NoError(t, err, "DialFromPool failed")
 	// Safety net: if the test fatals before reaching the explicit conn.Close()
 	// below, EventListener.session would otherwise keep a pgx connection
@@ -803,13 +803,13 @@ func TestMultipleConsumersSameQueue(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	_, err = conn.ConsumeHandler(ctx, queueName, makeHandler(1),
+	_, err = conn.ConsumeHandler(queueName, makeHandler(1),
 		postgremq.WithVT(30),
 		postgremq.WithBatchSize(1), // discourage one consumer from sweeping the queue
 	)
 	require.NoError(t, err, "First ConsumeHandler failed")
 
-	_, err = conn.ConsumeHandler(ctx, queueName, makeHandler(2),
+	_, err = conn.ConsumeHandler(queueName, makeHandler(2),
 		postgremq.WithVT(30),
 		postgremq.WithBatchSize(1),
 	)

@@ -38,7 +38,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	defer pool.Close()
 
 	// Check status first
-	status, err := postgremq.GetMigrationStatus(ctx, pool)
+	status, err := postgremq.GetMigrationStatus(pool)
 	if err != nil {
 		return fmt.Errorf("failed to get migration status: %w", err)
 	}
@@ -57,7 +57,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 
 	// Run migration
 	fmt.Println("Running migrations...")
-	if err := postgremq.Migrate(ctx, pool, postgremq.MigrateOptions{
+	if err := postgremq.Migrate(pool, postgremq.MigrateOptions{
 		TargetVersion: targetVer,
 	}); err != nil {
 		return fmt.Errorf("migration failed: %w", err)

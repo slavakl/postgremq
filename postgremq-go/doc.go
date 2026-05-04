@@ -65,7 +65,7 @@
 //
 // Create a consumer and process messages with automatic acknowledgment:
 //
-//	consumer, err := conn.Consume(ctx, "orders-processor",
+//	consumer, err := conn.Consume("orders-processor",
 //		postgremq.WithBatchSize(10),
 //		postgremq.WithVT(30))
 //	if err != nil {
@@ -139,7 +139,7 @@
 //
 // Disable auto-extension if you want manual control:
 //
-//	consumer, _ := conn.Consume(ctx, "queue-name",
+//	consumer, _ := conn.Consume("queue-name",
 //		postgremq.WithVT(60),
 //		postgremq.WithNoAutoExtension())
 //
@@ -177,7 +177,7 @@
 // Example with graceful shutdown:
 //
 //	func worker(ctx context.Context, conn *postgremq.Connection) {
-//		consumer, _ := conn.Consume(ctx, "work-queue", postgremq.WithVT(60))
+//		consumer, _ := conn.Consume("work-queue", postgremq.WithVT(60))
 //		defer consumer.Stop()
 //
 //		for msg := range consumer.Messages() {
@@ -252,7 +252,7 @@
 // Batch Size: Larger batches reduce database round-trips but increase memory usage
 // and time to first message. Default is 5.
 //
-//	consumer, _ := conn.Consume(ctx, "queue", postgremq.WithBatchSize(100))
+//	consumer, _ := conn.Consume("queue", postgremq.WithBatchSize(100))
 //
 // Visibility Timeout: Should be longer than typical processing time. Too short causes
 // duplicate processing; too long delays retries on failure.
@@ -260,7 +260,7 @@
 // Check Timeout: How often to poll for messages when no LISTEN/NOTIFY events arrive.
 // Default is 10 seconds.
 //
-//	consumer, _ := conn.Consume(ctx, "queue", postgremq.WithCheckTimeout(5*time.Second))
+//	consumer, _ := conn.Consume("queue", postgremq.WithCheckTimeout(5*time.Second))
 //
 // # Concurrency
 //

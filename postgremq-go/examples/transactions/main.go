@@ -28,7 +28,7 @@ func main() {
 	defer pool.Close()
 
 	// Connect PostgreMQ using existing pool
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	if err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
@@ -78,7 +78,7 @@ func main() {
 	// Example 2: Consume and acknowledge within transaction
 	log.Println("\n=== Consuming and acknowledging within transaction ===")
 
-	consumer, err := conn.Consume(ctx, queueName,
+	consumer, err := conn.Consume(queueName,
 		postgremq.WithBatchSize(1),
 		postgremq.WithVT(30))
 	if err != nil {

@@ -115,7 +115,7 @@ func TestConnectionLossRecovery(t *testing.T) {
 		RealPool: pool,
 	}
 
-	conn, err := postgremq.DialFromPool(ctx, mockPool)
+	conn, err := postgremq.DialFromPool(mockPool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -149,7 +149,7 @@ func TestConnectionLossRecovery(t *testing.T) {
 	require.Greater(t, recoverMsgID, msgID, "New message ID should be greater than previous")
 
 	// Verify consumer can still receive messages
-	consumer, err := conn.Consume(ctx, queueName)
+	consumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Should be able to create consumer after recovery")
 	defer consumer.Stop()
 
@@ -191,7 +191,7 @@ func TestTransactionErrorHandling(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	conn, err := postgremq.DialFromPool(ctx, mockPool,
+	conn, err := postgremq.DialFromPool(mockPool,
 		postgremq.WithRetryConfig(postgremq.RetryConfig{
 			MaxAttempts:       5,
 			InitialBackoff:    10 * time.Millisecond,
@@ -247,7 +247,7 @@ func TestConsumeMessagesDoesNotRetry(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	conn, err := postgremq.DialFromPool(ctx, mockPool,
+	conn, err := postgremq.DialFromPool(mockPool,
 		postgremq.WithRetryConfig(postgremq.RetryConfig{
 			MaxAttempts:       5,
 			InitialBackoff:    1 * time.Millisecond,
@@ -300,7 +300,7 @@ func TestConsumeMessagesReturnsPartialOnError(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	conn, err := postgremq.DialFromPool(ctx, mockPool)
+	conn, err := postgremq.DialFromPool(mockPool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -332,7 +332,7 @@ func TestRetryBackoffBehavior(t *testing.T) {
 	}
 
 	// Configure with initial backoff of 100ms doubling each time
-	conn, err := postgremq.DialFromPool(ctx, pool,
+	conn, err := postgremq.DialFromPool(pool,
 		postgremq.WithLogger(logger),
 		postgremq.WithRetryConfig(postgremq.RetryConfig{
 			MaxAttempts:       5,
@@ -379,7 +379,7 @@ func TestErrorConditionsInOperations(t *testing.T) {
 		pool, ctx := setupTestConnection(t)
 		defer pool.Close()
 
-		conn, err := postgremq.DialFromPool(ctx, pool)
+		conn, err := postgremq.DialFromPool(pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 
@@ -397,7 +397,7 @@ func TestErrorConditionsInOperations(t *testing.T) {
 		pool, ctx := setupTestConnection(t)
 		defer pool.Close()
 
-		conn, err := postgremq.DialFromPool(ctx, pool)
+		conn, err := postgremq.DialFromPool(pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 
@@ -425,7 +425,7 @@ func TestErrorConditionsInOperations(t *testing.T) {
 		topicName := "test_parallel_topic"
 		queueName := "test_parallel_queue"
 
-		conn, err := postgremq.DialFromPool(ctx, pool)
+		conn, err := postgremq.DialFromPool(pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 
@@ -474,7 +474,7 @@ func TestVeryLargePayload(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -518,7 +518,7 @@ func TestVeryLargePayload(t *testing.T) {
 	assert.Greater(t, messageID, int64(0), "Expected valid message ID")
 
 	// Consume and verify the message
-	consumer, err := conn.Consume(ctx, queueName)
+	consumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Failed to create consumer")
 	defer consumer.Stop()
 
@@ -543,7 +543,7 @@ func TestBoundaryConditions(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -567,11 +567,11 @@ func TestBoundaryConditions(t *testing.T) {
 	t.Log("Published message with ID:", messageID)
 
 	// Test minimum visibility timeout
-	consumer, err := conn.Consume(ctx, queueName, postgremq.WithVT(1))
+	consumer, err := conn.Consume(queueName, postgremq.WithVT(1))
 	require.NoError(t, err, "Should accept minimum visibility timeout")
 
 	// Test consume with large batch size - using a separate consumer
-	consumer2, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(1000))
+	consumer2, err := conn.Consume(queueName, postgremq.WithBatchSize(1000))
 	require.NoError(t, err, "Should accept large batch size")
 
 	// Ensure both consumers are stopped properly

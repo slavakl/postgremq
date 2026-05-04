@@ -32,14 +32,22 @@ type HandlerConsumer struct {
 }
 
 func newHandlerConsumer(
-	ctx context.Context,
 	conn *Connection,
 	consumer *Consumer,
 	handler MessageHandler,
 	logger LevelLogger,
 	options handlerConsumeOptions,
 ) *HandlerConsumer {
-	ctx, cancel := context.WithCancel(ctx)
+	// hc.ctx is parented on conn.ctx, NOT on the user-supplied ctx that
+	// ConsumeHandler accepts. The dispatch-loop lifetime is owned by
+	// HandlerConsumer.Stop() and (transitively) Connection.Close(); the
+	// user ctx parameter is bootstrap-only and does not control the
+	// returned resource. Cancelling the user ctx therefore does not exit
+	// dispatchLoop — call Stop() for that. This matches the canonical
+	// Go pattern (pgxpool, amqp, sql) and prevents the half-shutdown
+	// where dispatchLoop exits but the underlying Consumer keeps
+	// fetching with no one to drain its Messages channel.
+	ctx, cancel := context.WithCancel(conn.ctx)
 	hc := &HandlerConsumer{
 		conn:        conn,
 		consumer:    consumer,

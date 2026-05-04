@@ -56,6 +56,10 @@ type Connection struct {
 // provided pgx PoolConfig.
 //
 // The returned Connection owns the pool and will Close() it during shutdown.
+//
+// ctx is bootstrap-only: it bounds pgxpool.NewWithConfig at construction time
+// and is not retained by the returned Connection. Cancelling it after Dial
+// returns has no effect — call Close() to shut down the Connection.
 func Dial(ctx context.Context, config *pgxpool.Config, opts ...ConnectionOption) (*Connection, error) {
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
@@ -67,12 +71,22 @@ func Dial(ctx context.Context, config *pgxpool.Config, opts ...ConnectionOption)
 // DialFromPool creates a new Connection using an existing Pool implementation
 // (typically *pgxpool.Pool). The Connection does not own the pool and will not
 // close it on Connection.Close().
-func DialFromPool(ctx context.Context, pool Pool, opts ...ConnectionOption) (*Connection, error) {
-	return newConnection(ctx, pool, false, opts...)
+//
+// No ctx parameter: this constructor performs no I/O. The Pool is already
+// alive; Connection just stores a reference. Lifetime is owned by Close().
+func DialFromPool(pool Pool, opts ...ConnectionOption) (*Connection, error) {
+	return newConnection(context.Background(), pool, false, opts...)
 }
 
-func newConnection(ctx context.Context, pool Pool, ownPool bool, opts ...ConnectionOption) (*Connection, error) {
-	ctx, cancel := context.WithCancel(ctx)
+func newConnection(_ context.Context, pool Pool, ownPool bool, opts ...ConnectionOption) (*Connection, error) {
+	// Connection lifetime is owned by Close(), not by the caller's ctx.
+	// Deriving Connection.ctx from a user-supplied ctx (which we used to
+	// do) violated the canonical Go pattern (see pgxpool.New, amqp.Dial,
+	// sql.Open): the ctx parameter limits the bootstrap call, but the
+	// returned long-lived resource is managed via its own Close()/Stop()
+	// methods. The user ctx is therefore intentionally ignored here —
+	// it's used only by Dial for the pgxpool bootstrap call.
+	ctx, cancel := context.WithCancel(context.Background())
 	conn := &Connection{
 		pool:                pool,
 		ownPool:             ownPool,
@@ -322,11 +336,14 @@ func (c *Connection) PublishWithTx(ctx context.Context, tx Tx, topic string, pay
 //   - Backpressure: Messages are fetched in batches (WithBatchSize) and new
 //     fetches are driven by LISTEN/NOTIFY and polling (WithCheckTimeout).
 //
+// No ctx parameter: this constructor performs no I/O. Consumer lifetime is
+// owned by Consumer.Stop() and Connection.Close().
+//
 // Shutdown:
 //   - Consumer.Stop() releases buffered messages that were not delivered to the
 //     client yet (no attempt), and waits for in‑flight messages to complete or
 //     be released.
-func (c *Connection) Consume(ctx context.Context, queue string, opts ...ConsumeOption) (*Consumer, error) {
+func (c *Connection) Consume(queue string, opts ...ConsumeOption) (*Consumer, error) {
 	options := defaultConsumeOptions()
 	for _, opt := range opts {
 		opt(&options)
@@ -377,18 +394,16 @@ func (c *Connection) Consume(ctx context.Context, queue string, opts ...ConsumeO
 // returns without calling either, the message is automatically acked. If the
 // handler panics, the message is automatically nacked.
 //
-// The context passed to the handler is cancelled when the consumer is stopping -
-// handlers should check ctx.Done() and return promptly.
+// Each handler invocation receives msg.StoppedCtx, which is cancelled when
+// the consumer begins shutting down (HandlerConsumer.Stop or
+// Connection.Close). Handlers should check ctx.Done() and return promptly.
 //
-// Parameters:
-//   - ctx: Context for cancellation. Cancelling this context stops the consumer.
-//   - queue: Name of the queue to consume from.
-//   - handler: Function to process each message.
-//   - opts: Options to configure the handler consumer (WithMaxInFlight, etc.).
+// No ctx parameter: this constructor performs no I/O. Consumer lifetime is
+// owned by HandlerConsumer.Stop() and Connection.Close().
 //
 // Example:
 //
-//	hc, err := conn.ConsumeHandler(ctx, "orders",
+//	hc, err := conn.ConsumeHandler("orders",
 //	    func(ctx context.Context, msg *postgremq.Message) {
 //	        select {
 //	        case <-ctx.Done():
@@ -406,7 +421,6 @@ func (c *Connection) Consume(ctx context.Context, queue string, opts ...ConsumeO
 //	    postgremq.WithMaxInFlight(10),
 //	)
 func (c *Connection) ConsumeHandler(
-	ctx context.Context,
 	queue string,
 	handler MessageHandler,
 	opts ...HandlerConsumeOption,
@@ -443,7 +457,7 @@ func (c *Connection) ConsumeHandler(
 		return nil, err
 	}
 
-	hc := newHandlerConsumer(ctx, c, consumer, handler, c.logger, options)
+	hc := newHandlerConsumer(c, consumer, handler, c.logger, options)
 
 	c.consumers = append(c.consumers, hc)
 

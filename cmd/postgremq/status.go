@@ -31,7 +31,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 	defer pool.Close()
 
-	status, err := postgremq.GetMigrationStatus(ctx, pool)
+	status, err := postgremq.GetMigrationStatus(pool)
 	if err != nil {
 		return fmt.Errorf("failed to get migration status: %w", err)
 	}

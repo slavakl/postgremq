@@ -36,7 +36,7 @@ func ExampleConnection_Consume() {
 	_ = conn.CreateTopic(ctx, "jobs")
 	_ = conn.CreateQueue(ctx, "worker-queue", "jobs", false)
 
-	consumer, _ := conn.Consume(ctx, "worker-queue", WithBatchSize(10), WithVT(30))
+	consumer, _ := conn.Consume("worker-queue", WithBatchSize(10), WithVT(30))
 	defer consumer.Stop()
 
 	for msg := range consumer.Messages() {
@@ -60,7 +60,7 @@ func ExampleMessage_Ack() {
 	_ = conn.CreateTopic(ctx, "events")
 	_ = conn.CreateQueue(ctx, "events-q", "events", false)
 
-	consumer, _ := conn.Consume(ctx, "events-q", WithVT(60))
+	consumer, _ := conn.Consume("events-q", WithVT(60))
 	defer consumer.Stop()
 
 	msg := <-consumer.Messages()

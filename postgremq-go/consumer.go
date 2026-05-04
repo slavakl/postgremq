@@ -551,7 +551,7 @@ func (c *Consumer) Messages() <-chan *Message {
 //
 // Example:
 //
-//	consumer, _ := conn.Consume(ctx, "queue-name")
+//	consumer, _ := conn.Consume("queue-name")
 //	defer consumer.Stop()
 //
 //	for msg := range consumer.Messages() {

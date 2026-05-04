@@ -19,7 +19,7 @@ func TestErrLeaseLost_AckTwice(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -28,7 +28,7 @@ func TestErrLeaseLost_AckTwice(t *testing.T) {
 	_, err = conn.Publish(ctx, "ELLTopic", json.RawMessage(`{}`))
 	require.NoError(t, err)
 
-	consumer, err := conn.Consume(ctx, "ELLQueue", postgremq.WithVT(30))
+	consumer, err := conn.Consume("ELLQueue", postgremq.WithVT(30))
 	require.NoError(t, err)
 	defer consumer.Stop()
 
@@ -52,7 +52,7 @@ func TestErrLeaseLost_SetVTAfterExpiry(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -62,7 +62,7 @@ func TestErrLeaseLost_SetVTAfterExpiry(t *testing.T) {
 	require.NoError(t, err)
 
 	// Consume with a tiny vt and disable auto-extension so the lease lapses.
-	consumer, err := conn.Consume(ctx, "VTLossQueue",
+	consumer, err := conn.Consume("VTLossQueue",
 		postgremq.WithVT(1),
 		postgremq.WithNoAutoExtension(),
 	)
@@ -93,7 +93,7 @@ func TestErrLeaseLost_NackAfterStolen(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -102,7 +102,7 @@ func TestErrLeaseLost_NackAfterStolen(t *testing.T) {
 	_, err = conn.Publish(ctx, "StolenTopic", json.RawMessage(`{}`))
 	require.NoError(t, err)
 
-	consumer, err := conn.Consume(ctx, "StolenQueue",
+	consumer, err := conn.Consume("StolenQueue",
 		postgremq.WithVT(1),
 		postgremq.WithNoAutoExtension(),
 	)
@@ -133,7 +133,7 @@ func TestErrLeaseLost_ReleaseAfterAck(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -142,7 +142,7 @@ func TestErrLeaseLost_ReleaseAfterAck(t *testing.T) {
 	_, err = conn.Publish(ctx, "RelLLTopic", json.RawMessage(`{}`))
 	require.NoError(t, err)
 
-	consumer, err := conn.Consume(ctx, "RelLLQueue", postgremq.WithVT(30))
+	consumer, err := conn.Consume("RelLLQueue", postgremq.WithVT(30))
 	require.NoError(t, err)
 	defer consumer.Stop()
 
@@ -162,7 +162,7 @@ func TestErrQueueNotFound_PublishUnknownTopic(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -180,7 +180,7 @@ func TestErrQueueNotFound_CreateQueueUnknownTopic(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -197,7 +197,7 @@ func TestErrValidation_SetVTNegative(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -206,7 +206,7 @@ func TestErrValidation_SetVTNegative(t *testing.T) {
 	_, err = conn.Publish(ctx, "ValTopic", json.RawMessage(`{}`))
 	require.NoError(t, err)
 
-	consumer, err := conn.Consume(ctx, "ValQueue", postgremq.WithVT(30))
+	consumer, err := conn.Consume("ValQueue", postgremq.WithVT(30))
 	require.NoError(t, err)
 	defer consumer.Stop()
 
@@ -227,7 +227,7 @@ func TestErrValidation_CreateTopicInvalidName(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -244,7 +244,7 @@ func TestErrValidation_CreateQueueInvalidName(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -264,7 +264,7 @@ func TestErrValidation_QueueParamMismatch(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -289,7 +289,7 @@ func TestCreateQueue_Idempotent(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -311,7 +311,7 @@ func TestErrValidation_DeleteTopicWithMessages(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -333,7 +333,7 @@ func TestErrValidation_SetVTBatchMismatchedArrays(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 

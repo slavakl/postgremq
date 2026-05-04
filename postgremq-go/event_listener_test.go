@@ -54,7 +54,7 @@ func TestPerTopicNotify_CacheHit(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -68,7 +68,7 @@ func TestPerTopicNotify_CacheHit(t *testing.T) {
 	_, err = pool.Exec(ctx, "DELETE FROM queues WHERE name = $1", queue)
 	require.NoError(t, err)
 
-	consumer, err := conn.Consume(ctx, queue, postgremq.WithVT(30))
+	consumer, err := conn.Consume(queue, postgremq.WithVT(30))
 	require.NoError(t, err)
 	consumer.Stop()
 }
@@ -89,17 +89,17 @@ func TestPerTopicNotify_OutOfBandQueueNeedsWithTopic(t *testing.T) {
 	_, err = pool.Exec(ctx, "SELECT create_queue($1, $2, 0, false, interval '30 seconds')", queue, topic)
 	require.NoError(t, err)
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
 	// Without WithTopic, Consume errors because the cache is empty.
-	_, err = conn.Consume(ctx, queue, postgremq.WithVT(30))
+	_, err = conn.Consume(queue, postgremq.WithVT(30))
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, postgremq.ErrQueueNotFound))
 
 	// With WithTopic, it succeeds.
-	consumer, err := conn.Consume(ctx, queue, postgremq.WithVT(30), postgremq.WithTopic(topic))
+	consumer, err := conn.Consume(queue, postgremq.WithVT(30), postgremq.WithTopic(topic))
 	require.NoError(t, err)
 	consumer.Stop()
 }
@@ -109,14 +109,14 @@ func TestPerTopicNotify_OutOfBandQueueNeedsWithTopic(t *testing.T) {
 // listener registration succeeds.
 func TestPerTopicNotify_WithTopicOption(t *testing.T) {
 	t.Parallel()
-	pool, ctx := setupTestConnection(t)
+	pool, _ := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
-	consumer, err := conn.Consume(ctx, "QueueDoesNotExistInDB",
+	consumer, err := conn.Consume("QueueDoesNotExistInDB",
 		postgremq.WithVT(30),
 		postgremq.WithTopic("ExplicitTopic"),
 	)
@@ -129,14 +129,14 @@ func TestPerTopicNotify_WithTopicOption(t *testing.T) {
 // ErrQueueNotFound.
 func TestPerTopicNotify_UnknownQueueReturnsError(t *testing.T) {
 	t.Parallel()
-	pool, ctx := setupTestConnection(t)
+	pool, _ := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
-	_, err = conn.Consume(ctx, "GhostQueue", postgremq.WithVT(30))
+	_, err = conn.Consume("GhostQueue", postgremq.WithVT(30))
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, postgremq.ErrQueueNotFound),
 		"expected ErrQueueNotFound, got: %v", err)
@@ -149,7 +149,7 @@ func TestPerTopicNotify_RefcountSharing(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -160,9 +160,9 @@ func TestPerTopicNotify_RefcountSharing(t *testing.T) {
 	require.NoError(t, conn.CreateQueue(ctx, queueA, topic, false, postgremq.WithMaxDeliveryAttempts(0)))
 	require.NoError(t, conn.CreateQueue(ctx, queueB, topic, false, postgremq.WithMaxDeliveryAttempts(0)))
 
-	c1, err := conn.Consume(ctx, queueA, postgremq.WithVT(30))
+	c1, err := conn.Consume(queueA, postgremq.WithVT(30))
 	require.NoError(t, err)
-	c2, err := conn.Consume(ctx, queueB, postgremq.WithVT(30))
+	c2, err := conn.Consume(queueB, postgremq.WithVT(30))
 	require.NoError(t, err)
 
 	// Brief settle so both subscriptions have registered.
@@ -196,7 +196,7 @@ func TestEventListener_DeliversTopicNotify(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -227,7 +227,7 @@ func TestEventListener_DeliversQueueNotify(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -261,7 +261,7 @@ func TestEventListener_PublishTriggersTopicNotify(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -295,7 +295,7 @@ func TestEventListener_NackTriggersPerQueueNotify(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -341,7 +341,7 @@ func TestEventListener_ReleaseTriggersPerQueueNotify(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -381,10 +381,10 @@ func TestEventListener_ReleaseTriggersPerQueueNotify(t *testing.T) {
 // Consumer-driven path left them open.
 func TestEventListener_HandleCloseClosesWake(t *testing.T) {
 	t.Parallel()
-	pool, ctx := setupTestConnection(t)
+	pool, _ := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -415,10 +415,10 @@ func TestEventListener_HandleCloseClosesWake(t *testing.T) {
 // closes the wake channels of any handles still registered.
 func TestEventListener_CloseClosesRemainingWakes(t *testing.T) {
 	t.Parallel()
-	pool, ctx := setupTestConnection(t)
+	pool, _ := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 
 	conn.EventListener().Start()
@@ -443,7 +443,7 @@ func TestEventListener_DispatchDoesNotPanicOnConcurrentClose(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -491,10 +491,10 @@ func TestEventListener_DispatchDoesNotPanicOnConcurrentClose(t *testing.T) {
 // timeout due to pool exhaustion.
 func TestEventListener_NotifyDrainerCoalescesChurn(t *testing.T) {
 	t.Parallel()
-	pool, ctx := setupTestConnection(t)
+	pool, _ := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -524,7 +524,7 @@ func TestEventListener_MultipleSubscribersAllReceive(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -592,10 +592,10 @@ func assertChannelClosed(t *testing.T, ch <-chan struct{}, msg string) {
 // with a different channel — the same reference must come back.
 func TestEventListener_StartAfterCloseIsNoOp(t *testing.T) {
 	t.Parallel()
-	pool, ctx := setupTestConnection(t)
+	pool, _ := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 
 	el := conn.EventListener()

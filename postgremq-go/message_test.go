@@ -25,7 +25,7 @@ func TestMessageAcknowledgment(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -41,7 +41,7 @@ func TestMessageAcknowledgment(t *testing.T) {
 	messageID, err := conn.Publish(ctx, topicName, []byte(`{"test":"ack"}`))
 	require.NoError(t, err, "Failed to publish message")
 
-	consumer, err := conn.Consume(ctx, queueName)
+	consumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Failed to create consumer")
 	defer consumer.Stop()
 
@@ -68,7 +68,7 @@ func TestMessageNegativeAcknowledgment(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -84,7 +84,7 @@ func TestMessageNegativeAcknowledgment(t *testing.T) {
 	messageID, err := conn.Publish(ctx, topicName, []byte(`{"test":"nack"}`))
 	require.NoError(t, err, "Failed to publish message")
 
-	consumer, err := conn.Consume(ctx, queueName)
+	consumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Failed to create consumer")
 	defer consumer.Stop()
 
@@ -113,7 +113,7 @@ func TestMessageVisibilityTimeout(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -129,7 +129,7 @@ func TestMessageVisibilityTimeout(t *testing.T) {
 	messageID, err := conn.Publish(ctx, topicName, []byte(`{"test":"vt"}`))
 	require.NoError(t, err, "Failed to publish message")
 
-	consumer, err := conn.Consume(ctx, queueName, postgremq.WithVT(5))
+	consumer, err := conn.Consume(queueName, postgremq.WithVT(5))
 	require.NoError(t, err, "Failed to create consumer")
 	defer consumer.Stop()
 
@@ -160,7 +160,7 @@ func TestMessageDelayedDelivery(t *testing.T) {
 	defer pool.Close()
 
 	logger := MockLogger{}
-	conn, err := postgremq.DialFromPool(ctx, pool, postgremq.WithLogger(&logger))
+	conn, err := postgremq.DialFromPool(pool, postgremq.WithLogger(&logger))
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -177,7 +177,7 @@ func TestMessageDelayedDelivery(t *testing.T) {
 	messageID, err := conn.Publish(ctx, topicName, []byte(`{"test":"delayed"}`), postgremq.WithDeliverAfter(deliverAfter.UTC()))
 	require.NoError(t, err, "Failed to publish message")
 
-	consumer, err := conn.Consume(ctx, queueName)
+	consumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Failed to create consumer")
 	defer consumer.Stop()
 
@@ -211,7 +211,7 @@ func TestMessageDelayedRedelivery(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -227,7 +227,7 @@ func TestMessageDelayedRedelivery(t *testing.T) {
 	messageID, err := conn.Publish(ctx, topicName, []byte(`{"test":"delayed-nack"}`))
 	require.NoError(t, err, "Failed to publish message")
 
-	consumer, err := conn.Consume(ctx, queueName)
+	consumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Failed to create consumer")
 	defer consumer.Stop()
 
@@ -267,7 +267,7 @@ func TestMessageStatusTransitions(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -290,7 +290,7 @@ func TestMessageStatusTransitions(t *testing.T) {
 	assert.Equal(t, messageID, messages[0].MessageID, "Message ID mismatch")
 	assert.Equal(t, postgremq.MessageStatusPending, messages[0].Status, "Message should be pending on publication")
 
-	consumer, err := conn.Consume(ctx, queueName)
+	consumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Failed to create consumer")
 	defer consumer.Stop()
 
@@ -323,7 +323,7 @@ func TestMessageProperties(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -355,7 +355,7 @@ func TestMessageProperties(t *testing.T) {
 	messageID, err := conn.Publish(ctx, topicName, payload)
 	require.NoError(t, err, "Failed to publish message")
 
-	consumer, err := conn.Consume(ctx, queueName)
+	consumer, err := conn.Consume(queueName)
 	require.NoError(t, err, "Failed to create consumer")
 	defer consumer.Stop()
 
@@ -393,7 +393,7 @@ func TestAckWithTx(t *testing.T) {
 	// Test Case 1: Successful commit of acknowledge
 	t.Run("CommitTransaction", func(t *testing.T) {
 
-		conn, err := postgremq.DialFromPool(ctx, pool)
+		conn, err := postgremq.DialFromPool(pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 
@@ -414,7 +414,7 @@ func TestAckWithTx(t *testing.T) {
 		require.Greater(t, msgID, int64(0), "Message ID should be positive")
 
 		// Consume the message
-		consumer, err := conn.Consume(ctx, queueName)
+		consumer, err := conn.Consume(queueName)
 		require.NoError(t, err, "Failed to create consumer")
 		defer consumer.Stop()
 
@@ -448,7 +448,7 @@ func TestAckWithTx(t *testing.T) {
 	t.Run("RollbackTransaction", func(t *testing.T) {
 
 		cleanTestData(t, pool, ctx)
-		conn, err := postgremq.DialFromPool(ctx, pool)
+		conn, err := postgremq.DialFromPool(pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 
@@ -469,7 +469,7 @@ func TestAckWithTx(t *testing.T) {
 		require.Greater(t, msgID, int64(0), "Message ID should be positive")
 
 		// Consume the message with a very short visibility timeout (1 second)
-		consumer, err := conn.Consume(ctx, queueName, postgremq.WithVT(1), postgremq.WithCheckTimeout(1*time.Second))
+		consumer, err := conn.Consume(queueName, postgremq.WithVT(1), postgremq.WithCheckTimeout(1*time.Second))
 		require.NoError(t, err, "Failed to create consumer")
 		defer consumer.Stop()
 
@@ -525,7 +525,7 @@ func TestMessageID_BeyondInt32(t *testing.T) {
 	_, err := pool.Exec(ctx, "SELECT setval('messages_id_seq', $1)", seedTo)
 	require.NoError(t, err, "setval messages_id_seq")
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -538,7 +538,7 @@ func TestMessageID_BeyondInt32(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, publishedID, int64(seedTo), "publish_message must hand back the post-setval id")
 
-	consumer, err := conn.Consume(ctx, queueName)
+	consumer, err := conn.Consume(queueName)
 	require.NoError(t, err)
 	defer consumer.Stop()
 

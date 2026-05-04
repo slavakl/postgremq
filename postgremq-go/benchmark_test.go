@@ -41,7 +41,7 @@ func setupBenchConnection(b *testing.B) (*pgxpool.Pool, context.Context) {
 
 // cleanBenchData cleans test data for benchmarks
 func cleanBenchData(b *testing.B, pool *pgxpool.Pool, ctx context.Context) {
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	if err != nil {
 		b.Fatalf("Failed to create connection for cleanup: %v", err)
 	}
@@ -95,7 +95,7 @@ func BenchmarkMessagePublishing(b *testing.B) {
 	defer pool.Close()
 	defer cleanBenchData(b, pool, ctx)
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(b, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -141,7 +141,7 @@ func BenchmarkPublishConsume(b *testing.B) {
 	defer pool.Close()
 	defer cleanBenchData(b, pool, ctx)
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(b, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -161,7 +161,7 @@ func BenchmarkPublishConsume(b *testing.B) {
 
 		b.Run(fmt.Sprintf("PayloadSize_%dB", size), func(b *testing.B) {
 			// Create a consumer
-			consumer, err := conn.Consume(ctx, queueName, postgremq.WithBatchSize(10))
+			consumer, err := conn.Consume(queueName, postgremq.WithBatchSize(10))
 			require.NoError(b, err, "Failed to create consumer")
 			defer consumer.Stop()
 
@@ -222,7 +222,7 @@ func BenchmarkConcurrentConsumers(b *testing.B) {
 	defer pool.Close()
 	defer cleanBenchData(b, pool, ctx)
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(b, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -246,11 +246,11 @@ func BenchmarkConcurrentConsumers(b *testing.B) {
 			connections := make([]*postgremq.Connection, numConsumers)
 
 			for i := 0; i < numConsumers; i++ {
-				consConn, err := postgremq.DialFromPool(ctx, pool)
+				consConn, err := postgremq.DialFromPool(pool)
 				require.NoError(b, err, "Failed to create consumer connection")
 				connections[i] = consConn
 
-				consumer, err := consConn.Consume(ctx, queueName)
+				consumer, err := consConn.Consume(queueName)
 				require.NoError(b, err, "Failed to create consumer")
 				consumers[i] = consumer
 			}
@@ -335,7 +335,7 @@ func BenchmarkBatchProcessing(b *testing.B) {
 	defer pool.Close()
 	defer cleanBenchData(b, pool, ctx)
 
-	conn, err := postgremq.DialFromPool(ctx, pool)
+	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(b, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -367,7 +367,7 @@ func BenchmarkBatchProcessing(b *testing.B) {
 			}
 
 			// Create consumer with the specific batch size
-			consumer, err := conn.Consume(ctx, queueName,
+			consumer, err := conn.Consume(queueName,
 				postgremq.WithBatchSize(batchSize))
 			require.NoError(b, err, "Failed to create consumer")
 			defer consumer.Stop()
