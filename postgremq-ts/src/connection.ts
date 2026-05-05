@@ -24,7 +24,7 @@ import {
 } from './types';
 import { Consumer as ConsumerImpl } from './consumer';
 import { EventEmitter, DEFAULT_RETRY_POLICY, shouldRetry, sleep, withRetry } from './utils';
-import { mapDbError } from './errors';
+import { mapDbError, ConnectionClosedError } from './errors';
 
 /** Subscriber callback fires whenever a NOTIFY arrives on the subscribed
  *  channel. NOTIFYs from PostgreMQ carry no payload — the channel name is
@@ -178,20 +178,31 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Connect to the database and start the notification listener
+   * Connect to the database and start the notification listener.
+   *
+   * close() is terminal — once a connection has been closed, calling
+   * connect() again throws ConnectionClosedError rather than silently
+   * succeeding into a half-broken state (the pool may have been .end()'d,
+   * notification machinery torn down, etc.). Callers must construct a
+   * new Connection to reconnect.
+   *
    * @returns Promise that resolves when connected
+   * @throws ConnectionClosedError if close() has already been called.
    */
   async connect(): Promise<void> {
+    if (this.isShuttingDown) {
+      throw new ConnectionClosedError();
+    }
     if (this.connected) {
       return;
     }
-    
+
     try {
       // Test the connection by getting a client and releasing it
       const client = await this.pool.connect();
       await client.query('SELECT 1');
       client.release();
-      
+
       this.connected = true;
     } catch (error: any) {
       throw new Error(`Failed to connect to PostgreSQL: ${error.message}`);

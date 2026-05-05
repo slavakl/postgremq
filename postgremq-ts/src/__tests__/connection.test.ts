@@ -12,6 +12,7 @@ import {
   assertThrows
 } from './helpers';
 import { Connection } from '../connection';
+import { ConnectionClosedError } from '../errors';
 
 describe('Connection', () => {
   let testDb: TestDatabase;
@@ -69,6 +70,17 @@ describe('Connection', () => {
         () => connection.createTopic('test'),
         'not connected'
       );
+    });
+
+    // close() is terminal: re-calling connect() after close() must reject
+    // rather than silently succeeding into a half-broken state (the pool
+    // may have been .end()'d, notification listener torn down, etc.).
+    test('connect() after close() rejects with ConnectionClosedError', async () => {
+      const conn = new Connection({ connectionString: testDb.connectionString });
+      await conn.connect();
+      await conn.close();
+
+      await expect(conn.connect()).rejects.toBeInstanceOf(ConnectionClosedError);
     });
 
     test('should support connection pool reuse', async () => {

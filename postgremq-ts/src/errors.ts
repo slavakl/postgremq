@@ -62,6 +62,21 @@ export class ValidationError extends Error {
 }
 
 /**
+ * ConnectionClosedError is thrown by `connect()` when the connection has
+ * already been closed. close() is terminal: a connection cannot be
+ * resurrected — callers must construct a new Connection. Mirrors the Go
+ * client's ErrConnectionClosed sentinel.
+ *
+ * Pure client-side error (no SQLSTATE), so it carries no `code`.
+ */
+export class ConnectionClosedError extends Error {
+  constructor(message: string = 'Connection has been closed; construct a new Connection to reconnect') {
+    super(message);
+    this.name = 'ConnectionClosedError';
+  }
+}
+
+/**
  * Map a database error to one of the typed errors, if its SQLSTATE matches
  * a PostgreMQ code. Otherwise returns the input unchanged. nil pass-through.
  *

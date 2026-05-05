@@ -29,6 +29,7 @@ export {
   LeaseLostError,
   QueueNotFoundError,
   ValidationError,
+  ConnectionClosedError,
   ErrCodeLeaseLost,
   ErrCodeQueueNotFound,
   ErrCodeValidation,
