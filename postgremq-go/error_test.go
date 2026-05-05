@@ -25,6 +25,57 @@ import (
 // Error Handling Tests
 // -----------------------------------------------------------------------
 
+// TestIsRetryableError_Classification covers the per-SQLSTATE classification
+// done by IsRetryableError. The pre-fix substring fallback matched any
+// error whose text contained "08" — including timestamps like "08:00:00",
+// file paths, byte counts — producing spurious retries on permanent
+// failures. (REVIEW.md §3.7)
+func TestIsRetryableError_Classification(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		err       error
+		retryable bool
+	}{
+		// Retryable PG codes
+		{"40001 serialization_failure", &pgconn.PgError{Code: "40001"}, true},
+		{"40P01 deadlock_detected", &pgconn.PgError{Code: "40P01"}, true},
+		{"08000 connection_exception", &pgconn.PgError{Code: "08000"}, true},
+		{"08006 connection_failure", &pgconn.PgError{Code: "08006"}, true},
+		{"57P01 admin_shutdown", &pgconn.PgError{Code: "57P01"}, true},
+		{"57P02 crash_shutdown", &pgconn.PgError{Code: "57P02"}, true},
+		{"57P03 cannot_connect_now", &pgconn.PgError{Code: "57P03"}, true},
+
+		// Wrapped retryable PG error: errors.As must still find it.
+		{"wrapped 40001", fmt.Errorf("call failed: %w", &pgconn.PgError{Code: "40001"}), true},
+
+		// Non-retryable PG codes
+		{"PMQ01 lease_lost", &pgconn.PgError{Code: "PMQ01"}, false},
+		{"PMQ02 not_found", &pgconn.PgError{Code: "PMQ02"}, false},
+		{"PMQ03 validation", &pgconn.PgError{Code: "PMQ03"}, false},
+		{"23505 unique_violation", &pgconn.PgError{Code: "23505"}, false},
+
+		// Non-PgError errors must not be retryable. The pre-fix code
+		// would have flagged these as retryable because their text
+		// contains "08".
+		{"timestamp string contains 08", errors.New("query failed at 08:00:00"), false},
+		{"file path with 08", errors.New("error in /var/log/0801.log"), false},
+		{"40001 in random text", errors.New("error code 40001 in payload but not a PG error"), false},
+		{"plain message", errors.New("something broke"), false},
+		{"nil-like wrapped non-pg", fmt.Errorf("layered: %w", errors.New("eof")), false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := postgremq.IsRetryableError(tc.err)
+			assert.Equal(t, tc.retryable, got, "err=%v", tc.err)
+		})
+	}
+}
+
 // MockDisconnectingPool wraps a real pool and simulates connection loss
 type MockDisconnectingPool struct {
 	RealPool     *pgxpool.Pool // The actual database pool

@@ -16,11 +16,25 @@ const transientNodeErrorCodes = new Set([
   'EAI_AGAIN'
 ]);
 
-// Define transient SQLSTATE codes for PostgreSQL errors
+// Transient SQLSTATE codes for PostgreSQL errors that should trigger a retry:
+//   - 40001 (serialization_failure), 40P01 (deadlock_detected): transaction
+//     conflicts that may resolve on retry.
+//   - 57P01 (admin_shutdown), 57P02 (crash_shutdown), 57P03
+//     (cannot_connect_now): server-side restart / failover; retries succeed
+//     once the server is available.
+// Class 08 (connection_exception) codes are matched by prefix below.
 const transientSQLStateCodes = new Set([
-  '40001', // serialization_failure
-  '40P01'  // deadlock_detected
+  '40001',
+  '40P01',
+  '57P01',
+  '57P02',
+  '57P03',
 ]);
+
+function isTransientSQLState(code: unknown): boolean {
+  if (typeof code !== 'string') return false;
+  return transientSQLStateCodes.has(code) || code.startsWith('08');
+}
 
 /**
  * Determines if an error should trigger a retry.
@@ -28,25 +42,21 @@ const transientSQLStateCodes = new Set([
  * @returns {boolean} - True if the error is transient and can be retried.
  */
 export function shouldRetry(error: any): boolean {
-  // First, check if it's a Node.js network error.
-  if (error.code && transientNodeErrorCodes.has(error.code)) {
+  // Network-level error from Node (no SQLSTATE).
+  if (error?.code && transientNodeErrorCodes.has(error.code)) {
     return true;
   }
-  
-  /* 
-   * PostgreSQL errors include a SQLSTATE code in the error object.
-   * Depending on node-postgres version and error type, the SQLSTATE may be in error.code
-   * or as a separate property like error.sqlState.
-   */
-  if (error.sqlState && transientSQLStateCodes.has(error.sqlState)) {
+
+  // PostgreSQL errors include a SQLSTATE code. Depending on node-postgres
+  // version and the error class, it may be on `error.code` or
+  // `error.sqlState`. Try both.
+  if (isTransientSQLState(error?.sqlState)) {
     return true;
   }
-  
-  // In some cases, error.code itself is the SQLSTATE code.
-  if (error.code && transientSQLStateCodes.has(error.code)) {
+  if (isTransientSQLState(error?.code)) {
     return true;
   }
-  
+
   return false;
 }
 

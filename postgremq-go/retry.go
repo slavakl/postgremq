@@ -12,9 +12,9 @@ import (
 // RetryConfig holds configuration for automatic retry of transient database errors.
 //
 // The client automatically retries operations that fail due to:
+//   - Serialization failures (40001) and deadlock detection (40P01)
 //   - Connection failures (PostgreSQL error class 08)
-//   - Serialization failures (PostgreSQL error code 40001)
-//   - Deadlock detection (PostgreSQL error code 40P01)
+//   - Admin shutdown / crash shutdown / cannot-connect-now (57P01/57P02/57P03)
 //
 // Retry uses exponential backoff with jitter to avoid thundering herd problems.
 type RetryConfig struct {
@@ -53,26 +53,32 @@ func defaultRetryConfig() RetryConfig {
 // IsRetryableError determines if an error represents a transient database failure
 // that should trigger a retry.
 //
-// Retryable errors include:
-//   - Serialization failures (40001): Transaction conflicts that can succeed on retry
-//   - Deadlock detection (40P01): Deadlocks that may resolve on retry
-//   - Connection errors (08xxx): Network failures, connection timeouts, etc.
+// Retryable PostgreSQL SQLSTATE codes:
+//   - 40001 (serialization_failure): Transaction conflicts.
+//   - 40P01 (deadlock_detected): Deadlocks that may resolve on retry.
+//   - Class 08 (connection_exception): Network failures, broken connections.
+//   - 57P01 (admin_shutdown): Operator restarted the server (graceful).
+//   - 57P02 (crash_shutdown): Server crashed and is restarting.
+//   - 57P03 (cannot_connect_now): Server is starting up / in recovery.
 //
-// Returns true if the operation should be retried, false otherwise.
+// Returns true if the operation should be retried, false otherwise. The error
+// must unwrap to a *pgconn.PgError; we deliberately do NOT fall back to
+// string-matching the error text — the previous fallback `strings.Contains
+// (errStr, "08")` matched timestamps ("08:00:00"), file paths, and any
+// other place where "08" appeared, producing spurious retries on permanent
+// failures.
 func IsRetryableError(err error) bool {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		if pgErr.Code == "40001" || pgErr.Code == "40P01" || strings.HasPrefix(pgErr.Code, "08") {
-			return true
-		}
+	if !errors.As(err, &pgErr) {
 		return false
 	}
-	// Fallback: Check if the error text contains known retryable codes.
-	errStr := err.Error()
-	if strings.Contains(errStr, "40001") || strings.Contains(errStr, "40P01") || strings.Contains(errStr, "08") {
+	switch pgErr.Code {
+	case "40001", "40P01":
+		return true
+	case "57P01", "57P02", "57P03":
 		return true
 	}
-	return false
+	return strings.HasPrefix(pgErr.Code, "08")
 }
 
 // withRetry executes the given operation with retries
