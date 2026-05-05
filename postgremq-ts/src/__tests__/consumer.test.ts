@@ -112,6 +112,8 @@ describe('Consumer', () => {
       const { value: message2 } = await messages2.next();
 
       expect(message2).toBeDefined();
+      expect(typeof message1.id).toBe('number');
+      expect(typeof message2.id).toBe('number');
       expect(message2.id).toBe(message1.id);
       expect(message2.deliveryAttempts).toBe(2);
 

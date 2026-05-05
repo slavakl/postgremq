@@ -3,16 +3,7 @@
  * Connection management
  */
 
-import { Pool, PoolClient, PoolConfig, types as pgTypes } from 'pg';
-
-// PostgreSQL BIGINT (OID 20) is parsed by node-pg as a string by default to
-// avoid silent precision loss past 2^53. JS `number` covers up to
-// Number.MAX_SAFE_INTEGER (~9×10¹⁵), which is far past PostgreMQ's expected
-// id range (and significantly larger than the int32 it just replaced), so we
-// register a parser that returns a number — matching the TypeScript surface
-// (`Message.id: number`, `MessageId: number`, etc.). Process-global setting;
-// safe because PostgreMQ controls the column types it inserts.
-pgTypes.setTypeParser(20, (val: string) => parseInt(val, 10));
+import { Pool, PoolClient, PoolConfig } from 'pg';
 import {
   ConnectionOptions,
   Consumer,
@@ -632,7 +623,9 @@ export class Connection implements IConnection {
         }
 
         const result = await client.query(query, params);
-        return result.rows[0].publish_message;
+        // BIGINT columns arrive as strings from node-pg by default; convert at
+        // the read boundary to keep the rest of the client on `number`.
+        return Number(result.rows[0].publish_message);
       });
     } catch (err) {
       throw mapDbError(err);
@@ -883,7 +876,7 @@ export class Connection implements IConnection {
 
       return result.rows.map(row => ({
         queueName: row.queue_name,
-        messageId: row.message_id,
+        messageId: Number(row.message_id),
         retryCount: row.retry_count,
         publishedAt: row.published_at
       }));
@@ -969,7 +962,7 @@ export class Connection implements IConnection {
       );
       
       return result.rows.map(row => ({
-        messageId: row.message_id,
+        messageId: Number(row.message_id),
         status: row.status,
         publishedAt: row.published_at,
         deliveryAttempts: row.delivery_attempts,
@@ -1001,7 +994,7 @@ export class Connection implements IConnection {
       
       const row = result.rows[0];
       return {
-        messageId: row.message_id,
+        messageId: Number(row.message_id),
         topicName: row.topic_name,
         payload: row.payload,
         publishedAt: row.published_at
@@ -1032,7 +1025,12 @@ export class Connection implements IConnection {
           'SELECT * FROM consume_message($1, $2, $3)',
           [queueName, visibilityTimeout, limit]
         );
-        return result.rows;
+        // message_id is BIGINT; convert at the read boundary so callers see a
+        // number (matches Message.id and the rest of the public surface).
+        return result.rows.map(row => ({
+          ...row,
+          message_id: Number(row.message_id),
+        }));
       });
     } catch (err) {
       throw mapDbError(err);
@@ -1217,7 +1215,7 @@ export class Connection implements IConnection {
         // version doesn't, so read row.vt directly. (Reading row.new_vt
         // here silently produced Invalid Date for every returned tuple.)
         return result.rows.map(row => [
-          row.message_id,
+          Number(row.message_id),
           new Date(row.vt)
         ]);
       });

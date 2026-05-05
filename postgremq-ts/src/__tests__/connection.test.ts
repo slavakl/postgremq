@@ -270,6 +270,28 @@ describe('Connection', () => {
       expect(messages[0].deliveryAttempts).toBe(0);
     });
 
+    // Regression: BIGINT columns (messages.id is BIGSERIAL) used to come back as
+    // numbers only because postgremq registered a process-global pg type
+    // parser at module load. The fix dropped the global mutation and converts
+    // explicitly at every read boundary; this pins that the public surface is
+    // still typed-as-number at runtime, not silently a string.
+    test('BIGINT-bearing return values are runtime numbers', async () => {
+      const publishedId = await connection.publish('msg-topic', { test: 1 });
+      expect(typeof publishedId).toBe('number');
+
+      await sleep(100);
+
+      const listed = await connection.listMessages('msg-queue');
+      expect(listed.length).toBe(1);
+      expect(typeof listed[0].messageId).toBe('number');
+      expect(listed[0].messageId).toBe(publishedId);
+
+      const fetched = await connection.getMessage(publishedId);
+      expect(fetched).not.toBeNull();
+      expect(typeof fetched!.messageId).toBe('number');
+      expect(fetched!.messageId).toBe(publishedId);
+    });
+
     test('should delete specific queue message', async () => {
       const messageId = await connection.publish('msg-topic', { test: 'delete-me' });
 
