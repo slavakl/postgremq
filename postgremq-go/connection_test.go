@@ -72,9 +72,9 @@ type MockRows struct {
 	closed    bool
 }
 
-func (r *MockRows) Close()                                  { r.closed = true }
-func (r *MockRows) Err() error                              { return r.ErrAfter }
-func (r *MockRows) CommandTag() pgconn.CommandTag           { return pgconn.CommandTag{} }
+func (r *MockRows) Close()                                       { r.closed = true }
+func (r *MockRows) Err() error                                   { return r.ErrAfter }
+func (r *MockRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
 func (r *MockRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *MockRows) Next() bool {
 	if r.idx >= len(r.ScanFuncs) {
@@ -90,9 +90,9 @@ func (r *MockRows) Scan(dest ...any) error {
 	r.idx++
 	return fn(dest...)
 }
-func (r *MockRows) Values() ([]any, error)                  { return nil, nil }
-func (r *MockRows) RawValues() [][]byte                     { return nil }
-func (r *MockRows) Conn() *pgx.Conn                         { return nil }
+func (r *MockRows) Values() ([]any, error) { return nil, nil }
+func (r *MockRows) RawValues() [][]byte    { return nil }
+func (r *MockRows) Conn() *pgx.Conn        { return nil }
 
 // MockLogger implements Logger interface for testing
 type MockLogger struct {
@@ -809,7 +809,7 @@ func TestListQueues(t *testing.T) {
 
 	// Verify queue 1 properties
 	assert.Equal(t, topicName, queue1Info.TopicName, "Queue 1 should have correct topic name")
-	assert.Equal(t, 3, queue1Info.MaxDeliveryAttempts, "Queue 1 should have default max delivery attempts")
+	assert.Equal(t, 0, queue1Info.MaxDeliveryAttempts, "Queue 1 should have default max delivery attempts (0 = unlimited)")
 	assert.False(t, queue1Info.Exclusive, "Queue 1 should not be exclusive")
 
 	// Verify queue 2 properties

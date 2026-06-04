@@ -85,7 +85,7 @@ CREATE TABLE queues (
   topic_name VARCHAR(255) REFERENCES topics(name) ON DELETE CASCADE,
   max_delivery_attempts INT NOT NULL DEFAULT 0,
   exclusive BOOLEAN NOT NULL DEFAULT false,  -- Changed from durable
-  keep_alive_interval INTERVAL NOT NULL DEFAULT '30 seconds',
+  keep_alive_interval INTERVAL NOT NULL DEFAULT '5 minutes',
   keep_alive_until TIMESTAMPTZ
 );
 
@@ -294,7 +294,7 @@ $$ LANGUAGE plpgsql;
  *   - p_keep_alive_interval (INTERVAL): Stored on the queue and used for both the initial
  *                                       keep_alive_until (NOW() + interval) and for the
  *                                       implicit refresh in consume_message. Defaults to
- *                                       '30 seconds'. Effectively only matters for exclusive
+ *                                       '5 minutes'. Effectively only matters for exclusive
  *                                       queues; non-exclusive ones never expire.
  *
  * Returns: VOID.
@@ -309,7 +309,7 @@ CREATE OR REPLACE FUNCTION create_queue(
     p_topic_name VARCHAR(255),
     p_max_attempts INTEGER DEFAULT 0,  -- 0 = unlimited retries
     p_exclusive BOOLEAN DEFAULT false,
-    p_keep_alive_interval INTERVAL DEFAULT '30 seconds'
+    p_keep_alive_interval INTERVAL DEFAULT '5 minutes'
 ) RETURNS VOID AS $$
 DECLARE
     v_existing queues%ROWTYPE;

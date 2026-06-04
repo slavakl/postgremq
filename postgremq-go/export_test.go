@@ -1,6 +1,9 @@
 package postgremq_go
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // This file is compiled only during `go test`. It exposes a few unexported
 // pieces of state to the external `postgremq_go_test` package so internal
@@ -34,4 +37,29 @@ func (el *EventListener) StoppedChan() <-chan struct{} {
 // behavior without spinning up a Consumer goroutine. Tests only.
 func (c *Connection) ConsumeMessages(ctx context.Context, queue string, limit, vt int) ([]*Message, error) {
 	return c.consumeMessages(ctx, queue, limit, vt)
+}
+
+// CalculateExtendAt exposes the unexported method so tests can verify
+// extension-timing math directly without spinning up a real Consumer
+// goroutine + database. Tests only.
+func (c *Consumer) CalculateExtendAt(vtUntil time.Time) time.Time {
+	return c.calculateExtendAt(vtUntil)
+}
+
+// NewConsumerForTest constructs a Consumer with just the fields needed for
+// pure-math tests of CalculateExtendAt — does not start any goroutines or
+// touch the database. Tests only.
+func NewConsumerForTest(extensionThreshold float64) *Consumer {
+	return &Consumer{extensionThreshold: extensionThreshold}
+}
+
+// ValidateConsumeOptionsForTest exposes the unexported validation function
+// to external tests so option misuse can be unit-tested without spinning
+// up a real Consumer. Tests only.
+func ValidateConsumeOptionsForTest(opts ...ConsumeOption) error {
+	options := defaultConsumeOptions()
+	for _, o := range opts {
+		o(&options)
+	}
+	return validateConsumeOptions(&options)
 }

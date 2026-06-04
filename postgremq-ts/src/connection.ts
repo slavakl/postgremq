@@ -707,7 +707,8 @@ export class Connection implements IConnection {
       await this.executeWithRetry(async (client) => {
         // Always pass all parameters to avoid parameter index misalignment
         const maxDeliveryAttempts = options.maxDeliveryAttempts ?? 0;
-        const keepAliveSeconds = options.keepAliveInterval ?? 30;
+        // 5 minutes — matches the SQL function default and the Go client.
+        const keepAliveSeconds = options.keepAliveInterval ?? 300;
 
         // Scale seconds to INTERVAL via "$5 * interval '1 sec'" so the SQL
         // function can stay typed as INTERVAL without us needing a per-driver

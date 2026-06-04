@@ -234,7 +234,7 @@ func (m *Message) Release(ctx context.Context) error {
 //
 // Note: This method is typically not needed when auto-extension is enabled (default).
 // The Consumer automatically extends visibility timeouts for in-flight messages
-// at 50% of the visibility timeout period.
+// once the extension threshold elapses (default 50% — see WithExtensionThreshold).
 //
 // Example:
 //

@@ -14,25 +14,26 @@ import (
 // optionally auto‑extend their visibility timeouts, and track in‑flight
 // messages until they are Ack/Nack/Release‑d. Create via Connection.Consume.
 type Consumer struct {
-	conn             *Connection
-	queue            string
-	topic            string
-	messages         chan *Message
-	batchSize        int // number of messages to fetch in one batch
-	vtSec            int // visibility timeout in seconds
-	noAutoExtension  bool
-	checkTimeout     time.Duration // how often to check for new messages, if no events comming
-	extendBatchSize  int           // how many messages to extend in one batch
-	ctx              context.Context
-	cancel           context.CancelFunc
-	dbCtx            context.Context
-	wg               sync.WaitGroup     // wg is used to wait for all goroutines to finish
-	topicHandle      *ListenerHandle    // wakes on per-topic publish notifications
-	queueHandle      *ListenerHandle    // wakes on nack/release for this queue
-	vtMessageUpdates chan messageUpdate // signal of message updates. used to keep track of vts
-	messageUpdates   chan messageUpdate
-	inFlightFlag     chan struct{}
-	logger           LevelLogger
+	conn               *Connection
+	queue              string
+	topic              string
+	messages           chan *Message
+	batchSize          int // number of messages to fetch in one batch
+	vtSec              int // visibility timeout in seconds
+	noAutoExtension    bool
+	checkTimeout       time.Duration // how often to check for new messages, if no events comming
+	extendBatchSize    int           // how many messages to extend in one batch
+	extensionThreshold float64       // fraction of vt that must elapse before extension fires
+	ctx                context.Context
+	cancel             context.CancelFunc
+	dbCtx              context.Context
+	wg                 sync.WaitGroup     // wg is used to wait for all goroutines to finish
+	topicHandle        *ListenerHandle    // wakes on per-topic publish notifications
+	queueHandle        *ListenerHandle    // wakes on nack/release for this queue
+	vtMessageUpdates   chan messageUpdate // signal of message updates. used to keep track of vts
+	messageUpdates     chan messageUpdate
+	inFlightFlag       chan struct{}
+	logger             LevelLogger
 }
 
 type messageUpdate struct {
@@ -66,24 +67,25 @@ func newConsumerFromOptions(parentCtx context.Context, conn *Connection, logger 
 	ctx, cancel := context.WithCancel(parentCtx)
 	dbCtx := context.Background() // some operations should not be cancelled by consumer stop
 	return &Consumer{
-		conn:             conn,
-		queue:            queue,
-		topic:            options.topic,
-		messages:         make(chan *Message, options.batchSize),
-		batchSize:        options.batchSize,
-		vtSec:            options.vt,
-		noAutoExtension:  options.noAutoExtension,
-		checkTimeout:     options.checkTimeout,
-		extendBatchSize:  options.extendBatchSize,
-		ctx:              ctx,
-		cancel:           cancel,
-		dbCtx:            dbCtx,
-		topicHandle:      topicHandle,
-		queueHandle:      queueHandle,
-		vtMessageUpdates: make(chan messageUpdate, options.batchSize*2),
-		messageUpdates:   make(chan messageUpdate, 100), // Buffered to avoid blocking during shutdown
-		inFlightFlag:     make(chan struct{}),
-		logger:           logger,
+		conn:               conn,
+		queue:              queue,
+		topic:              options.topic,
+		messages:           make(chan *Message, options.batchSize),
+		batchSize:          options.batchSize,
+		vtSec:              options.vt,
+		noAutoExtension:    options.noAutoExtension,
+		checkTimeout:       options.checkTimeout,
+		extendBatchSize:    options.extendBatchSize,
+		extensionThreshold: options.extensionThreshold,
+		ctx:                ctx,
+		cancel:             cancel,
+		dbCtx:              dbCtx,
+		topicHandle:        topicHandle,
+		queueHandle:        queueHandle,
+		vtMessageUpdates:   make(chan messageUpdate, options.batchSize*2),
+		messageUpdates:     make(chan messageUpdate, 100), // Buffered to avoid blocking during shutdown
+		inFlightFlag:       make(chan struct{}),
+		logger:             logger,
 	}, nil
 }
 
@@ -317,22 +319,26 @@ type vtInfo struct {
 
 // calculateExtendAt calculates when to extend the message's visibility timeout.
 //
-// We extend at the halfway point (50%) to ensure the message doesn't become
-// visible to other consumers while still being processed. This provides a
-// safety margin for network latency and extension execution time.
+// Extension fires once `extensionThreshold` of the remaining VT has elapsed
+// (default 0.5 — halfway through the lease), leaving the rest as headroom
+// for network latency and extension execution time. Lower thresholds extend
+// earlier (more headroom, more DB calls); higher thresholds extend later.
 //
-// For example, with VT=60s:
+// Example with VT=60s and threshold=0.5:
 //   - Message locked until: 12:00:60
 //   - Extension triggered at: 12:00:30 (halfway point)
 //   - After extension: locked until 12:01:30
 //
-// Returns the timestamp when extension should occur, or now if VT has already expired.
-func calculateExtendAt(vtUntil time.Time) time.Time {
+// Returns the timestamp when extension should occur, or now if VT has
+// already expired.
+func (c *Consumer) calculateExtendAt(vtUntil time.Time) time.Time {
 	remaining := time.Until(vtUntil)
 	if remaining < 0 {
 		return time.Now()
 	}
-	return time.Now().Add(remaining / 2)
+	// Wait `threshold` of the remaining time, then extend. With threshold
+	// 0.5 this is the historical "halfway point" behavior.
+	return time.Now().Add(time.Duration(float64(remaining) * c.extensionThreshold))
 }
 
 func (c *Consumer) startExtendLoop() {
@@ -398,7 +404,7 @@ func (c *Consumer) startExtendLoop() {
 					vts.push(&vtInfo{
 						messageID:     update.msg.ID,
 						consumerToken: update.msg.consumerToken,
-						extendAt:      calculateExtendAt(update.msg.GetVT()),
+						extendAt:      c.calculateExtendAt(update.msg.GetVT()),
 						cancel:        update.msg.cancel,
 					})
 				case messageRemoved:
@@ -470,7 +476,7 @@ func (c *Consumer) extendVTs(vts *vtHeap) (tryAfter time.Time) {
 			c.logger.Warnf("Extending message returned some unknown message : %d", vt.ID)
 			continue
 		}
-		oldVT.extendAt = calculateExtendAt(vt.VT)
+		oldVT.extendAt = c.calculateExtendAt(vt.VT)
 		vts.push(oldVT)
 	}
 

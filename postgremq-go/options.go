@@ -132,7 +132,7 @@ type QueueOption func(*queueOptions)
 
 func defaultQueueOptions() queueOptions {
 	return queueOptions{
-		maxDeliveryAttempts: 3,
+		maxDeliveryAttempts: 0,
 		keepAliveInterval:   5 * time.Minute,
 	}
 }
@@ -146,7 +146,8 @@ func defaultQueueOptions() queueOptions {
 // Parameters:
 //   - n: Maximum delivery attempts (0 for unlimited retries).
 //
-// Default is 3 when creating queues via the client.
+// Default is 0 (unlimited) — matches the SQL function's default and the
+// TS client. Pick a finite value to enable the dead-letter queue path.
 //
 // Messages increment delivery_attempts each time they are consumed. If a
 // message is Nack'd or released due to visibility timeout expiration, it
@@ -179,12 +180,13 @@ func WithKeepAliveInterval(d time.Duration) QueueOption {
 
 // consumeOptions holds configuration for message consumption.
 type consumeOptions struct {
-	batchSize       int
-	checkTimeout    time.Duration
-	vt              int
-	noAutoExtension bool
-	extendBatchSize int
-	topic           string
+	batchSize          int
+	checkTimeout       time.Duration
+	vt                 int
+	noAutoExtension    bool
+	extendBatchSize    int
+	extensionThreshold float64
+	topic              string
 }
 
 // ConsumeOption configures consumer behavior.
@@ -233,11 +235,12 @@ func WithMaxInFlight(n int) HandlerConsumeOption {
 
 func defaultConsumeOptions() consumeOptions {
 	return consumeOptions{
-		batchSize:       5,
-		checkTimeout:    10 * time.Second,
-		vt:              0,
-		noAutoExtension: false,
-		extendBatchSize: 100,
+		batchSize:          10,
+		checkTimeout:       10 * time.Second,
+		vt:                 0,
+		noAutoExtension:    false,
+		extendBatchSize:    100,
+		extensionThreshold: 0.5,
 	}
 }
 
@@ -253,6 +256,9 @@ func validateConsumeOptions(options *consumeOptions) error {
 	}
 	if options.vt < 0 {
 		return fmt.Errorf("lock timeout must be positive")
+	}
+	if options.extensionThreshold <= 0 || options.extensionThreshold >= 1 {
+		return fmt.Errorf("extension threshold must be in (0, 1)")
 	}
 	return nil
 }
@@ -280,7 +286,7 @@ func validateHandlerConsumeOptions(options *handlerConsumeOptions) error {
 // and time to first message. The Messages() channel is buffered to this size.
 //
 // Parameters:
-//   - n: Number of messages per batch. Default is 5. Must be > 0.
+//   - n: Number of messages per batch. Default is 10. Must be > 0.
 func WithBatchSize(n int) ConsumeOption {
 	return func(o *consumeOptions) {
 		o.batchSize = n
@@ -316,7 +322,8 @@ func WithCheckTimeout(d time.Duration) ConsumeOption {
 //
 // The visibility timeout should be longer than typical message processing time.
 // If auto-extension is enabled (default), messages are automatically extended
-// at 50% of the visibility timeout to prevent expiration during processing.
+// once the extension threshold elapses (default 50% — see WithExtensionThreshold)
+// to prevent expiration during processing.
 //
 // If a message's visibility timeout expires before being acknowledged, it
 // becomes visible to other consumers again.
@@ -329,8 +336,9 @@ func WithVT(seconds int) ConsumeOption {
 // WithNoAutoExtension disables automatic visibility timeout extension.
 //
 // By default, the Consumer automatically extends visibility timeouts for
-// in-flight messages at 50% of the VT period to prevent them from becoming
-// visible to other consumers while still being processed.
+// in-flight messages once the extension threshold elapses (default 50% —
+// see WithExtensionThreshold) to prevent them from becoming visible to other
+// consumers while still being processed.
 //
 // When auto-extension is disabled, the application is responsible for calling
 // Message.SetVT() to extend the visibility timeout if processing takes longer
@@ -370,12 +378,31 @@ func WithTopic(topic string) ConsumeOption {
 //
 // Larger batch sizes reduce database round-trips but may cause delays in
 // extending individual messages. The batch is processed when the first
-// message in the batch reaches 50% of its VT period.
+// message in the batch hits the extension threshold (default 50% of VT —
+// see WithExtensionThreshold).
 //
 // Only applicable when auto-extension is enabled (default).
 func WithExtendBatchSize(size int) ConsumeOption {
 	return func(o *consumeOptions) {
 		o.extendBatchSize = size
+	}
+}
+
+// WithExtensionThreshold sets when auto-extension fires, expressed as the
+// fraction of the visibility timeout that must elapse before extension.
+//
+// Default is 0.5 — extend at the halfway point. Lower values extend
+// earlier (more headroom, more DB calls); higher values extend later
+// (fewer DB calls, less headroom for slow handlers / network blips).
+//
+// Parameters:
+//   - threshold: Fraction in (0, 1). 0.5 = 50% of VT elapsed.
+//
+// Mirrors the TS client's autoExtension.extensionThreshold option.
+// Only applicable when auto-extension is enabled (default).
+func WithExtensionThreshold(threshold float64) ConsumeOption {
+	return func(o *consumeOptions) {
+		o.extensionThreshold = threshold
 	}
 }
 

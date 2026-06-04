@@ -280,17 +280,31 @@ def test_unlimited_delivery_attempts(cur: psycopg2.extensions.cursor) -> None:
     assert cur.fetchone()[0] == 0
 
 def test_default_keep_alive_for_exclusive_queue(cur: psycopg2.extensions.cursor) -> None:
-    """Test that exclusive queues get default 30-second keep-alive."""
+    """Test that exclusive queues get the default 5-minute keep-alive."""
     cur.execute("""
         SELECT create_topic('TestTopic');
         SELECT create_queue('ExQueue', 'TestTopic', 2, true);
     """)
-    
+
     cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExQueue'")
     keep_alive = cur.fetchone()[0]
     now = datetime.now(pytz.UTC)
-    assert keep_alive > now + timedelta(seconds=25)
-    assert keep_alive < now + timedelta(seconds=35)
+    assert keep_alive > now + timedelta(minutes=4, seconds=55)
+    assert keep_alive < now + timedelta(minutes=5, seconds=5)
+
+def test_queues_table_keep_alive_column_default(cur: psycopg2.extensions.cursor) -> None:
+    """The queues.keep_alive_interval column default (used only on direct INSERT
+    paths that bypass create_queue) must match the create_queue function
+    default — otherwise schema and function disagree."""
+    cur.execute("""
+        SELECT column_default
+        FROM information_schema.columns
+        WHERE table_name = 'queues' AND column_name = 'keep_alive_interval'
+    """)
+    column_default = cur.fetchone()[0]
+    assert "00:05:00" in column_default or "5 minutes" in column_default, (
+        f"queues.keep_alive_interval default should be 5 minutes; got: {column_default!r}"
+    )
 
 def test_non_exclusive_queue_keep_alive_ignored(cur: psycopg2.extensions.cursor) -> None:
     """Test that keep_alive is ignored for non-exclusive queues."""

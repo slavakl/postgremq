@@ -226,10 +226,10 @@ func (c *Connection) CreateQueue(ctx context.Context, name, topic string, exclus
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		_, err := c.pool.Exec(ctx,
 			"SELECT create_queue($1, $2, $3, $4, $5 * interval '1 ms')",
-			name,                                    // p_queue_name
-			topic,                                   // p_topic_name
-			options.maxDeliveryAttempts,             // p_max_attempts
-			exclusive,                               // p_exclusive
+			name,                                     // p_queue_name
+			topic,                                    // p_topic_name
+			options.maxDeliveryAttempts,              // p_max_attempts
+			exclusive,                                // p_exclusive
 			options.keepAliveInterval.Milliseconds()) // p_keep_alive_interval (ms scaled to INTERVAL)
 		if err != nil {
 			return mapPgError(fmt.Errorf("failed to create queue: %w", err))

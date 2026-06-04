@@ -166,7 +166,8 @@ export interface QueueOptions {
   /**
    * Keep-alive interval in seconds for exclusive queues. consume_message
    * refreshes keep_alive_until on every call, and the client also runs a
-   * background timer that extends it every (interval / 2). Default 30s.
+   * background timer that extends it every (interval / 2). Default 300s
+   * (5 minutes) — matches the SQL function default and the Go client.
    */
   keepAliveInterval?: number;
 }

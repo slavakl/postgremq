@@ -765,9 +765,9 @@ func TestMultipleConsumersSameQueue(t *testing.T) {
 	// invocation; the test asserts on aggregate behaviour, not per-consumer
 	// liveness, since distribution is racy.
 	var (
-		mu                  sync.Mutex
-		startedTotal        int
-		doneTotal           int
+		mu                   sync.Mutex
+		startedTotal         int
+		doneTotal            int
 		c1Started, c2Started bool
 	)
 	allStarted := make(chan struct{}) // closed when first handler from any consumer reports started

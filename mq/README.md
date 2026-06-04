@@ -36,7 +36,7 @@ CREATE TABLE queues (
     name VARCHAR(255) UNIQUE NOT NULL,
     topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
     exclusive BOOLEAN NOT NULL DEFAULT FALSE,
-    max_delivery_attempts INTEGER NOT NULL DEFAULT 3,
+    max_delivery_attempts INTEGER NOT NULL DEFAULT 0,
     keep_alive_until TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -131,7 +131,7 @@ Creates a new queue subscribed to a topic.
 
 - `exclusive`: If true, creates a temporary queue
 - `max_delivery_attempts`: Number of retries before moving to DLQ
-- `keep_alive_interval`: Stored on the queue and used as both the initial keep-alive duration and the per-consume refresh amount. Effectively only matters for exclusive queues. Defaults to `'30 seconds'`.
+- `keep_alive_interval`: Stored on the queue and used as both the initial keep-alive duration and the per-consume refresh amount. Effectively only matters for exclusive queues. Defaults to `'5 minutes'`.
 
 #### `delete_queue(queue_name TEXT) RETURNS VOID`
 Deletes a queue and all its queue_messages.
