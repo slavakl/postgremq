@@ -4,6 +4,11 @@
  */
 
 import { Pool, PoolConfig } from 'pg';
+// Type-only import (erased at compile) so MessageHandler refers to the same
+// concrete Message class users import from the package — avoids the
+// contravariance mismatch a handler typed with the concrete class would hit
+// against the lighter forward `Message` interface below. No runtime cycle.
+import type { Message as MessageClass } from './message';
 
 /** 
  * Forward declaration of Consumer interface
@@ -26,12 +31,30 @@ export interface Message {
   readonly deliveryAttempts: number;
   readonly publishedAt: Date;
   vt: Date;
+  /** Fires when the lease is lost or the consumer is shutting down. */
+  readonly signal: AbortSignal;
+  /** True once ack/nack/release has been attempted (whether or not it succeeded). */
+  readonly isSettled: boolean;
   ack(): Promise<void>;
   ackWithTransaction(tx: Transaction): Promise<void>;
   nack(options?: MessageOptions): Promise<void>;
   release(): Promise<void>;
   setVt(newVt: number): Promise<Date>;
 }
+
+/**
+ * Forward declaration of HandlerConsumer interface.
+ * Full implementation is in handler-consumer.ts
+ */
+export interface HandlerConsumer {
+  stop(): Promise<void>;
+}
+
+/**
+ * A message handler dispatched to by a HandlerConsumer. See
+ * handler-consumer.ts for the auto-ack / auto-nack settlement rules.
+ */
+export type MessageHandler = (msg: MessageClass) => void | Promise<void>;
 
 /**
  * Connection options for PostgreMQ client
@@ -81,6 +104,17 @@ export interface IConnection {
 
   /** Create a consumer for a queue */
   consume(queue: string, options?: Partial<ConsumerOptions>): Consumer;
+
+  /**
+   * Create a handler-based consumer for a queue. Each message is dispatched
+   * to `handler` with optional concurrency limiting (options.maxInFlight).
+   * The push-based counterpart to consume()'s async iteration.
+   */
+  consumeHandler(
+    queue: string,
+    handler: MessageHandler,
+    options?: Partial<HandlerConsumerOptions>
+  ): HandlerConsumer;
   
   /** Create a new topic */
   createTopic(topic: string): Promise<void>;
@@ -212,6 +246,19 @@ export interface ConsumerOptions {
    * knows the topic (e.g. consuming a queue created out-of-band).
    */
   topic?: string;
+}
+
+/**
+ * Options for a handler-based consumer (Connection.consumeHandler).
+ * Extends ConsumerOptions with handler-specific settings.
+ */
+export interface HandlerConsumerOptions extends ConsumerOptions {
+  /**
+   * Maximum number of handler invocations running concurrently. 0 (the
+   * default) means unlimited — a handler is started as soon as a message
+   * is available. Mirrors the Go client's WithMaxInFlight.
+   */
+  maxInFlight?: number;
 }
 
 /**

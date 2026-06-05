@@ -10,7 +10,9 @@ import {
   ConsumerOptions,
   DLQMessage,
   EventType,
+  HandlerConsumerOptions,
   IConnection,
+  MessageHandler,
   MessageOptions,
   NotificationEvent,
   PublishOptions,
@@ -23,8 +25,15 @@ import {
   Transaction
 } from './types';
 import { Consumer as ConsumerImpl } from './consumer';
+import { HandlerConsumer } from './handler-consumer';
 import { EventEmitter, DEFAULT_RETRY_POLICY, shouldRetry, sleep, withRetry } from './utils';
 import { mapDbError, ConnectionClosedError } from './errors';
+
+/** Anything the connection can shut down during close(). Both ConsumerImpl
+ *  and HandlerConsumer satisfy this. */
+interface Stoppable {
+  stop(): Promise<void>;
+}
 
 /** Subscriber callback fires whenever a NOTIFY arrives on the subscribed
  *  channel. NOTIFYs from PostgreMQ carry no payload — the channel name is
@@ -66,8 +75,10 @@ export class Connection implements IConnection {
   /** Flag indicating if client is shutting down */
   private isShuttingDown: boolean = false;
 
-  /** Set of active consumers */
-  private consumers: Set<ConsumerImpl> = new Set();
+  /** Set of active consumers. Holds both iterator-based consumers
+   *  (ConsumerImpl) and handler-based ones (HandlerConsumer); both expose
+   *  stop() so close() can shut them all down uniformly. */
+  private consumers: Set<Stoppable> = new Set();
 
   /** Map of exclusive queue keep-alive timeouts */
   private exclusiveQueueTimers: Map<string, NodeJS.Timeout> = new Map();
@@ -513,7 +524,7 @@ export class Connection implements IConnection {
    * @internal
    * @param consumer - The consumer to register
    */
-  registerConsumer(consumer: ConsumerImpl): void {
+  registerConsumer(consumer: Stoppable): void {
     this.consumers.add(consumer);
   }
 
@@ -522,7 +533,7 @@ export class Connection implements IConnection {
    * @internal
    * @param consumer - The consumer to unregister
    */
-  unregisterConsumer(consumer: ConsumerImpl): void {
+  unregisterConsumer(consumer: Stoppable): void {
     this.consumers.delete(consumer);
     // If there are no more consumers, proactively stop the notification listener
     // to avoid lingering clients and open handles under heavy load.
@@ -735,6 +746,59 @@ export class Connection implements IConnection {
     const consumer = new ConsumerImpl(queue, this, options);
     this.registerConsumer(consumer);
     return consumer;
+  }
+
+  /**
+   * Create a handler-based consumer for a queue.
+   *
+   * Each message is dispatched to `handler`. The push-based counterpart to
+   * consume()'s `for await` iteration, mirroring the Go client's
+   * ConsumeHandler. Settlement rules:
+   *   - handler returns without ack/nack/release  -> message auto-acked
+   *   - handler throws                            -> message auto-nacked
+   *   - handler settles the message itself        -> no automatic action
+   *
+   * `options.maxInFlight` bounds how many handlers run concurrently (0 =
+   * unlimited, the default). Handlers receive a message whose `signal`
+   * fires on shutdown / lease loss; long-running handlers should check it.
+   *
+   * @param queue - The queue name
+   * @param handler - Per-message handler
+   * @param options - Consumer options plus maxInFlight
+   * @returns A started HandlerConsumer; call stop() to shut it down
+   *
+   * @example
+   *   const hc = connection.consumeHandler('orders', async (msg) => {
+   *     await processOrder(msg.payload);   // auto-acked on return
+   *   }, { maxInFlight: 10 });
+   *   // ... later ...
+   *   await hc.stop();
+   */
+  consumeHandler(
+    queue: string,
+    handler: MessageHandler,
+    options: Partial<HandlerConsumerOptions> = {}
+  ): HandlerConsumer {
+    if (!this.connected) {
+      throw new Error('Client is not connected');
+    }
+
+    // Start notification listener if it's not already active (same as consume).
+    if (!this.notificationListenerActive) {
+      this.startNotificationListener().catch(error => {
+        console.error('Failed to start notification listener:', error);
+      });
+    }
+
+    const { maxInFlight = 0, ...consumerOptions } = options;
+    // The underlying consumer is NOT registered with the connection — the
+    // HandlerConsumer is, so close() drives the full handler-aware shutdown
+    // (wait for in-flight handlers) rather than just stopping the consumer.
+    const consumer = new ConsumerImpl(queue, this, consumerOptions);
+    const handlerConsumer = new HandlerConsumer(this, consumer, handler, maxInFlight);
+    this.registerConsumer(handlerConsumer);
+    handlerConsumer.start();
+    return handlerConsumer;
   }
 
   /**

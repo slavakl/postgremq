@@ -7,6 +7,7 @@
 export { IConnection as Connection } from './types';
 export { Message } from './message';
 export { Consumer } from './consumer';
+export { HandlerConsumer, MessageHandler } from './handler-consumer';
 
 // Export public types
 export {
@@ -14,6 +15,7 @@ export {
   PublishOptions,
   QueueOptions,
   ConsumerOptions,
+  HandlerConsumerOptions,
   MessageOptions,
   QueueInfo,
   QueueStatistics,

@@ -159,6 +159,16 @@ export class Message {
   }
 
   /**
+   * True once a terminal operation (ack / nack / release) has been attempted
+   * on this message, whether or not it succeeded. HandlerConsumer uses this
+   * to decide whether to auto-ack a message the handler returned without
+   * settling. Mirrors the "completed" tracking in the Go HandlerConsumer.
+   */
+  get isSettled(): boolean {
+    return this.completeCalled;
+  }
+
+  /**
    * Cancel this message's signal — invoked by the Consumer when it
    * determines the lease can no longer be extended.
    * @internal — for Consumer use only.

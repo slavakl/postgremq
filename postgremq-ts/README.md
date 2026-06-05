@@ -200,6 +200,37 @@ for await (const message of consumer.messages()) {
 await consumer.stop();
 ```
 
+### Handler-based consumption
+
+For a push-based style with bounded concurrency, use `consumeHandler`. Each
+message is dispatched to your handler; if the handler returns without calling
+`ack`/`nack`/`release` the message is auto-acked, and if it throws the message
+is auto-nacked (redelivered). `maxInFlight` caps how many handlers run at once
+(0 = unlimited).
+
+```typescript
+const handlerConsumer = client.consumeHandler(
+  'processing-queue',
+  async (message) => {
+    // Long-running handlers should check the abort signal, which fires on
+    // shutdown or lease loss.
+    if (message.signal.aborted) return;
+
+    await processMessage(message.payload);
+    // Returning here auto-acks. Throw to auto-nack, or call
+    // message.ack()/nack()/release() explicitly to settle it yourself.
+  },
+  {
+    maxInFlight: 10,          // up to 10 concurrent handlers
+    visibilityTimeoutSec: 60,
+  }
+);
+
+// stop() stops fetching, signals in-flight handlers, and waits for them to
+// finish before resolving.
+await handlerConsumer.stop();
+```
+
 ## Administrative Operations
 
 The client provides comprehensive administrative functions:
