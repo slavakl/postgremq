@@ -127,12 +127,24 @@ const delayedId = await client.publish('orders', { orderId: '67890' }, {
   deliverAfter: new Date(Date.now() + 60000) // Deliver after 1 minute
 });
 
-// Publishing within a transaction
-await client.executeWithTransaction(async (tx) => {
-  await client.publishWithTransaction(tx, 'orders', { orderId: '12345' });
-  await client.publishWithTransaction(tx, 'notifications', { type: 'order_created' });
-  // All messages are published atomically
-});
+// Publishing within a transaction.
+// The caller owns the transaction lifecycle (BEGIN/COMMIT/ROLLBACK); the
+// message is published atomically with the caller's other writes and only
+// reaches the queues if the transaction commits. Pass any client with an
+// open transaction (a pg PoolClient/Client after BEGIN satisfies this).
+const txClient = await pool.connect();
+try {
+  await txClient.query('BEGIN');
+  await txClient.query('INSERT INTO orders (id) VALUES ($1)', ['12345']);
+  await client.publishWithTransaction(txClient, 'orders', { orderId: '12345' });
+  await client.publishWithTransaction(txClient, 'notifications', { type: 'order_created' });
+  await txClient.query('COMMIT'); // all writes + both messages commit together
+} catch (err) {
+  await txClient.query('ROLLBACK');
+  throw err;
+} finally {
+  txClient.release();
+}
 ```
 
 ## Consuming Messages

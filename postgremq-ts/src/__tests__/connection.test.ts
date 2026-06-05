@@ -12,7 +12,7 @@ import {
   assertThrows
 } from './helpers';
 import { Connection } from '../connection';
-import { ConnectionClosedError } from '../errors';
+import { ConnectionClosedError, QueueNotFoundError } from '../errors';
 
 describe('Connection', () => {
   let testDb: TestDatabase;
@@ -247,6 +247,109 @@ describe('Connection', () => {
 
       expect(messageId).toBeGreaterThan(0);
       expect(typeof messageId).toBe('number');
+    });
+
+    test('publishWithTransaction commits the message when the tx commits', async () => {
+      const payload = generateTestPayload();
+      const client = await rawPool!.connect();
+
+      let messageId: number;
+      try {
+        await client.query('BEGIN');
+        messageId = await connection.publishWithTransaction(client, 'msg-topic', payload);
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+
+      expect(messageId).toBeGreaterThan(0);
+      expect(typeof messageId).toBe('number');
+
+      await sleep(100);
+
+      // The message and its distribution to the queue must be visible after commit.
+      const fetched = await connection.getMessage(messageId);
+      expect(fetched).not.toBeNull();
+      expect(fetched!.payload).toEqual(payload);
+
+      const stats = await connection.getQueueStatistics('msg-queue');
+      expect(stats.totalCount).toBe(1);
+    });
+
+    test('publishWithTransaction leaves nothing behind when the tx rolls back', async () => {
+      const payload = generateTestPayload();
+      const client = await rawPool!.connect();
+
+      let messageId: number;
+      try {
+        await client.query('BEGIN');
+        messageId = await connection.publishWithTransaction(client, 'msg-topic', payload);
+        // Roll back instead of commit — the message and its queue distribution
+        // (the trigger ran inside the tx) must both vanish.
+        await client.query('ROLLBACK');
+      } finally {
+        client.release();
+      }
+
+      const fetched = await connection.getMessage(messageId!);
+      expect(fetched).toBeNull();
+
+      const stats = await connection.getQueueStatistics('msg-queue');
+      expect(stats.totalCount).toBe(0);
+    });
+
+    test('publishWithTransaction honors deliverAfter inside the tx', async () => {
+      const payload = generateTestPayload();
+      const deliverAfter = new Date(Date.now() + 5000);
+      const client = await rawPool!.connect();
+
+      let messageId: number;
+      try {
+        await client.query('BEGIN');
+        messageId = await connection.publishWithTransaction(
+          client, 'msg-topic', payload, { deliverAfter });
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+
+      expect(messageId).toBeGreaterThan(0);
+
+      // Distributed but not yet deliverable — same shape as the non-tx
+      // delayed-delivery path.
+      const stats = await connection.getQueueStatistics('msg-queue');
+      expect(stats.pendingCount).toBe(1);
+
+      const fetched = await connection.getMessage(messageId);
+      expect(fetched).not.toBeNull();
+      expect(fetched!.payload).toEqual(payload);
+    });
+
+    test('publishWithTransaction maps DB errors so the caller can ROLLBACK', async () => {
+      const client = await rawPool!.connect();
+
+      try {
+        await client.query('BEGIN');
+        // Publishing to a non-existent topic raises PMQ02 -> QueueNotFoundError.
+        // The caller must receive the mapped error so it can decide to roll back.
+        await expect(
+          connection.publishWithTransaction(client, 'no-such-topic', { x: 1 })
+        ).rejects.toBeInstanceOf(QueueNotFoundError);
+        // The transaction is now aborted; ROLLBACK must succeed and leave
+        // the real queue untouched.
+        await client.query('ROLLBACK');
+      } finally {
+        client.release();
+      }
+
+      const stats = await connection.getQueueStatistics('msg-queue');
+      expect(stats.totalCount).toBe(0);
     });
 
     test('should publish message with delayed delivery', async () => {

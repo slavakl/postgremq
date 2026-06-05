@@ -605,6 +605,35 @@ export class Connection implements IConnection {
   }
 
   /**
+   * Run publish_message against any queryable (a pooled client or a
+   * caller-supplied transaction) and return the new message ID. Shared by
+   * publish() and publishWithTransaction() so the SQL, parameter shape, and
+   * BIGINT conversion live in exactly one place.
+   */
+  private async publishOn(
+    queryable: Transaction,
+    topic: string,
+    payload: any,
+    options: PublishOptions
+  ): Promise<number> {
+    let query: string;
+    let params: any[];
+
+    if (options.deliverAfter) {
+      query = 'SELECT publish_message($1, $2, $3) as publish_message';
+      params = [topic, JSON.stringify(payload), options.deliverAfter];
+    } else {
+      query = 'SELECT publish_message($1, $2) as publish_message';
+      params = [topic, JSON.stringify(payload)];
+    }
+
+    const result = await queryable.query(query, params);
+    // BIGINT columns arrive as strings from node-pg by default; convert at
+    // the read boundary to keep the rest of the client on `number`.
+    return Number(result.rows[0].publish_message);
+  }
+
+  /**
    * Publish a message to a topic
    * @param topic - The topic name
    * @param payload - The message payload
@@ -619,25 +648,67 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     try {
-      return await this.executeWithRetry(async (client) => {
-        let query: string;
-        let params: any[];
+      // executeWithRetry hands us a pooled client, which satisfies the
+      // Transaction (query-bearing) shape publishOn expects.
+      return await this.executeWithRetry((client) =>
+        this.publishOn(client, topic, payload, options));
+    } catch (err) {
+      throw mapDbError(err);
+    }
+  }
 
-        if (options.deliverAfter) {
-          query = 'SELECT publish_message($1, $2, $3) as publish_message';
-          params = [topic, JSON.stringify(payload), options.deliverAfter];
-        } else {
-          query = 'SELECT publish_message($1, $2) as publish_message';
-          params = [topic, JSON.stringify(payload)];
-        }
+  /**
+   * Publish a message within an existing transaction.
+   *
+   * Runs publish_message on the caller-supplied transaction so the publish
+   * commits (or rolls back) atomically with the caller's other writes — e.g.
+   * insert an order row and enqueue its "order.created" event in one unit.
+   * The distribution trigger fires inside the transaction, so the message
+   * only reaches queues if the transaction commits.
+   *
+   * Unlike publish(), this does NOT apply the internal retry policy: retry
+   * boundaries belong to the caller, who owns BEGIN / COMMIT / ROLLBACK. A
+   * retry here could replay the INSERT against an already-aborted or
+   * already-committed transaction. The caller is responsible for retrying
+   * the whole transaction on a serialization failure.
+   *
+   * @param tx - An object exposing `query(text, values)` bound to an open
+   *             transaction — a pg PoolClient/Client after `BEGIN` satisfies
+   *             this. Mirrors the tx accepted by Message.ackWithTransaction.
+   * @param topic - The topic name (must already exist)
+   * @param payload - The message payload
+   * @param options - Publishing options (e.g. deliverAfter for delayed delivery)
+   * @returns Promise resolving to the message ID
+   *
+   * @example
+   *   const client = await pool.connect();
+   *   try {
+   *     await client.query('BEGIN');
+   *     await client.query('INSERT INTO orders ...');
+   *     const id = await connection.publishWithTransaction(
+   *       client, 'orders', { orderId: 42 });
+   *     await client.query('COMMIT');
+   *   } catch (err) {
+   *     await client.query('ROLLBACK');
+   *     throw err;
+   *   } finally {
+   *     client.release();
+   *   }
+   */
+  async publishWithTransaction(
+    tx: Transaction,
+    topic: string,
+    payload: any,
+    options: PublishOptions = {}
+  ): Promise<number> {
+    if (!this.connected) {
+      throw new Error('Client is not connected');
+    }
 
-        const result = await client.query(query, params);
-        // BIGINT columns arrive as strings from node-pg by default; convert at
-        // the read boundary to keep the rest of the client on `number`.
-        return Number(result.rows[0].publish_message);
-      });
+    try {
+      return await this.publishOn(tx, topic, payload, options);
     } catch (err) {
       throw mapDbError(err);
     }

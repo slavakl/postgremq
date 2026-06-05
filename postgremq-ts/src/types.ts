@@ -60,12 +60,25 @@ export interface IConnection {
   /** Close the connection and clean up resources */
   close(): Promise<void>;
   
-  /** 
-   * Publish a message to a topic 
+  /**
+   * Publish a message to a topic
    * @returns Message ID
    */
   publish(topic: string, payload: any, options?: PublishOptions): Promise<number>;
-  
+
+  /**
+   * Publish a message within an existing transaction, atomically with the
+   * caller's other writes. Does not apply the internal retry policy — the
+   * caller owns the transaction boundaries.
+   * @returns Message ID
+   */
+  publishWithTransaction(
+    tx: Transaction,
+    topic: string,
+    payload: any,
+    options?: PublishOptions
+  ): Promise<number>;
+
   /** Create a consumer for a queue */
   consume(queue: string, options?: Partial<ConsumerOptions>): Consumer;
   
