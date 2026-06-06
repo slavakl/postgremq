@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -567,8 +568,16 @@ func (c *Connection) startKeepAlive(queue string, interval time.Duration) {
 				return
 			case <-next:
 				if err := c.sendKeepAlive(c.keepAliveCtx, queue, interval); err != nil {
+					// PMQ02 (queue gone) / PMQ03 (not exclusive) are
+					// permanent: retrying can never succeed, so stop the loop
+					// instead of logging every second forever. Matches the TS
+					// client, which gives up after a bounded retry budget.
+					if errors.Is(err, ErrQueueNotFound) || errors.Is(err, ErrValidation) {
+						c.logger.Errorf("Stopping keep-alive for queue %s: %v", queue, err)
+						return
+					}
 					c.logger.Errorf("Failed to send keep-alive for queue %s: %v", queue, err)
-					next = time.After(1 * time.Second) // retry in a second
+					next = time.After(1 * time.Second) // retry transient errors in a second
 				} else {
 					next = time.After(interval / 2)
 				}
@@ -677,7 +686,10 @@ func (c *Connection) sendKeepAlive(ctx context.Context, queue string, interval t
 		_, err := c.pool.Exec(ctx, "SELECT extend_queue_keep_alive($1, $2 * interval '1 ms')",
 			queue, interval.Milliseconds(),
 		)
-		return err
+		// extend_queue_keep_alive raises PMQ02 (queue gone) / PMQ03
+		// (non-exclusive) instead of returning FALSE; surface them as typed
+		// errors so the keep-alive loop logs a clean message.
+		return mapPgError(err)
 	})
 }
 

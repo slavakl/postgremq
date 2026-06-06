@@ -1530,7 +1530,9 @@ func TestDeleteInactiveQueues(t *testing.T) {
 	require.NoError(t, err, "Failed to list queues")
 	require.Len(t, queues, 3, "Should have 3 queues initially")
 	conn.Close()
-	time.Sleep(3 * time.Second) // Wait for queues to expire
+	// Wait past the 2s keep-alive interval PLUS the maintenance 5s grace
+	// period (delete_inactive_queues only reaps queues expired > 5s).
+	time.Sleep(8 * time.Second)
 
 	conn, err = postgremq.DialFromPool(pool)
 	require.NoError(t, err, "Failed to create connection")

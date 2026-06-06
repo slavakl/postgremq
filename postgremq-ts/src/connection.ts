@@ -1394,24 +1394,31 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Extend the keep-alive time for an exclusive queue
+   * Extend the keep-alive time for an exclusive queue.
+   *
+   * Resolves on success. Rejects with QueueNotFoundError (PMQ02) if the queue
+   * doesn't exist, or ValidationError (PMQ03) if it exists but is not
+   * exclusive — the SQL function distinguishes these rather than returning a
+   * single ambiguous boolean.
+   *
    * @param queueName - The queue name
    * @param seconds - The number of seconds to extend by
-   * @returns Promise that resolves to a boolean indicating success
    */
-  async extendQueueKeepAlive(queueName: string, seconds: number): Promise<boolean> {
+  async extendQueueKeepAlive(queueName: string, seconds: number): Promise<void> {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
-    return this.executeWithRetry(async (client) => {
-      const result = await client.query(
-        'SELECT extend_queue_keep_alive($1, make_interval(secs => $2)) AS success',
-        [queueName, seconds]
-      );
-      
-      return result.rows[0].success;
-    });
+
+    try {
+      await this.executeWithRetry(async (client) => {
+        await client.query(
+          'SELECT extend_queue_keep_alive($1, make_interval(secs => $2))',
+          [queueName, seconds]
+        );
+      });
+    } catch (err) {
+      throw mapDbError(err);
+    }
   }
 
   /**
@@ -1543,42 +1550,23 @@ export class Connection implements IConnection {
     const QUICK_RETRY_DELAY_MS = 5000; // 5 seconds
     
     try {
-      // Extend the keep-alive
-      const success = await this.extendQueueKeepAlive(queueName, keepAliveSeconds);
-      
-      if (success) {
-        if (retryCount > 0) {
-          console.info(`Successfully extended keep-alive for exclusive queue ${queueName} after ${retryCount} retries`);
-        } else {
-          console.debug(`Extended keep-alive for exclusive queue ${queueName} by ${keepAliveSeconds} seconds`);
-        }
-        
-        // Reset retry count and schedule next keep-alive at normal interval
-        retryCount = 0;
-        
-        // Schedule the next keep-alive at normal interval (half the keep-alive period)
-        if (!this.isShuttingDown) {
-          const extendIntervalMs = Math.floor(keepAliveSeconds * 1000 / 2);
-          const timer = setTimeout(() => {
-            this.sendQueueKeepAlive(queueName, 0);
-          }, extendIntervalMs);
-          this.exclusiveQueueTimers.set(queueName, timer);
-        }
+      // Extend the keep-alive. Success = resolves; any failure throws and is
+      // handled in the catch below (extend_queue_keep_alive no longer returns
+      // a boolean — it raises PMQ02/PMQ03 on missing / non-exclusive queues).
+      await this.extendQueueKeepAlive(queueName, keepAliveSeconds);
+
+      if (retryCount > 0) {
+        console.info(`Successfully extended keep-alive for exclusive queue ${queueName} after ${retryCount} retries`);
       } else {
-        console.warn(`Failed to extend keep-alive for exclusive queue ${queueName}`);
-        
-        // If we've reached max retries, stop the keep-alive timer
-        if (retryCount >= MAX_QUICK_RETRIES) {
-          console.error(`Giving up on extending keep-alive for exclusive queue ${queueName} after ${retryCount} retries`);
-          this.stopQueueKeepAlive(queueName);
-          return;
-        }
-        
-        // Otherwise, retry quickly
-        console.info(`Will retry extending keep-alive for exclusive queue ${queueName} in ${QUICK_RETRY_DELAY_MS}ms`);
+        console.debug(`Extended keep-alive for exclusive queue ${queueName} by ${keepAliveSeconds} seconds`);
+      }
+
+      // Schedule the next keep-alive at normal interval (half the keep-alive period)
+      if (!this.isShuttingDown) {
+        const extendIntervalMs = Math.floor(keepAliveSeconds * 1000 / 2);
         const timer = setTimeout(() => {
-          this.sendQueueKeepAlive(queueName, retryCount + 1);
-        }, QUICK_RETRY_DELAY_MS);
+          this.sendQueueKeepAlive(queueName, 0);
+        }, extendIntervalMs);
         this.exclusiveQueueTimers.set(queueName, timer);
       }
     } catch (error) {

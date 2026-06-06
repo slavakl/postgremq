@@ -12,7 +12,7 @@ import {
   assertThrows
 } from './helpers';
 import { Connection } from '../connection';
-import { ConnectionClosedError, QueueNotFoundError } from '../errors';
+import { ConnectionClosedError, QueueNotFoundError, ValidationError } from '../errors';
 
 describe('Connection', () => {
   let testDb: TestDatabase;
@@ -167,6 +167,30 @@ describe('Connection', () => {
   describe('Queue Operations', () => {
     beforeEach(async () => {
       await connection.createTopic('queue-test-topic');
+    });
+
+    test('extendQueueKeepAlive resolves and advances keep-alive for an exclusive queue', async () => {
+      await connection.createQueue('ka-ex', 'queue-test-topic', true, { keepAliveInterval: 60 });
+
+      const before = (await connection.listQueues()).find(q => q.queueName === 'ka-ex')!.keepAliveUntil!;
+      await sleep(1100); // let NOW() advance so the new deadline is strictly later
+      await expect(connection.extendQueueKeepAlive('ka-ex', 120)).resolves.toBeUndefined();
+
+      const after = (await connection.listQueues()).find(q => q.queueName === 'ka-ex')!.keepAliveUntil!;
+      expect(new Date(after).getTime()).toBeGreaterThan(new Date(before).getTime());
+    });
+
+    test('extendQueueKeepAlive rejects with QueueNotFoundError for a missing queue', async () => {
+      await expect(
+        connection.extendQueueKeepAlive('no-such-queue', 60)
+      ).rejects.toBeInstanceOf(QueueNotFoundError);
+    });
+
+    test('extendQueueKeepAlive rejects with ValidationError for a non-exclusive queue', async () => {
+      await connection.createQueue('ka-nonex', 'queue-test-topic', false);
+      await expect(
+        connection.extendQueueKeepAlive('ka-nonex', 60)
+      ).rejects.toBeInstanceOf(ValidationError);
     });
 
     test('should create and list queues', async () => {

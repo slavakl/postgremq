@@ -139,12 +139,11 @@ def test_queue_keep_alive_extension(cur: psycopg2.extensions.cursor) -> None:
         SELECT create_queue('TestQueue_NonEx', 'TestTopic', 2, false);
     """)
 
-    # Get initial keep-alive and extend it
+    # Get initial keep-alive and extend it (returns VOID; success = no raise)
     cur.execute("""
         SELECT keep_alive_until FROM queues WHERE name = 'TestQueue_Ex';
         SELECT extend_queue_keep_alive('TestQueue_Ex', interval '15 minutes');
     """)
-    assert cur.fetchone()[0] is True
 
     # Verify keep-alive was extended
     cur.execute("""
@@ -156,6 +155,97 @@ def test_queue_keep_alive_extension(cur: psycopg2.extensions.cursor) -> None:
     now = datetime.now(pytz.UTC)
     assert new_keep_alive > now + timedelta(minutes=14)
     assert new_keep_alive < now + timedelta(minutes=16)
+
+def test_extend_keep_alive_raises_pmq02_when_queue_missing(cur: psycopg2.extensions.cursor) -> None:
+    """extend_queue_keep_alive must raise PMQ02 (not silently return) when the
+    queue does not exist — distinct from the non-exclusive case below."""
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT extend_queue_keep_alive('NoSuchQueue', interval '1 minute')")
+    assert exc_info.value.pgcode == 'PMQ02', \
+        f"expected PMQ02, got {exc_info.value.pgcode}: {exc_info.value}"
+
+def test_extend_keep_alive_raises_pmq03_when_non_exclusive(cur: psycopg2.extensions.cursor) -> None:
+    """extend_queue_keep_alive must raise PMQ03 for a non-exclusive queue —
+    a different condition than 'not found', no longer conflated into FALSE."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT create_queue('NonExQ', 'TestTopic', 0, false)")
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT extend_queue_keep_alive('NonExQ', interval '1 minute')")
+    assert exc_info.value.pgcode == 'PMQ03', \
+        f"expected PMQ03, got {exc_info.value.pgcode}: {exc_info.value}"
+
+def test_queue_messages_status_check_constraint(cur: psycopg2.extensions.cursor) -> None:
+    """A typo'd status must be rejected by the CHECK constraint rather than
+    silently stranding the row in a state no query matches."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT create_queue('Q', 'TestTopic', 0, false)")
+    cur.execute("SELECT publish_message('TestTopic', '{}'::jsonb)")
+    with pytest.raises(psycopg2.errors.CheckViolation):
+        cur.execute("UPDATE queue_messages SET status = 'Processing'")  # capital P typo
+
+def test_fk_columns_not_null(cur: psycopg2.extensions.cursor) -> None:
+    """queues.topic_name and messages.topic_name are NOT NULL (defense against
+    direct-table writes that bypass the create_* functions)."""
+    cur.execute("""
+        SELECT is_nullable FROM information_schema.columns
+        WHERE table_name = 'queues' AND column_name = 'topic_name'
+    """)
+    assert cur.fetchone()[0] == 'NO'
+    cur.execute("""
+        SELECT is_nullable FROM information_schema.columns
+        WHERE table_name = 'messages' AND column_name = 'topic_name'
+    """)
+    assert cur.fetchone()[0] == 'NO'
+
+def test_consumer_token_is_uuid(cur: psycopg2.extensions.cursor) -> None:
+    """consume_message now mints consumer tokens with gen_random_uuid(); the
+    token should parse as a UUID (no more timestamp+random()+txid hack)."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT create_queue('Q', 'TestTopic', 0, false)")
+    cur.execute("SELECT publish_message('TestTopic', '{}'::jsonb)")
+    cur.execute("SELECT consumer_token FROM consume_message('Q', 30, 1)")
+    token = cur.fetchone()[0]
+    # Raises ValueError if not a valid UUID.
+    uuid.UUID(token)
+
+def test_consume_skips_redundant_keep_alive_write(cur: psycopg2.extensions.cursor) -> None:
+    """Back-to-back consumes on an exclusive queue should NOT rewrite
+    keep_alive_until every time — only once the deadline drifts past the
+    half-interval point. Avoids dead-tuple churn on the hot queues row."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    # Long interval so a second consume stays well inside the half-interval window.
+    cur.execute("SELECT create_queue('ExQ', 'TestTopic', 0, true, interval '1 hour')")
+    cur.execute("SELECT publish_message('TestTopic', '{}'::jsonb)")
+    cur.execute("SELECT publish_message('TestTopic', '{}'::jsonb)")
+
+    cur.execute("SELECT consume_message('ExQ', 30, 1)")
+    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExQ'")
+    first = cur.fetchone()[0]
+
+    cur.execute("SELECT consume_message('ExQ', 30, 1)")
+    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExQ'")
+    second = cur.fetchone()[0]
+
+    assert first == second, "second consume should not have rewritten keep_alive_until"
+
+def test_maintenance_grace_period_for_just_expired_queue(cur: psycopg2.extensions.cursor) -> None:
+    """pmq_maintenance_fast must not reap an exclusive queue whose keep-alive
+    only just lapsed (within the 5s grace) — protects a keep-alive that fired
+    a hair late. A queue well past the grace is still reaped."""
+    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT create_queue('JustExpired', 'TestTopic', 0, true, interval '60 seconds')")
+    cur.execute("SELECT create_queue('LongExpired', 'TestTopic', 0, true, interval '60 seconds')")
+
+    # JustExpired: 2s past deadline (inside grace). LongExpired: 30s past (outside).
+    cur.execute("UPDATE queues SET keep_alive_until = NOW() - INTERVAL '2 seconds' WHERE name = 'JustExpired'")
+    cur.execute("UPDATE queues SET keep_alive_until = NOW() - INTERVAL '30 seconds' WHERE name = 'LongExpired'")
+
+    cur.execute("SELECT pmq_maintenance_fast()")
+
+    cur.execute("SELECT count(*) FROM queues WHERE name = 'JustExpired'")
+    assert cur.fetchone()[0] == 1, "queue within the 5s grace must survive"
+    cur.execute("SELECT count(*) FROM queues WHERE name = 'LongExpired'")
+    assert cur.fetchone()[0] == 0, "queue well past the grace must be reaped"
 
 def test_create_queue_idempotent_and_strict(cur: psycopg2.extensions.cursor) -> None:
     """create_queue follows RabbitMQ-style 'match-or-error' semantics:
@@ -317,27 +407,27 @@ def test_non_exclusive_queue_keep_alive_ignored(cur: psycopg2.extensions.cursor)
     assert cur.fetchone()[0] is None
 
 def test_consume_refreshes_keep_alive_for_exclusive(cur: psycopg2.extensions.cursor) -> None:
-    """consume_message must advance keep_alive_until for exclusive queues so an
-    actively-polling consumer cannot have its queue GC'd by drift in the
-    explicit extend_queue_keep_alive timer."""
+    """consume_message advances keep_alive_until for exclusive queues once the
+    deadline has drifted into the second half of the interval, so an actively-
+    polling consumer cannot have its queue GC'd. (It deliberately SKIPS the
+    write while the deadline is still in the first half — see
+    test_consume_skips_redundant_keep_alive_write.)"""
     cur.execute("SELECT create_topic('TestTopic')")
-    # 60s keep-alive so the test window is comfortable.
     cur.execute("SELECT create_queue('ExActive', 'TestTopic', 0, true, interval '60 seconds')")
     cur.execute("SELECT publish_message('TestTopic', '{\"x\": 1}'::jsonb)")
 
-    # Snapshot keep_alive_until and pin queue's view of NOW(), then consume.
+    # Force the deadline into the second half of the interval (10s of 60s left)
+    # so the next consume's refresh predicate fires.
+    cur.execute("UPDATE queues SET keep_alive_until = NOW() + INTERVAL '10 seconds' WHERE name = 'ExActive'")
     cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExActive'")
     before = cur.fetchone()[0]
 
-    # Sleep briefly so NOW() advances; the refresh is NOW() + interval, so the
-    # post-consume value must be strictly later than the pre-consume value.
-    time.sleep(1.2)
     cur.execute("SELECT consume_message('ExActive', 30, 1)")
 
     cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExActive'")
     after = cur.fetchone()[0]
-    assert after > before, f"keep_alive_until should advance on consume: before={before} after={after}"
-    # Must be ~now+60s (the interval), not now+30 (vt) or unchanged.
+    assert after > before, f"keep_alive_until should advance on consume when due: before={before} after={after}"
+    # Refreshed to ~now+60s (the interval), not now+30 (vt).
     now = datetime.now(pytz.UTC)
     assert after > now + timedelta(seconds=55)
     assert after < now + timedelta(seconds=65)
@@ -400,9 +490,9 @@ def test_pmq_maintenance_fast(cur: psycopg2.extensions.cursor) -> None:
         (msg_id,),
     )
 
-    # Expired exclusive queue (the inactive-queue branch).
+    # Expired exclusive queue (the inactive-queue branch). Past the 5s grace.
     cur.execute("SELECT create_queue('ExpiredEx', 'MaintTopic', 0, true, interval '60 seconds')")
-    cur.execute("UPDATE queues SET keep_alive_until = NOW() - interval '1 second' WHERE name = 'ExpiredEx'")
+    cur.execute("UPDATE queues SET keep_alive_until = NOW() - interval '10 seconds' WHERE name = 'ExpiredEx'")
 
     cur.execute("SELECT retired_to_dlq, inactive_queues_dropped FROM pmq_maintenance_fast()")
     retired, dropped = cur.fetchone()
@@ -1194,8 +1284,8 @@ def test_pmq_maintenance_fast_skips_inactive_queue_with_dlq(cur: psycopg2.extens
     msg_id, token = cur.fetchone()
     cur.execute("SELECT nack_message('MaintDlqQueue', %s, %s)", (msg_id, token))
 
-    # Force the queue's keep_alive_until into the past — eligible for reaping.
-    cur.execute("UPDATE queues SET keep_alive_until = NOW() - interval '1 second' WHERE name = 'MaintDlqQueue'")
+    # Force the queue's keep_alive_until past the 5s grace — eligible for reaping.
+    cur.execute("UPDATE queues SET keep_alive_until = NOW() - interval '10 seconds' WHERE name = 'MaintDlqQueue'")
 
     cur.execute("SELECT inactive_queues_dropped FROM pmq_maintenance_fast()")
     assert cur.fetchone()[0] == 0, "queue with DLQ entries must not be reaped"

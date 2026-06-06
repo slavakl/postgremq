@@ -82,7 +82,7 @@ CREATE TABLE topics (
 -- Queues table.
 CREATE TABLE queues (
   name VARCHAR(255) PRIMARY KEY,
-  topic_name VARCHAR(255) REFERENCES topics(name) ON DELETE CASCADE,
+  topic_name VARCHAR(255) NOT NULL REFERENCES topics(name) ON DELETE CASCADE,
   max_delivery_attempts INT NOT NULL DEFAULT 0,
   exclusive BOOLEAN NOT NULL DEFAULT false,  -- Changed from durable
   keep_alive_interval INTERVAL NOT NULL DEFAULT '5 minutes',
@@ -94,7 +94,7 @@ CREATE TABLE queues (
 -- rates and silently corrupt message identity.
 CREATE TABLE messages (
   id BIGSERIAL PRIMARY KEY,
-  topic_name VARCHAR(255) REFERENCES topics(name) ON DELETE CASCADE,
+  topic_name VARCHAR(255) NOT NULL REFERENCES topics(name) ON DELETE CASCADE,
   payload JSONB NOT NULL,
   published_at TIMESTAMPTZ DEFAULT NOW(),
   deliver_after TIMESTAMPTZ DEFAULT NOW()  -- New column with default NOW()
@@ -113,7 +113,11 @@ CREATE TABLE queue_messages (
   processed_at TIMESTAMPTZ,
   PRIMARY KEY (queue_name, message_id),
   CONSTRAINT queue_messages_delivery_attempts_nonneg
-    CHECK (delivery_attempts >= 0)
+    CHECK (delivery_attempts >= 0),
+  -- Guard against a future code path writing a typo'd status (e.g.
+  -- 'Processing') that no query would ever match, stranding the row.
+  CONSTRAINT queue_messages_status_valid
+    CHECK (status IN ('pending', 'processing', 'completed'))
 );
 
 -- Dead Letter Queue table.
@@ -477,11 +481,18 @@ BEGIN
     -- Additive to extend_queue_keep_alive: covers the active-polling case
     -- so a drifted client timer can't GC a queue that's still being used.
     -- No-op for non-exclusive queues (their keep_alive_until is NULL).
+    --
+    -- Only write when the deadline has crept past the halfway point of the
+    -- interval. A high-rate consumer would otherwise version this hot row on
+    -- every call (1000 consume/sec => 1000 dead tuples/sec), bloating the
+    -- table the publish-side trigger also reads. Skipping the no-op refresh
+    -- still leaves at least half the interval of runway before expiry.
     UPDATE queues
     SET keep_alive_until = NOW() + keep_alive_interval
     WHERE name = p_queue_name
       AND exclusive
-      AND keep_alive_until > NOW();
+      AND keep_alive_until > NOW()
+      AND keep_alive_until < NOW() + keep_alive_interval / 2;
 
     RETURN QUERY
     WITH target_queue AS (
@@ -510,8 +521,9 @@ BEGIN
     SET status = 'processing',
         vt = NOW() + make_interval(secs => p_vt),
         delivery_attempts = qm.delivery_attempts + 1,
-        -- Generate unique consumer token using microsecond precision and transaction ID
-        consumer_token = to_char(NOW(), 'YYYYMMDDHH24MISS.US') || '-' || substr(md5(random()::text || txid_current()::text), 1, 12)
+        -- Per-lease ownership token. gen_random_uuid() is collision-free
+        -- without the old timestamp+random()+txid_current() construction.
+        consumer_token = gen_random_uuid()::text
     FROM next_msg qm
     WHERE queue_messages.queue_name = qm.queue_name
         AND queue_messages.message_id = qm.message_id
@@ -585,8 +597,13 @@ DECLARE
 BEGIN
     -- Look up the queue's retry limit. We need this to decide between the
     -- "reset to pending" path and the "inline DLQ retirement" path.
+    -- FOR SHARE pins the queue row for the rest of the function: without it
+    -- a concurrent delete_queue cascade could drop the queue (and its
+    -- queue_messages) between this read and the UPDATE/INSERT below,
+    -- leaving a stale v_max_attempts and a NOTIFY on a dropped channel.
     SELECT max_delivery_attempts INTO v_max_attempts
-    FROM queues WHERE name = p_queue_name;
+    FROM queues WHERE name = p_queue_name
+    FOR SHARE;
 
     -- Reset to pending. RETURNING gives us the (post-consume-increment)
     -- delivery_attempts so we can decide whether this was the final attempt.
@@ -795,7 +812,10 @@ BEGIN
     WITH dropped AS (
         DELETE FROM queues q
         WHERE q.exclusive = true
-          AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= NOW())
+          -- 5s grace past expiry so a keep-alive that fired a hair late
+          -- (network/scheduler jitter) doesn't lose its queue out from
+          -- under an active consumer.
+          AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= NOW() - INTERVAL '5 seconds')
           AND NOT EXISTS (
               SELECT 1 FROM dead_letter_queue dlq WHERE dlq.queue_name = q.name
           )
@@ -810,30 +830,44 @@ $$ LANGUAGE plpgsql;
 /* Function: extend_queue_keep_alive
  *
  * Description:
- *   Extends the keep-alive time for a non-durable queue by setting its expiration to
- *   NOW() plus the provided extension interval.
+ *   Extends the keep-alive time for an exclusive queue by setting its
+ *   expiration to NOW() plus the provided extension interval.
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue.
  *   - p_interval (INTERVAL): The interval to add to NOW() for the new keep-alive timestamp.
  *
- * Returns:
- *   BOOLEAN indicating whether the update was successful.
+ * Returns: VOID.
  *
- * Note:
- *   Negative or zero intervals are not allowed.
+ * Raises:
+ *   - PMQ02 if the queue does not exist.
+ *   - PMQ03 if the queue exists but is not exclusive (keep-alive does not
+ *     apply to non-exclusive queues). Previously both conditions collapsed
+ *     to a FALSE return, leaving the caller unable to tell them apart.
  */
 CREATE OR REPLACE FUNCTION extend_queue_keep_alive(
     p_queue_name VARCHAR(255),
     p_interval INTERVAL
-) RETURNS BOOLEAN AS $$
+) RETURNS VOID AS $$
+DECLARE
+    v_exclusive BOOLEAN;
 BEGIN
+    SELECT exclusive INTO v_exclusive
+    FROM queues WHERE name = p_queue_name;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Queue "%" does not exist', p_queue_name
+          USING ERRCODE = 'PMQ02';
+    END IF;
+
+    IF NOT v_exclusive THEN
+        RAISE EXCEPTION 'Queue "%" is not exclusive; keep-alive does not apply', p_queue_name
+          USING ERRCODE = 'PMQ03';
+    END IF;
+
     UPDATE queues
     SET keep_alive_until = NOW() + p_interval
-    WHERE name = p_queue_name
-      AND exclusive = true;  -- Changed from NOT durable
-    
-    RETURN FOUND;
+    WHERE name = p_queue_name;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1188,7 +1222,8 @@ BEGIN
   -- DLQ before dropping the queue.
   DELETE FROM queues q
   WHERE q.exclusive = true  -- Changed from durable = false
-    AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= NOW())
+    -- 5s grace past expiry — see pmq_maintenance_fast.
+    AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= NOW() - INTERVAL '5 seconds')
     AND NOT EXISTS (
         SELECT 1 FROM dead_letter_queue dlq WHERE dlq.queue_name = q.name
     );
