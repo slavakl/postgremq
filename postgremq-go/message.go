@@ -124,6 +124,19 @@ func (m *Message) Ack(ctx context.Context) error {
 //	return tx.Commit(ctx)
 func (m *Message) AckWithTx(ctx context.Context, tx Tx) error {
 	err := m.conn.ackMessageWithTx(ctx, tx, m.queue, m.ID, m.consumerToken)
+	// Untrack on the call (complete() untracks unconditionally), matching plain
+	// Ack. We cannot observe the caller's commit/rollback — the transaction
+	// lifecycle is the caller's.
+	//
+	// Consequence on rollback: the ack is undone server-side, so the message
+	// stays 'processing' until its visibility timeout lapses and is then
+	// redelivered. That is the correct outcome of an abandoned transaction.
+	// Residual (pre-existing) race: between this call and the caller's commit
+	// the message is no longer auto-extended, so a commit that outlives the
+	// remaining VT could let the row expire and be redelivered even though the
+	// ack ultimately lands. Keep transactions short relative to the VT. Fully
+	// closing this would require an after-commit hook, which the caller-owned
+	// transaction model does not expose.
 	m.complete(messageAck, err)
 	return err
 }
@@ -264,6 +277,23 @@ func (m *Message) SetVT(ctx context.Context, vt int) (time.Time, error) {
 	return newVT, nil
 }
 
+// complete removes the message from the consumer's in-flight tracking and
+// auto-extension. It is called by Ack/Nack/Release/AckWithTx once the
+// application is done with the message.
+//
+// Untracking is UNCONDITIONAL — it happens whether or not the settle succeeded.
+// This is required by the Consumer.Stop() contract: shutdown cancels every
+// in-flight message's StoppedCtx and then waits for each to be settled, draining
+// the in-flight set as complete() fires. A settle is therefore terminal for
+// tracking by design. Skipping untrack on error would strand a message that
+// failed to settle (e.g. ErrLeaseLost / PMQ01 — the row is no longer ours and
+// can never be acked) in the in-flight set forever and deadlock Stop().
+//
+// Note also that Ack/Nack/Release already retry transient DB errors internally
+// before surfacing an error here, so an error reaching complete() is effectively
+// terminal — there is nothing to keep the lease alive for.
+//
+// op is currently unused; retained for potential future per-operation handling.
 func (m *Message) complete(op int, err error) {
 	if m.onComplete != nil {
 		m.completeOnce.Do(func() {

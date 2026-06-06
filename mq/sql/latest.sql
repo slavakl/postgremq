@@ -174,6 +174,21 @@ CREATE INDEX idx_queue_messages_completed_processed_at
 ON queue_messages(processed_at)
 WHERE status = 'completed';
 
+-- Per-status partial indexes on queue_name for get_queue_statistics. The
+-- combined consume indexes group pending+processing together, so a
+-- single-status COUNT still needs a heap recheck to tell them apart. These
+-- narrow partial indexes let the hot pending/processing counts run as
+-- index-only/partial scans instead of full-table scans over the retained
+-- completed set (which can reach tens of millions of rows within the 24h
+-- completed-message retention window).
+CREATE INDEX idx_queue_messages_pending
+ON queue_messages(queue_name)
+WHERE status = 'pending';
+
+CREATE INDEX idx_queue_messages_processing
+ON queue_messages(queue_name)
+WHERE status = 'processing';
+
 /* Function: distribute_message
  *
  * Description:
@@ -196,6 +211,12 @@ WHERE status = 'completed';
 CREATE OR REPLACE FUNCTION distribute_message()
 RETURNS trigger AS $$
 BEGIN
+   -- Distribute to an exclusive queue only while its keep-alive is still live
+   -- (keep_alive_until > NOW()). There is no grace window: the reaper and the
+   -- consume-side gating use the same strict NOW() cutoff, so an expired queue
+   -- is treated as dead everywhere at once. Clients are responsible for sending
+   -- keep-alive well before expiry (with their own safety margin) so a queue is
+   -- never considered expired while still in use.
    INSERT INTO queue_messages(queue_name, message_id, vt)
    SELECT q.name, NEW.id, NEW.deliver_after
    FROM queues q
@@ -487,6 +508,10 @@ BEGIN
     -- every call (1000 consume/sec => 1000 dead tuples/sec), bloating the
     -- table the publish-side trigger also reads. Skipping the no-op refresh
     -- still leaves at least half the interval of runway before expiry.
+    --
+    -- Only refresh a queue that is still live (keep_alive_until > NOW()); a
+    -- queue that has already expired is dead and is not revived here. There is
+    -- no grace window — clients must send keep-alive before expiry.
     UPDATE queues
     SET keep_alive_until = NOW() + keep_alive_interval
     WHERE name = p_queue_name
@@ -499,6 +524,8 @@ BEGIN
         SELECT name, max_delivery_attempts
         FROM queues
         WHERE name = p_queue_name
+            -- Strict NOW() cutoff, symmetric with distribute_message and the
+            -- reaper: an expired exclusive queue serves nothing. No grace window.
             AND (NOT exclusive OR keep_alive_until > NOW())
     ),
     next_msg AS (
@@ -513,7 +540,16 @@ BEGIN
             AND (tq.max_delivery_attempts = 0 OR qm.delivery_attempts < tq.max_delivery_attempts)
             AND (qm.status = 'pending' OR qm.status = 'processing' )
             AND qm.vt <= NOW()
-        ORDER BY qm.published_at
+        -- Order by vt, not published_at, to match idx_queue_messages_consume
+        -- (queue_name, vt, published_at). The leading `vt <= NOW()` range scan
+        -- already walks the index in vt order, so ordering by vt eliminates the
+        -- Sort node that ORDER BY published_at forced over the whole visible set
+        -- (an O(n log n) cliff on a deep backlog). At distribution time vt equals
+        -- published_at, so fresh messages keep FIFO order. Tradeoff: REDELIVERED
+        -- messages (nack/release resets vt but not published_at) are ordered by
+        -- their reset vt rather than original publish time — acceptable for
+        -- visibility-timeout semantics.
+        ORDER BY qm.vt
         FOR UPDATE SKIP LOCKED
         LIMIT p_limit
     )
@@ -812,10 +848,11 @@ BEGIN
     WITH dropped AS (
         DELETE FROM queues q
         WHERE q.exclusive = true
-          -- 5s grace past expiry so a keep-alive that fired a hair late
-          -- (network/scheduler jitter) doesn't lose its queue out from
-          -- under an active consumer.
-          AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= NOW() - INTERVAL '5 seconds')
+          -- Strict expiry: reap as soon as keep_alive_until has passed. No
+          -- grace window — symmetric with distribute_message / consume_message,
+          -- so an expired queue is dead everywhere at the same instant. Clients
+          -- must send keep-alive before expiry (with their own margin).
+          AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= NOW())
           AND NOT EXISTS (
               SELECT 1 FROM dead_letter_queue dlq WHERE dlq.queue_name = q.name
           )
@@ -953,6 +990,17 @@ $$ LANGUAGE plpgsql;
  *     - processing_count (BIGINT): Number of messages with status 'processing'.
  *     - completed_count (BIGINT): Number of messages with status 'completed'.
  *     - total_count (BIGINT): Total number of messages in the queue.
+ *
+ * Performance note:
+ *   pending_count and processing_count are served by the narrow partial
+ *   indexes idx_queue_messages_pending / idx_queue_messages_processing as
+ *   index-only/partial scans, so the common dashboard poll never touches the
+ *   retained completed set. completed_count and total_count inherently require
+ *   counting the completed rows (retained up to 24h) and are served by
+ *   idx_queue_messages_completed_processed_at; total_count is derived as the
+ *   sum of the three status counts rather than a separate full scan, so no
+ *   call performs a heap seqscan. The return shape is unchanged (four BIGINT
+ *   columns in the same order); Go/TS clients select all four by name.
  */
 CREATE OR REPLACE FUNCTION get_queue_statistics(p_queue VARCHAR(255) DEFAULT NULL)
 RETURNS TABLE(
@@ -963,13 +1011,23 @@ RETURNS TABLE(
 ) AS $$
 BEGIN
   RETURN QUERY
-    SELECT 
-      count(*) FILTER (WHERE qm.status = 'pending'),
-      count(*) FILTER (WHERE qm.status = 'processing'),
-      count(*) FILTER (WHERE qm.status = 'completed'),
-      count(*)
-    FROM queue_messages qm
-    WHERE (p_queue IS NULL OR qm.queue_name = p_queue);
+    SELECT
+      v_pending,
+      v_processing,
+      v_completed,
+      v_pending + v_processing + v_completed
+    FROM (
+      SELECT
+        (SELECT count(*) FROM queue_messages qm
+           WHERE qm.status = 'pending'
+             AND (p_queue IS NULL OR qm.queue_name = p_queue)) AS v_pending,
+        (SELECT count(*) FROM queue_messages qm
+           WHERE qm.status = 'processing'
+             AND (p_queue IS NULL OR qm.queue_name = p_queue)) AS v_processing,
+        (SELECT count(*) FROM queue_messages qm
+           WHERE qm.status = 'completed'
+             AND (p_queue IS NULL OR qm.queue_name = p_queue)) AS v_completed
+    ) counts;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1222,8 +1280,8 @@ BEGIN
   -- DLQ before dropping the queue.
   DELETE FROM queues q
   WHERE q.exclusive = true  -- Changed from durable = false
-    -- 5s grace past expiry — see pmq_maintenance_fast.
-    AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= NOW() - INTERVAL '5 seconds')
+    -- Strict expiry, no grace window — see pmq_maintenance_fast.
+    AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= NOW())
     AND NOT EXISTS (
         SELECT 1 FROM dead_letter_queue dlq WHERE dlq.queue_name = q.name
     );

@@ -28,8 +28,15 @@ module.exports = {
     }
   },
   testTimeout: 120000, // 120 seconds to allow container start/pulls
-  detectOpenHandles: true,
+  // detectOpenHandles is intentionally OFF: it implies --runInBand (serial),
+  // which defeats maxWorkers. Re-enable it temporarily (or run
+  // `jest --detectOpenHandles`) only when debugging a leaked handle.
   forceExit: true,
   setupFilesAfterEnv: ['<rootDir>/src/__tests__/setup.ts'],
-  maxWorkers: 1 // Run tests serially to avoid database conflicts
+  // Each test runs in its own freshly-created database (createIsolatedTestConnection),
+  // and each worker process reuses a single shared container (getSharedTestDatabase),
+  // so tests are fully isolated and safe to run in parallel. Mirrors Go's model
+  // (one shared container + parallel tests). Workers run test FILES concurrently,
+  // so the per-file real-time waits (vt expiry, keep-alive) overlap instead of summing.
+  maxWorkers: '50%'
 };

@@ -6,6 +6,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, jest } from '@jest/globals';
 import {
   TestDatabase,
+  getSharedTestDatabase,
   createIsolatedTestConnection,
   createTestConnection,
   generateTestPayload,
@@ -21,8 +22,7 @@ describe('Error Scenarios', () => {
   let dropDb: (() => Promise<void>) | null = null;
 
   beforeAll(async () => {
-    testDb = new TestDatabase();
-    await testDb.start();
+    testDb = await getSharedTestDatabase();
   });
 
   beforeEach(async () => {
@@ -44,7 +44,7 @@ describe('Error Scenarios', () => {
 
   afterAll(async () => {
     if (testDb) {
-      await testDb.stop();
+      // shared container is stopped once on process exit (getSharedTestDatabase)
     }
   });
 
@@ -627,15 +627,14 @@ describe('Error Scenarios', () => {
         const consumer = connection.consume('autoext-transient-queue', {
           batchSize: 3,
           // VT is 10s so the message can't be re-consumed even if our
-          // extension fails. extensionThreshold=0.9 schedules the first
-          // extension 1s after consume — that's where the injected
-          // transient error lands. With 1s backoff the retry hits at ~2s
-          // and succeeds, well before the 10s VT actually expires.
+          // extension fails. extensionThreshold=0.1 schedules the first
+          // extension ~1s after consume (10% of the remaining lease) — that's
+          // where the injected transient error lands. With 1s backoff the
+          // retry hits at ~2s and succeeds, well before the 10s VT expires.
           visibilityTimeoutSec: 10,
           autoExtension: {
             enabled: true,
-            extensionSec: 10,
-            extensionThreshold: 0.9,
+            extensionThreshold: 0.1,
             maxBatchSize: 100
           }
         });
@@ -714,8 +713,7 @@ describe('Error Scenarios', () => {
         visibilityTimeoutSec: 10,
         autoExtension: {
           enabled: true,
-          extensionSec: 10,
-          extensionThreshold: 0.9, // first extension at consume+1s
+          extensionThreshold: 0.1, // first extension at consume+1s (10% of lease)
           maxBatchSize: 100
         }
       });
@@ -784,8 +782,7 @@ describe('Error Scenarios', () => {
         visibilityTimeoutSec: 10,
         autoExtension: {
           enabled: true,
-          extensionSec: 10,
-          extensionThreshold: 0.9,
+          extensionThreshold: 0.1, // first extension ~1s after consume (10% of lease)
           maxBatchSize: 100
         }
       });
@@ -904,8 +901,7 @@ describe('Error Scenarios', () => {
           visibilityTimeoutSec: 10,
           autoExtension: {
             enabled: true,
-            extensionSec: 10,
-            extensionThreshold: 0.9,  // first attempt at consume+1s
+            extensionThreshold: 0.1,  // first attempt at consume+1s (10% of lease)
             maxBatchSize: 100
           }
         });

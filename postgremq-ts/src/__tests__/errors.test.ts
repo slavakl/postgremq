@@ -7,6 +7,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from '@jest/globals';
 import {
   TestDatabase,
+  getSharedTestDatabase,
   createIsolatedTestConnection,
   generateTestPayload,
   sleep,
@@ -24,8 +25,7 @@ describe('Typed errors (SQLSTATE → class mapping)', () => {
   let dropDb: (() => Promise<void>) | null = null;
 
   beforeAll(async () => {
-    testDb = new TestDatabase();
-    await testDb.start();
+    testDb = await getSharedTestDatabase();
   });
 
   beforeEach(async () => {
@@ -46,7 +46,7 @@ describe('Typed errors (SQLSTATE → class mapping)', () => {
 
   afterAll(async () => {
     if (testDb) {
-      await testDb.stop();
+      // shared container is stopped once on process exit (getSharedTestDatabase)
     }
   });
 

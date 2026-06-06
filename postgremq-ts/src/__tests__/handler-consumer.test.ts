@@ -7,6 +7,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from '@jest/globals';
 import {
   TestDatabase,
+  getSharedTestDatabase,
   createIsolatedTestConnection,
   generateTestPayload,
   sleep,
@@ -21,8 +22,7 @@ describe('HandlerConsumer', () => {
   let dropDb: (() => Promise<void>) | null = null;
 
   beforeAll(async () => {
-    testDb = new TestDatabase();
-    await testDb.start();
+    testDb = await getSharedTestDatabase();
   });
 
   beforeEach(async () => {
@@ -45,7 +45,7 @@ describe('HandlerConsumer', () => {
 
   afterAll(async () => {
     if (testDb) {
-      await testDb.stop();
+      // shared container is stopped once on process exit (getSharedTestDatabase)
     }
   });
 

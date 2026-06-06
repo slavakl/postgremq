@@ -7,6 +7,43 @@ import { ConsumerOptions } from './types';
 import { Connection } from './connection';
 import { Message } from './message';
 import { createDeferred, sleep } from './utils';
+import { ValidationError } from './errors';
+
+/**
+ * Validate consumer options at construction, mirroring the Go client's
+ * validateConsumeOptions. Throws ValidationError synchronously so misuse
+ * surfaces at consume()/consumeHandler() rather than as a silent hang
+ * (e.g. batchSize 0 never fetches) or a never-extended lease (e.g.
+ * extensionThreshold outside (0, 1) puts every extension time in the past).
+ *
+ * visibilityTimeoutSec === 0 is treated as "use the default" (Go maps
+ * 0 -> 30) rather than rejected, so it is validated by the caller after the
+ * default has been applied.
+ */
+export function validateConsumerOptions(options: Partial<ConsumerOptions>): void {
+  if (options.batchSize !== undefined && options.batchSize <= 0) {
+    throw new ValidationError('batchSize must be positive');
+  }
+  if (options.visibilityTimeoutSec !== undefined && options.visibilityTimeoutSec < 0) {
+    throw new ValidationError('visibilityTimeoutSec must be non-negative');
+  }
+  if (options.pollingIntervalMs !== undefined && options.pollingIntervalMs <= 0) {
+    throw new ValidationError('pollingIntervalMs must be positive');
+  }
+  const ext = options.autoExtension;
+  if (ext) {
+    if (ext.extensionThreshold !== undefined &&
+        (ext.extensionThreshold <= 0 || ext.extensionThreshold >= 1)) {
+      throw new ValidationError('extensionThreshold must be in (0, 1)');
+    }
+    if (ext.extensionSec !== undefined && ext.extensionSec <= 0) {
+      throw new ValidationError('extensionSec must be positive');
+    }
+    if (ext.maxBatchSize !== undefined && ext.maxBatchSize <= 0) {
+      throw new ValidationError('autoExtension.maxBatchSize must be positive');
+    }
+  }
+}
 
 /**
  * Track which message is due next for visibility timeout extension
@@ -59,20 +96,25 @@ class ExtensionQueue {
   }
 
   /**
-   * Schedule `message` for extension. The first attempt is at
-   * `vt - visibilityTimeoutSec * threshold * 1000` (typically halfway
-   * through the lease). No-op if the message's vt is older than 3× the
-   * lease window (likely already expired or stuck) or if the planned
-   * extension time is already past — in the latter case the caller's
-   * normal scheduling/retry path will pick it up.
+   * Schedule `message` for extension. The first attempt fires once
+   * `threshold` of the *remaining* lease (vt - now) has elapsed —
+   * mirroring Go's calculateExtendAt — leaving the rest as headroom for
+   * latency and the extension call itself. No-op if the message's vt is
+   * older than 3× the lease window (likely already expired or stuck). If
+   * the computed extension time is already in the past (e.g. a very short
+   * remaining lease), schedule it for `now` so it's extended immediately
+   * rather than silently dropped — dropping it would leave the message
+   * untracked and let it expire mid-processing.
    */
   add(message: Message): void {
-    const thresholdMs = this.visibilityTimeoutSec * this.threshold * 1000;
     const now = Date.now();
     const MAX_AGE_MS = this.visibilityTimeoutSec * 3 * 1000;
     if (message.vt.getTime() < now - MAX_AGE_MS) return;
-    const extensionTime = new Date(message.vt.getTime() - thresholdMs);
-    if (extensionTime.getTime() <= now) return;
+    // Wait `threshold` of the remaining lease, then extend. Derived from
+    // the message's actual vt so schedule and lease stay consistent even
+    // when the lease was just extended to a different value.
+    const remainingMs = Math.max(0, message.vt.getTime() - now);
+    const extensionTime = new Date(now + remainingMs * this.threshold);
 
     const idx = this.findInsertionIndex(extensionTime, message.id);
     this.items.splice(idx, 0, {
@@ -214,14 +256,25 @@ export class Consumer {
   ) {
     this.queueName = queueName;
     this.connection = connection;
-    
+
+    // Reject invalid options up front (mirrors Go's validateConsumeOptions)
+    // so misuse fails loudly here instead of as a silent hang / never-extend.
+    validateConsumerOptions(options);
+
+    // Treat an explicit visibilityTimeoutSec of 0 as "use the default"
+    // (matches Go mapping 0 -> 30) rather than letting it override.
+    const normalized: Partial<ConsumerOptions> = { ...options };
+    if (normalized.visibilityTimeoutSec === 0) {
+      delete normalized.visibilityTimeoutSec;
+    }
+
     // Merge default options with provided options
     this.options = {
       ...Consumer.DEFAULT_OPTIONS,
-      ...options,
+      ...normalized,
       autoExtension: {
         ...Consumer.DEFAULT_OPTIONS.autoExtension,
-        ...options.autoExtension
+        ...normalized.autoExtension
       }
     };
     
@@ -356,7 +409,12 @@ export class Consumer {
       this.tryAfter = null;
 
       const now = new Date();
-      const extensionSec = this.options.autoExtension.extensionSec ?? 30;
+      // Always re-extend by the configured consume VT (matching Go). The
+      // ExtensionQueue schedule is derived from the returned vt, so the
+      // lease the SQL grants and the next-extension time stay consistent.
+      // Using an independent, smaller amount here would collapse a large
+      // VT and let the message expire before the next scheduled extension.
+      const extensionSec = this.options.visibilityTimeoutSec;
       const maxBatchSize = this.options.autoExtension.maxBatchSize ?? 100;
 
       const dueForExtension = this.queue.due(now, maxBatchSize);
@@ -395,10 +453,19 @@ export class Consumer {
         if (extendedIds.has(info.messageId)) continue;
         const msg = this.inFlightMessages.get(info.messageId);
         if (msg) {
+          // Signal the handler (advisory abort) that the lease is gone, then
+          // drop the message from in-flight tracking and the extension queue.
+          // Without the inFlight removal, a handler that honors the abort by
+          // returning without ack/nack/release leaks the entry until stop(),
+          // growing memory and slowing shutdown. handleMessageComplete also
+          // removes it from the extension queue, so no separate remove() is
+          // needed here.
           msg._cancel();
           leaseLost++;
+          this.handleMessageComplete(info.messageId);
+        } else {
+          this.queue.remove(info.messageId);
         }
-        this.queue.remove(info.messageId);
       }
 
       if (leaseLost > 0 && !this.connection.isClientShuttingDown()) {

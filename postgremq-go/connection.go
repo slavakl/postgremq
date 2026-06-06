@@ -44,6 +44,7 @@ type Connection struct {
 	keepAliveWg         sync.WaitGroup
 	retryConfig         RetryConfig
 	closedFlag          chan struct{}
+	closeOnce           sync.Once
 	// topicCache maps queue name -> topic name. Populated by CreateQueue
 	// in this session, and also by Consume when WithTopic is provided
 	// explicitly. Consume avoids any SQL round-trip when the entry is
@@ -126,58 +127,62 @@ func newConnection(_ context.Context, pool Pool, ownPool bool, opts ...Connectio
 //   - Messages buffered by a Consumer but not yet delivered are released back
 //     to the queue without incrementing delivery attempts.
 func (c *Connection) Close() error {
-	if c.isClosed() {
-		return nil
-	}
-	close(c.closedFlag)
-	c.cancel()
+	// Guard the entire teardown with a sync.Once so concurrent callers (e.g. a
+	// deferred Close racing a signal handler) can't both close(c.closedFlag) —
+	// which panics "close of closed channel" — or run the non-idempotent
+	// teardown twice. The first caller performs the shutdown; any concurrent or
+	// later caller returns nil cleanly.
+	c.closeOnce.Do(func() {
+		close(c.closedFlag)
+		c.cancel()
 
-	// Stop the event listener first. This closes every consumer's wake
-	// channels, so consumers stop pulling new messages immediately while
-	// they finish processing whatever they already prefetched. Their
-	// Stop() calls below then become a clean drain.
-	c.eventListener.Close()
+		// Stop the event listener first. This closes every consumer's wake
+		// channels, so consumers stop pulling new messages immediately while
+		// they finish processing whatever they already prefetched. Their
+		// Stop() calls below then become a clean drain.
+		c.eventListener.Close()
 
-	// Stop all consumers and wait for in-flight messages to complete.
-	var wg sync.WaitGroup
-	c.mu.RLock()
-	consumers := c.consumers
-	c.mu.RUnlock()
-	for _, consumer := range consumers {
-		wg.Add(1)
-		go func(cons Stoppable) {
-			defer wg.Done()
-			cons.Stop()
-		}(consumer)
-	}
-
-	// Wait for consumers with timeout if specified
-	if c.shutdownTimeout > 0 {
-		done := make(chan struct{})
-		go func() {
-			wg.Wait()
-			close(done)
-		}()
-
-		select {
-		case <-done:
-			// All consumers finished gracefully
-		case <-time.After(c.shutdownTimeout):
-
-			c.logger.Warnf("Excedded timeout for consumers to finish. Will shutdown connection")
+		// Stop all consumers and wait for in-flight messages to complete.
+		var wg sync.WaitGroup
+		c.mu.RLock()
+		consumers := c.consumers
+		c.mu.RUnlock()
+		for _, consumer := range consumers {
+			wg.Add(1)
+			go func(cons Stoppable) {
+				defer wg.Done()
+				cons.Stop()
+			}(consumer)
 		}
-	} else {
-		wg.Wait()
-	}
 
-	// Stop keep-alive loops
-	c.keepAliveCancel()
-	c.keepAliveWg.Wait() // waiting for all keep-alive loops to finish
+		// Wait for consumers with timeout if specified
+		if c.shutdownTimeout > 0 {
+			done := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(done)
+			}()
 
-	// Close pool if we own it
-	if c.ownPool {
-		c.pool.Close()
-	}
+			select {
+			case <-done:
+				// All consumers finished gracefully
+			case <-time.After(c.shutdownTimeout):
+
+				c.logger.Warnf("Excedded timeout for consumers to finish. Will shutdown connection")
+			}
+		} else {
+			wg.Wait()
+		}
+
+		// Stop keep-alive loops
+		c.keepAliveCancel()
+		c.keepAliveWg.Wait() // waiting for all keep-alive loops to finish
+
+		// Close pool if we own it
+		if c.ownPool {
+			c.pool.Close()
+		}
+	})
 	return nil
 }
 

@@ -437,7 +437,9 @@ func (c *Consumer) extendVTs(vts *vtHeap) (tryAfter time.Time) {
 	extendingMap := make(map[int64]*vtInfo)
 	var extending []MessageExtension
 
-	// get the batch of messages to extend
+	// get the batch of messages to extend. The heap holds at most one entry per
+	// messageID (push() overrides on duplicate), so set_vt_batch — which
+	// correlates result rows by messageID — never sees a duplicate ID.
 	head := vts.peek()
 	for head != nil && head.extendAt.Before(extendDeadline) && len(extending) < c.extendBatchSize {
 		head = vts.pop()
@@ -620,7 +622,19 @@ func (h *vtHeap) Pop() interface{} {
 }
 
 // helper methods
+
+// push inserts item, or — if an entry for the same messageID is already in the
+// heap — overrides it in place with the new data and re-heapifies. The newest
+// state from the DB always wins: if consume_message re-picks a message whose
+// lease lapsed (same messageID, new consumer_token and vt), that fresh entry
+// replaces the stale one instead of creating a duplicate that would corrupt
+// itemIndex.
 func (h *vtHeap) push(item *vtInfo) {
+	if idx, ok := h.itemIndex[item.messageID]; ok {
+		h.items[idx] = item
+		heap.Fix(h, idx)
+		return
+	}
 	heap.Push(h, item)
 }
 

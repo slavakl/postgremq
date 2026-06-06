@@ -86,6 +86,14 @@ export class Connection implements IConnection {
   /** Map of exclusive queue keep-alive intervals in seconds */
   private exclusiveQueueIntervals: Map<string, number> = new Map();
 
+  /** Emitter for connection-level events the application can observe.
+   *  Currently emits 'keepAliveFailure' (queue, error) when keep-alive for
+   *  an exclusive queue is permanently abandoned. */
+  private readonly events: EventEmitter = new EventEmitter();
+
+  /** Optional callback invoked alongside the 'keepAliveFailure' event. */
+  private readonly onKeepAliveFailure?: (queue: string, error: unknown) => void;
+
   /** Retry policy for operations */
   private retryPolicy: RetryPolicy;
 
@@ -126,6 +134,12 @@ export class Connection implements IConnection {
   private static readonly NOTIFY_RECONNECT_BASE_MS = 500;
   private static readonly NOTIFY_RECONNECT_MAX_MS = 30_000;
 
+  /** Pending notify-listener reconnect timer (set by handleNotifyClientError).
+   *  Tracked so close()/stopNotificationListener can clear it — otherwise a
+   *  live timer (delay up to 30s) keeps the Node event loop alive past
+   *  close() and hangs short-lived processes. */
+  private notifyReconnectTimer: NodeJS.Timeout | null = null;
+
   /**
    * Create a new connection manager
    * @param options - Connection options
@@ -153,6 +167,9 @@ export class Connection implements IConnection {
     
     // Set shutdown timeout
     this.shutdownTimeoutMs = options.shutdownTimeoutMs || 30000;
+
+    // Optional keep-alive give-up callback (also surfaced via the emitter).
+    this.onKeepAliveFailure = options.onKeepAliveFailure;
 
     // Install a single pool-level error handler to avoid unhandled errors from idle clients
     try {
@@ -509,7 +526,11 @@ export class Connection implements IConnection {
       Connection.NOTIFY_RECONNECT_MAX_MS,
     );
     this.notifyReconnectAttempts += 1;
-    setTimeout(() => {
+    if (this.notifyReconnectTimer) {
+      clearTimeout(this.notifyReconnectTimer);
+    }
+    const timer = setTimeout(() => {
+      this.notifyReconnectTimer = null;
       if (this.isShuttingDown || this.consumers.size === 0 || this.stoppingNotify) {
         return;
       }
@@ -517,6 +538,9 @@ export class Connection implements IConnection {
         console.error('Failed to restart notification listener:', err);
       });
     }, delay);
+    // Don't let a pending reconnect keep the process alive on its own.
+    if (typeof timer.unref === 'function') timer.unref();
+    this.notifyReconnectTimer = timer;
   }
 
   /**
@@ -552,6 +576,12 @@ export class Connection implements IConnection {
   private async stopNotificationListener(): Promise<void> {
     if (this.stoppingNotify) return;
     this.stoppingNotify = true;
+    // Cancel any pending reconnect so it can't fire (and keep the event loop
+    // alive) after the listener has been torn down.
+    if (this.notifyReconnectTimer) {
+      clearTimeout(this.notifyReconnectTimer);
+      this.notifyReconnectTimer = null;
+    }
     // If a startup is in-flight, await it first. The startup IIFE checks
     // consumers.size on resume and releases the client itself if we got
     // here first, so this await handles both orderings: either start
@@ -853,9 +883,15 @@ export class Connection implements IConnection {
           [name, topic, maxDeliveryAttempts, exclusive, keepAliveSeconds]
         );
 
-        // If this is an exclusive queue with a keep-alive period, set up the keep-alive timer
-        if (exclusive && options.keepAliveInterval) {
-          this.startQueueKeepAlive(name, options.keepAliveInterval);
+        // Exclusive queues expire unless the client keeps refreshing
+        // keep_alive_until. Start the refresh timer on `exclusive` alone
+        // (matching Go) — gating on an explicit keepAliveInterval meant an
+        // exclusive queue created with the default interval was never
+        // refreshed client-side and got reaped after ~300s if consumption
+        // paused. Use the same default (300s) as the server-side
+        // keep_alive_until set above and as Go's 5-minute default.
+        if (exclusive) {
+          this.startQueueKeepAlive(name, keepAliveSeconds);
         }
       });
     } catch (err) {
@@ -1166,21 +1202,32 @@ export class Connection implements IConnection {
       throw new Error('Client is not connected or shutting down');
     }
 
+    // Deliberately a DIRECT, un-retried call — not via executeWithRetry.
+    // consume_message is not idempotent: it flips matched rows to 'processing',
+    // increments delivery_attempts, mints a new consumer_token, and pushes vt
+    // forward. If the statement commits server-side but the response is lost on
+    // the wire (e.g. an 08-class drop while reading the result), a retry would
+    // skip the just-claimed rows and claim a SECOND disjoint batch — orphaning
+    // the first batch in 'processing' with delivery_attempts already burned.
+    // Recovery is the next fetch tick + vt expiry, not a retry. Mirrors Go's
+    // consumeMessages, which is also deliberately un-retried. (Genuinely
+    // idempotent ops — ack/nack/release/setVt/publish — keep the retry.)
+    const client = await this.pool.connect();
     try {
-      return await this.executeWithRetry(async (client) => {
-        const result = await client.query(
-          'SELECT * FROM consume_message($1, $2, $3)',
-          [queueName, visibilityTimeout, limit]
-        );
-        // message_id is BIGINT; convert at the read boundary so callers see a
-        // number (matches Message.id and the rest of the public surface).
-        return result.rows.map(row => ({
-          ...row,
-          message_id: Number(row.message_id),
-        }));
-      });
+      const result = await client.query(
+        'SELECT * FROM consume_message($1, $2, $3)',
+        [queueName, visibilityTimeout, limit]
+      );
+      // message_id is BIGINT; convert at the read boundary so callers see a
+      // number (matches Message.id and the rest of the public surface).
+      return result.rows.map(row => ({
+        ...row,
+        message_id: Number(row.message_id),
+      }));
     } catch (err) {
       throw mapDbError(err);
+    } finally {
+      client.release();
     }
   }
 
@@ -1493,6 +1540,29 @@ export class Connection implements IConnection {
   }
 
   /**
+   * Subscribe to a connection-level event. Currently emits:
+   *   - 'keepAliveFailure' (queue: string, error: unknown): the client has
+   *     permanently given up refreshing the keep-alive for an exclusive
+   *     queue; it will be reaped server-side once keep_alive_until lapses.
+   *
+   * @param event - The event name
+   * @param listener - The callback
+   */
+  on(event: 'keepAliveFailure', listener: (queue: string, error: unknown) => void): void;
+  on(event: string, listener: (...args: any[]) => void): void {
+    this.events.on(event, listener);
+  }
+
+  /**
+   * Unsubscribe a previously registered connection-level event listener.
+   * @param event - The event name
+   * @param listener - The callback to remove
+   */
+  off(event: string, listener: (...args: any[]) => void): void {
+    this.events.off(event, listener);
+  }
+
+  /**
    * Start keep-alive timer for an exclusive queue
    * @internal
    * @param queueName - The queue name
@@ -1572,10 +1642,21 @@ export class Connection implements IConnection {
     } catch (error) {
       console.error(`Error extending keep-alive for exclusive queue ${queueName}:`, error);
       
-      // If we've reached max retries, stop the keep-alive timer
+      // If we've reached max retries, stop the keep-alive timer and surface
+      // the give-up so the application can react (the queue will be reaped
+      // server-side once keep_alive_until lapses). We emit an observable
+      // event AND invoke the optional callback, in addition to logging.
       if (retryCount >= MAX_QUICK_RETRIES) {
         console.error(`Giving up on extending keep-alive for exclusive queue ${queueName} after ${retryCount} retries`);
         this.stopQueueKeepAlive(queueName);
+        this.events.emit('keepAliveFailure', queueName, error);
+        if (this.onKeepAliveFailure) {
+          try {
+            this.onKeepAliveFailure(queueName, error);
+          } catch (cbErr) {
+            console.error(`onKeepAliveFailure callback threw for queue ${queueName}:`, cbErr);
+          }
+        }
         return;
       }
       

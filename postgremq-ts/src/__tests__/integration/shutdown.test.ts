@@ -6,6 +6,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, jest } from '@jest/globals';
 import {
   TestDatabase,
+  getSharedTestDatabase,
   createIsolatedTestConnection,
   createTestConnection,
   generateTestPayload,
@@ -18,13 +19,12 @@ describe('Shutdown Behavior', () => {
   let dropDb: (() => Promise<void>) | null = null;
 
   beforeAll(async () => {
-    testDb = new TestDatabase();
-    await testDb.start();
+    testDb = await getSharedTestDatabase();
   });
 
   afterAll(async () => {
     if (testDb) {
-      await testDb.stop();
+      // shared container is stopped once on process exit (getSharedTestDatabase)
     }
   });
 

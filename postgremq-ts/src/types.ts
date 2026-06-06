@@ -70,6 +70,15 @@ export interface ConnectionOptions {
   shutdownTimeoutMs?: number;
   /** Retry policy for transient errors */
   retry?: RetryPolicy;
+  /**
+   * Called when the client permanently gives up refreshing the keep-alive
+   * for an exclusive queue (after the bounded quick-retry budget is
+   * exhausted). After this fires the queue will be reaped server-side once
+   * its keep_alive_until lapses, so the application should treat the queue
+   * as lost. The same event is also emitted on the connection's emitter as
+   * `'keepAliveFailure'`. Optional — omit it to fall back to logging only.
+   */
+  onKeepAliveFailure?: (queue: string, error: unknown) => void;
 }
 
 /**
@@ -231,9 +240,22 @@ export interface ConsumerOptions {
   autoExtension?: {
     /** Whether to automatically extend message visibility */
     enabled: boolean;
-    /** Percentage of visibility timeout to wait before extending (e.g., 0.5 = 50%) */
+    /**
+     * Fraction of the remaining visibility timeout that must elapse before
+     * auto-extension fires, matching the Go client's `WithExtensionThreshold`.
+     * Must be in (0, 1). Default 0.5 (extend at the halfway point). Lower
+     * values extend earlier (more headroom, more DB calls); higher values
+     * extend later (e.g. 0.9 = extend at 90% of the lease). Note: this is the
+     * inverse of pre-1.0 TS behavior, where a higher value extended earlier —
+     * it now follows the documented/Go semantics.
+     */
     extensionThreshold?: number;
-    /** How much to extend visibility by (in seconds) */
+    /**
+     * @deprecated Ignored. Auto-extension always re-extends by
+     * `visibilityTimeoutSec` (matching the Go client) so the granted lease
+     * and the next-extension schedule stay consistent. A smaller value here
+     * used to collapse a large VT and let messages expire mid-processing.
+     */
     extensionSec?: number;
     /** Maximum number of messages to process in a single extension batch */
     maxBatchSize?: number;
