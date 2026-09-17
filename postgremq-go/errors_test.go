@@ -1,7 +1,6 @@
 package postgremq_go_test
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -340,15 +339,15 @@ func TestErrValidation_SetVTBatchMismatchedArrays(t *testing.T) {
 	require.NoError(t, conn.CreateTopic(ctx, "BatchValTopic"))
 	require.NoError(t, conn.CreateQueue(ctx, "BatchValQueue", "BatchValTopic", false))
 
-	// SetVTBatch fires a query with mismatched arrays; the SQL function raises PMQ03.
-	// We craft the mismatch by issuing the SQL directly through the pool to
-	// bypass client-side normalization that would equalize the two arrays.
-	_, err = pool.Exec(ctx, `SELECT * FROM set_vt_batch($1, ARRAY[1,2]::int[], ARRAY['a']::varchar[], 60)`, "BatchValQueue")
+	// set_vt_batch_multi rejects mismatched parallel arrays with PMQ03. We craft
+	// the mismatch by issuing the SQL directly through the pool to bypass the
+	// client-side normalization that would always pass equal-length arrays.
+	_, err = pool.Exec(ctx,
+		`SELECT * FROM set_vt_batch_multi(ARRAY[$1]::varchar[], ARRAY[1,2]::bigint[], ARRAY['a']::varchar[], ARRAY[60]::int[])`,
+		"BatchValQueue")
 	require.Error(t, err)
 	// The raw-SQL path doesn't go through mapPgError. We verify the SQLSTATE
 	// directly via pgconn.PgError: errors.Is on the wrapped sentinel works
 	// only on paths that go through the client's wrappers.
-	require.Contains(t, err.Error(), "must have the same length")
+	require.Contains(t, err.Error(), "SQLSTATE PMQ03")
 }
-
-func _silenceUnused(_ context.Context) {}

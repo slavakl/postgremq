@@ -105,18 +105,19 @@ func TestPerTopicNotify_OutOfBandQueueNeedsWithTopic(t *testing.T) {
 }
 
 // TestPerTopicNotify_WithTopicOption verifies WithTopic bypasses both the
-// cache and any DB lookup. Even with the queue absent from the database, the
-// listener registration succeeds.
+// topic cache. The queue generation is resolved from the database.
 func TestPerTopicNotify_WithTopicOption(t *testing.T) {
 	t.Parallel()
-	pool, _ := setupTestConnection(t)
+	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
 	conn, err := postgremq.DialFromPool(pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
-	consumer, err := conn.Consume("QueueDoesNotExistInDB",
+	_, err = pool.Exec(ctx, "SELECT create_topic('ExplicitTopic'); SELECT create_queue('ExternalQueue','ExplicitTopic')")
+	require.NoError(t, err)
+	consumer, err := conn.Consume("ExternalQueue",
 		postgremq.WithVT(30),
 		postgremq.WithTopic("ExplicitTopic"),
 	)

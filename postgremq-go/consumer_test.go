@@ -231,6 +231,7 @@ func TestConsumerVisibilityTimeoutExtension(t *testing.T) {
 	defer consumer.Stop()
 
 	msg := <-consumer.Messages()
+	initialVT := msg.GetVT()
 
 	// Wait to allow auto-extension to occur.
 	// With VT=2 seconds, extension happens at halfway (1 second).
@@ -245,12 +246,12 @@ func TestConsumerVisibilityTimeoutExtension(t *testing.T) {
 	err = msg.Ack(ctx)
 	require.NoError(t, err, "Ack failed")
 
-	assert.True(t, updatedVT.After(msg.GetVT()), "Visibility timeout should be extended automatically. Logs: \n\t%s", strings.Join(logger.GetMessages(), "\n\t"))
+	assert.True(t, updatedVT.After(initialVT), "Visibility timeout should be extended automatically. Logs: \n\t%s", strings.Join(logger.GetMessages(), "\n\t"))
 }
 
 // TestConsumerExtensionCancelsHandlerOnLeaseLost verifies that when the
 // auto-extension routine discovers a message's lease is lost server-side
-// (set_vt_batch returns the row missing from its result), the consumer
+// (set_vt_batch_multi returns the row missing from its result), the consumer
 // cancels msg.StoppedCtx so the handler can stop work that's no longer
 // ackable. Pre-fix the consumer just logged a warning — the handler ran
 // to completion, possibly committing non-idempotent side-effects, before
@@ -286,7 +287,7 @@ func TestConsumerExtensionCancelsHandlerOnLeaseLost(t *testing.T) {
 	msg2 := <-consumer.Messages()
 
 	// Steal msg1's lease server-side: rewrite consumer_token. The next
-	// set_vt_batch will omit msg1 from its result (token mismatch in the
+	// set_vt_batch_multi will omit msg1 from its result (token mismatch in the
 	// WHERE clause) — that's the lease-lost signal we want to test.
 	_, err = pool.Exec(ctx,
 		`UPDATE queue_messages SET consumer_token = 'stolen-by-other'

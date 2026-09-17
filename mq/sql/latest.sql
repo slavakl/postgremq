@@ -22,8 +22,9 @@
  *   - Exclusive (temporary): expire unless a client keeps them alive by
  *     periodically extending `keep_alive_until`.
  * - Keep‑Alive: Clients of exclusive queues should periodically call
- *   `extend_queue_keep_alive()` (both clients implement automatic keep‑alive)
- *   otherwise the queue is eligible for deletion by `delete_inactive_queues()`.
+ *   `extend_queue_keep_alive_multi()` (both clients implement automatic
+ *   connection-level keep‑alive) otherwise the queue is eligible for deletion
+ *   by `delete_inactive_queues()`.
  * - Delivery Attempts: Each time a message is consumed its
  *   `delivery_attempts` is incremented. When a queue has
  *   `max_delivery_attempts > 0` and a message reaches the limit, the
@@ -63,9 +64,10 @@
  *   - ack_message: Mark as completed; clears consumer token; sets processed_at.
  *   - nack_message: Return to pending with optional delay; clears token; NOTIFY.
  *   - release_message: Return to pending without incrementing attempts; NOTIFY.
- *   - set_vt / set_vt_batch: Extend visibility time for one or many messages.
+ *   - set_vt / set_vt_batch_multi: Extend visibility time for one or many
+ *     (cross-queue) messages.
  *   - requeue_dlq_messages / purge_dlq for DLQ management.
- *   - extend_queue_keep_alive / delete_inactive_queues for exclusive queues.
+ *   - extend_queue_keep_alive_multi / delete_inactive_queues for exclusive queues.
  *   - pmq_maintenance_fast: bundled cron entry — retires crashed-final-attempt
  *     rows to DLQ, reaps expired exclusive queues; returns counters.
  *   - Management: create_topic, create_queue, delete_topic, delete_queue,
@@ -81,6 +83,7 @@ CREATE TABLE topics (
 
 -- Queues table.
 CREATE TABLE queues (
+  generation UUID NOT NULL DEFAULT gen_random_uuid(),
   name VARCHAR(255) PRIMARY KEY,
   topic_name VARCHAR(255) NOT NULL REFERENCES topics(name) ON DELETE CASCADE,
   max_delivery_attempts INT NOT NULL DEFAULT 0,
@@ -96,8 +99,8 @@ CREATE TABLE messages (
   id BIGSERIAL PRIMARY KEY,
   topic_name VARCHAR(255) NOT NULL REFERENCES topics(name) ON DELETE CASCADE,
   payload JSONB NOT NULL,
-  published_at TIMESTAMPTZ DEFAULT NOW(),
-  deliver_after TIMESTAMPTZ DEFAULT NOW()  -- New column with default NOW()
+  published_at TIMESTAMPTZ DEFAULT clock_timestamp(),
+  deliver_after TIMESTAMPTZ DEFAULT clock_timestamp()  -- New column with default clock_timestamp()
 );
 
 -- Queue Messages table.
@@ -106,8 +109,8 @@ CREATE TABLE queue_messages (
   queue_name VARCHAR(255) REFERENCES queues(name) ON DELETE CASCADE,
   message_id BIGINT REFERENCES messages(id) ON DELETE CASCADE,
   status VARCHAR(16) DEFAULT 'pending',  -- Allowed: 'pending', 'processing', 'completed'
-  published_at TIMESTAMPTZ DEFAULT NOW(),
-  vt TIMESTAMPTZ NOT NULL DEFAULT NOW(),  -- Renamed from locked_until
+  published_at TIMESTAMPTZ DEFAULT clock_timestamp(),
+  vt TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),  -- Renamed from locked_until
   delivery_attempts INT DEFAULT 0,
   consumer_token VARCHAR(64),
   processed_at TIMESTAMPTZ,
@@ -132,7 +135,7 @@ CREATE TABLE dead_letter_queue (
   queue_name VARCHAR(255) REFERENCES queues(name) ON DELETE RESTRICT,
   message_id BIGINT REFERENCES messages(id) ON DELETE RESTRICT,
   retry_count INT,
-  published_at TIMESTAMPTZ DEFAULT NOW(),
+  published_at TIMESTAMPTZ DEFAULT clock_timestamp(),
   PRIMARY KEY (queue_name, message_id)
 );
 
@@ -212,8 +215,8 @@ CREATE OR REPLACE FUNCTION distribute_message()
 RETURNS trigger AS $$
 BEGIN
    -- Distribute to an exclusive queue only while its keep-alive is still live
-   -- (keep_alive_until > NOW()). There is no grace window: the reaper and the
-   -- consume-side gating use the same strict NOW() cutoff, so an expired queue
+   -- (keep_alive_until > clock_timestamp()). There is no grace window: the reaper and the
+   -- consume-side gating use the same strict clock_timestamp() cutoff, so an expired queue
    -- is treated as dead everywhere at once. Clients are responsible for sending
    -- keep-alive well before expiry (with their own safety margin) so a queue is
    -- never considered expired while still in use.
@@ -221,7 +224,7 @@ BEGIN
    SELECT q.name, NEW.id, NEW.deliver_after
    FROM queues q
    WHERE q.topic_name = NEW.topic_name
-     AND (NOT q.exclusive OR q.keep_alive_until > NOW());
+     AND (NOT q.exclusive OR q.keep_alive_until > clock_timestamp());
 
    -- Wake-up signal only; payload is empty. Clients use the channel name
    -- alone to decide what to fetch next.
@@ -306,7 +309,7 @@ $$ LANGUAGE plpgsql;
  *   "passive match-or-error" semantics.
  *
  *   For exclusive queues, an idempotent re-create also refreshes
- *   keep_alive_until to NOW() + keep_alive_interval. This means a re-create
+ *   keep_alive_until to clock_timestamp() + keep_alive_interval. This means a re-create
  *   on an expired exclusive queue effectively revives it (the caller is
  *   asserting ownership now), consistent with consume_message's implicit
  *   refresh on the same column.
@@ -317,7 +320,7 @@ $$ LANGUAGE plpgsql;
  *   - p_max_attempts (INTEGER): Maximum delivery attempts before moving to DLQ.
  *   - p_exclusive (BOOLEAN): If true, queue will be deleted when keep_alive expires.
  *   - p_keep_alive_interval (INTERVAL): Stored on the queue and used for both the initial
- *                                       keep_alive_until (NOW() + interval) and for the
+ *                                       keep_alive_until (clock_timestamp() + interval) and for the
  *                                       implicit refresh in consume_message. Defaults to
  *                                       '5 minutes'. Effectively only matters for exclusive
  *                                       queues; non-exclusive ones never expire.
@@ -335,9 +338,10 @@ CREATE OR REPLACE FUNCTION create_queue(
     p_max_attempts INTEGER DEFAULT 0,  -- 0 = unlimited retries
     p_exclusive BOOLEAN DEFAULT false,
     p_keep_alive_interval INTERVAL DEFAULT '5 minutes'
-) RETURNS VOID AS $$
+) RETURNS UUID AS $$
 DECLARE
     v_existing queues%ROWTYPE;
+    v_generation UUID;
 BEGIN
     IF p_queue_name IS NULL OR p_queue_name !~ '^[A-Za-z0-9_:.\-]+$' THEN
         RAISE EXCEPTION 'Invalid queue name "%": must match ^[A-Za-z0-9_:.\-]+$', p_queue_name
@@ -355,6 +359,9 @@ BEGIN
     -- attempts counter passes the negative threshold) and never retires to DLQ
     -- (nack_message and pmq_maintenance_fast both gate on max_attempts > 0).
     -- Reject upfront so callers see PMQ03 instead of an invisibly-broken queue.
+    IF p_keep_alive_interval IS NULL OR p_keep_alive_interval <= interval '0' THEN
+        RAISE EXCEPTION 'keep alive interval must be positive' USING ERRCODE = 'PMQ03';
+    END IF;
     IF p_max_attempts < 0 THEN
         RAISE EXCEPTION 'p_max_attempts must be >= 0 (got %)', p_max_attempts
           USING ERRCODE = 'PMQ03';
@@ -380,20 +387,23 @@ BEGIN
         p_exclusive,
         p_keep_alive_interval,
         CASE
-            WHEN p_exclusive THEN NOW() + p_keep_alive_interval
+            WHEN p_exclusive THEN clock_timestamp() + p_keep_alive_interval
             ELSE NULL
         END
     )
-    ON CONFLICT (name) DO NOTHING;
+    ON CONFLICT (name) DO NOTHING RETURNING generation INTO v_generation;
 
     IF FOUND THEN
-        RETURN;  -- inserted on the fast path
+        RETURN v_generation;  -- inserted on the fast path
     END IF;
 
     -- Conflict path: queue with this name already exists. Verify the caller's
     -- parameters match the existing row; otherwise raise so accidental config
     -- drift is caught loudly rather than silently ignored.
-    SELECT * INTO v_existing FROM queues WHERE name = p_queue_name;
+    SELECT * INTO v_existing FROM queues WHERE name = p_queue_name FOR UPDATE;
+    IF v_existing.exclusive AND v_existing.keep_alive_until <= clock_timestamp() THEN
+        RAISE EXCEPTION 'Queue "%" expired; delete it before recreating it', p_queue_name USING ERRCODE = 'PMQ02';
+    END IF;
     IF v_existing.topic_name IS DISTINCT FROM p_topic_name
        OR v_existing.max_delivery_attempts IS DISTINCT FROM p_max_attempts
        OR v_existing.exclusive IS DISTINCT FROM p_exclusive
@@ -408,15 +418,12 @@ BEGIN
           USING ERRCODE = 'PMQ03';
     END IF;
 
-    -- Params match → idempotent success. For exclusive queues, refresh
-    -- keep_alive_until so a re-create on an expired queue resurrects it.
-    -- (Non-exclusive queues never have keep_alive_until, so this is a no-op
-    -- for them.)
+    -- Redeclaration is idempotent only while this lease is live.
     IF p_exclusive THEN
-        UPDATE queues
-        SET keep_alive_until = NOW() + keep_alive_interval
+        UPDATE queues SET keep_alive_until = clock_timestamp() + keep_alive_interval
         WHERE name = p_queue_name;
     END IF;
+    RETURN v_existing.generation;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -432,7 +439,7 @@ $$ LANGUAGE plpgsql;
  * Parameters:
  *   - p_topic (VARCHAR): Topic name (must exist).
  *   - p_payload (JSONB): Arbitrary JSON payload stored in `messages.payload`.
- *   - p_deliver_after (TIMESTAMPTZ, default NOW()): First visibility time.
+ *   - p_deliver_after (TIMESTAMPTZ, default clock_timestamp()): First visibility time.
  *
  * Returns:
  *   BIGINT: The generated message id.
@@ -444,7 +451,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION publish_message(
     p_topic VARCHAR(255),
     p_payload JSONB,
-    p_deliver_after TIMESTAMPTZ DEFAULT NOW()
+    p_deliver_after TIMESTAMPTZ DEFAULT clock_timestamp()
 ) RETURNS BIGINT AS $$
 DECLARE
     v_message_id BIGINT;
@@ -476,11 +483,17 @@ $$ LANGUAGE plpgsql;
  *
  * Returns:
  *   A table of records with fields: queue_name, message_id, payload, consumer_token, delivery_attempts.
+ *
+ * Raises:
+ *   - PMQ03 if p_vt < 0 or p_limit <= 0.
+ *   - PMQ02 if the queue does not exist (deleted out-of-band). An existing but
+ *     empty queue returns zero rows with no error.
  */
 CREATE OR REPLACE FUNCTION consume_message(
     p_queue_name VARCHAR(255),
     p_vt INTEGER,
-    p_limit INT DEFAULT 1
+    p_limit INT DEFAULT 1,
+    p_generation UUID DEFAULT NULL
 ) RETURNS TABLE(
     queue_name VARCHAR(255),
     message_id BIGINT,
@@ -498,35 +511,29 @@ BEGIN
         RAISE EXCEPTION 'p_limit must be > 0' USING ERRCODE = 'PMQ03';
     END IF;
 
-    -- Refresh keep_alive_until for exclusive queues on every consume call.
-    -- Additive to extend_queue_keep_alive: covers the active-polling case
-    -- so a drifted client timer can't GC a queue that's still being used.
-    -- No-op for non-exclusive queues (their keep_alive_until is NULL).
-    --
-    -- Only write when the deadline has crept past the halfway point of the
-    -- interval. A high-rate consumer would otherwise version this hot row on
-    -- every call (1000 consume/sec => 1000 dead tuples/sec), bloating the
-    -- table the publish-side trigger also reads. Skipping the no-op refresh
-    -- still leaves at least half the interval of runway before expiry.
-    --
-    -- Only refresh a queue that is still live (keep_alive_until > NOW()); a
-    -- queue that has already expired is dead and is not revived here. There is
-    -- no grace window — clients must send keep-alive before expiry.
-    UPDATE queues
-    SET keep_alive_until = NOW() + keep_alive_interval
-    WHERE name = p_queue_name
-      AND exclusive
-      AND keep_alive_until > NOW()
-      AND keep_alive_until < NOW() + keep_alive_interval / 2;
+    -- Consuming a queue that no longer exists is fatal for the caller's consumer:
+    -- RabbitMQ surfaces queue deletion to active consumers as a cancel / channel
+    -- exception. Raise PMQ02 so the client can tear the consumer down instead of
+    -- silently polling an empty result forever. An existing-but-empty queue still
+    -- returns zero rows with no error (the common idle case); only an ABSENT
+    -- queue row raises here.
+    PERFORM 1 FROM queues WHERE name = p_queue_name AND (p_generation IS NULL OR generation = p_generation)
+      AND (NOT exclusive OR keep_alive_until > clock_timestamp());
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Queue "%" does not exist', p_queue_name
+          USING ERRCODE = 'PMQ02';
+    END IF;
 
+    -- Queue lifetime belongs to the keep-alive protocol, not message polling.
+    -- Consumption never locks the shared queue row to refresh its lease.
     RETURN QUERY
     WITH target_queue AS (
         SELECT name, max_delivery_attempts
         FROM queues
-        WHERE name = p_queue_name
-            -- Strict NOW() cutoff, symmetric with distribute_message and the
+        WHERE name = p_queue_name AND (p_generation IS NULL OR generation = p_generation)
+            -- Strict clock_timestamp() cutoff, symmetric with distribute_message and the
             -- reaper: an expired exclusive queue serves nothing. No grace window.
-            AND (NOT exclusive OR keep_alive_until > NOW())
+            AND (NOT exclusive OR keep_alive_until > clock_timestamp())
     ),
     next_msg AS (
         SELECT qm.queue_name,
@@ -539,9 +546,9 @@ BEGIN
         WHERE qm.queue_name = tq.name
             AND (tq.max_delivery_attempts = 0 OR qm.delivery_attempts < tq.max_delivery_attempts)
             AND (qm.status = 'pending' OR qm.status = 'processing' )
-            AND qm.vt <= NOW()
+            AND qm.vt <= clock_timestamp()
         -- Order by vt, not published_at, to match idx_queue_messages_consume
-        -- (queue_name, vt, published_at). The leading `vt <= NOW()` range scan
+        -- (queue_name, vt, published_at). The leading `vt <= clock_timestamp()` range scan
         -- already walks the index in vt order, so ordering by vt eliminates the
         -- Sort node that ORDER BY published_at forced over the whole visible set
         -- (an O(n log n) cliff on a deep backlog). At distribution time vt equals
@@ -555,7 +562,7 @@ BEGIN
     )
     UPDATE queue_messages
     SET status = 'processing',
-        vt = NOW() + make_interval(secs => p_vt),
+        vt = clock_timestamp() + make_interval(secs => p_vt),
         delivery_attempts = qm.delivery_attempts + 1,
         -- Per-lease ownership token. gen_random_uuid() is collision-free
         -- without the old timestamp+random()+txid_current() construction.
@@ -581,7 +588,7 @@ $$ LANGUAGE plpgsql;
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue.
- *   - p_message_id (INT): Identifier of the message.
+ *   - p_message_id (BIGINT): Identifier of the message.
  *   - p_consumer_token (VARCHAR): The consumer token generated via consume_message.
  *
  * Returns: VOID.
@@ -593,7 +600,7 @@ RETURNS VOID AS $$
 BEGIN
   UPDATE queue_messages
   SET status = 'completed',
-      processed_at = NOW(),
+      processed_at = clock_timestamp(),
       consumer_token = NULL
   WHERE queue_name = p_queue_name
     AND message_id = p_message_id
@@ -615,7 +622,7 @@ $$ LANGUAGE plpgsql;
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue.
- *   - p_message_id (INT): Identifier of the message.
+ *   - p_message_id (BIGINT): Identifier of the message.
  *   - p_consumer_token (VARCHAR): The consumer token to verify the consumer.
  *   - p_delay_until (TIMESTAMPTZ): The timestamp until which the message should be delayed for redelivery.
  *
@@ -625,7 +632,7 @@ CREATE OR REPLACE FUNCTION nack_message(
     p_queue_name VARCHAR(255),
     p_message_id BIGINT,
     p_consumer_token VARCHAR(64),
-    p_delay_until TIMESTAMPTZ DEFAULT NOW()
+    p_delay_until TIMESTAMPTZ DEFAULT clock_timestamp()
 ) RETURNS VOID AS $$
 DECLARE
     v_attempts     INT;
@@ -688,7 +695,7 @@ $$ LANGUAGE plpgsql;
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue.
- *   - p_message_id (INT): Identifier of the message.
+ *   - p_message_id (BIGINT): Identifier of the message.
  *   - p_consumer_token (VARCHAR): The consumer token to verify the consumer.
  *
  * Returns: VOID.
@@ -702,7 +709,7 @@ CREATE OR REPLACE FUNCTION release_message(
 BEGIN
     UPDATE queue_messages
     SET status = 'pending',
-        vt = NOW(),  -- Renamed from locked_until
+        vt = clock_timestamp(),  -- Renamed from locked_until
         consumer_token = NULL,
         -- GREATEST floors at 0: a stale consumer racing a reclaim path could
         -- otherwise underflow delivery_attempts on repeated releases. The
@@ -732,9 +739,9 @@ $$ LANGUAGE plpgsql;
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue.
- *   - p_message_id (INT): Identifier of the message.
+ *   - p_message_id (BIGINT): Identifier of the message.
  *   - p_consumer_token (VARCHAR): The consumer token to verify the consumer.
- *   - p_vt (INT): Additional seconds to add to the current lock duration.
+ *   - p_vt (INT): New lease duration in seconds from the current wall clock.
  *
  * Returns:
  *   TIMESTAMPTZ indicating new lock time.
@@ -757,19 +764,17 @@ BEGIN
         RAISE EXCEPTION 'p_vt must be >= 0' USING ERRCODE = 'PMQ03';
     END IF;
 
-    UPDATE queue_messages
-    SET vt = NOW() + make_interval(secs => p_vt)
-    WHERE queue_name = p_queue_name
-      AND message_id = p_message_id
-      AND consumer_token = p_consumer_token
-      AND status = 'processing'
-      AND vt > NOW()
-    RETURNING vt INTO v_vt;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Extend lock failed: message not in processing state or token mismatch'
+    SELECT qm.vt INTO v_vt FROM queue_messages qm
+    WHERE qm.queue_name = p_queue_name AND qm.message_id = p_message_id
+      AND qm.consumer_token = p_consumer_token AND qm.status = 'processing'
+    FOR UPDATE NOWAIT;
+    IF NOT FOUND OR v_vt <= clock_timestamp() THEN
+        RAISE EXCEPTION 'Extend lock failed: message not in processing state, expired, or token mismatch'
           USING ERRCODE = 'PMQ01';
     END IF;
+    UPDATE queue_messages qm SET vt = clock_timestamp() + make_interval(secs => p_vt)
+    WHERE qm.queue_name = p_queue_name AND qm.message_id = p_message_id
+    RETURNING qm.vt INTO v_vt;
 
     RETURN v_vt;
 END;
@@ -786,7 +791,7 @@ $$ LANGUAGE plpgsql;
  *      acking/nacking the final attempt — those would otherwise stay stuck
  *      in 'processing' (consume_message refuses to re-pick them because
  *      delivery_attempts >= max_delivery_attempts). The retire predicate is
- *      gated on status='processing' AND vt <= NOW() so we never yank a
+ *      gated on status='processing' AND vt <= clock_timestamp() so we never yank a
  *      healthy in-flight row out from under a still-running consumer.
  *   2. Reap exclusive queues whose keep_alive_until has expired.
  *
@@ -818,12 +823,12 @@ BEGIN
           AND q.max_delivery_attempts > 0
           AND qm.delivery_attempts >= q.max_delivery_attempts
           -- Only retire rows that are genuinely abandoned: a consumer
-          -- holding a still-valid lease (status='processing' AND vt > NOW())
+          -- holding a still-valid lease (status='processing' AND vt > clock_timestamp())
           -- might be mid-handler on its final attempt; yanking the row out
           -- from under it would let its side-effects commit while the
           -- message also lands in DLQ. Restrict to expired processing rows.
           AND qm.status = 'processing'
-          AND qm.vt <= NOW()
+          AND qm.vt <= clock_timestamp()
         RETURNING qm.queue_name, qm.message_id, qm.delivery_attempts
     ),
     inserted AS (
@@ -852,7 +857,7 @@ BEGIN
           -- grace window — symmetric with distribute_message / consume_message,
           -- so an expired queue is dead everywhere at the same instant. Clients
           -- must send keep-alive before expiry (with their own margin).
-          AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= NOW())
+          AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= clock_timestamp())
           AND NOT EXISTS (
               SELECT 1 FROM dead_letter_queue dlq WHERE dlq.queue_name = q.name
           )
@@ -864,47 +869,36 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-/* Function: extend_queue_keep_alive
- *
- * Description:
- *   Extends the keep-alive time for an exclusive queue by setting its
- *   expiration to NOW() plus the provided extension interval.
- *
- * Parameters:
- *   - p_queue_name (VARCHAR): Name of the queue.
- *   - p_interval (INTERVAL): The interval to add to NOW() for the new keep-alive timestamp.
- *
- * Returns: VOID.
- *
- * Raises:
- *   - PMQ02 if the queue does not exist.
- *   - PMQ03 if the queue exists but is not exclusive (keep-alive does not
- *     apply to non-exclusive queues). Previously both conditions collapsed
- *     to a FALSE return, leaving the caller unable to tell them apart.
+/* Queue heartbeat outcomes: extended with deadline, busy with NULL deadline,
+ * or omitted when gone/expired/wrong generation. Busy never means lease lost.
+ * Pass generations to bind renewals to specific queue incarnations.
  */
-CREATE OR REPLACE FUNCTION extend_queue_keep_alive(
-    p_queue_name VARCHAR(255),
-    p_interval INTERVAL
-) RETURNS VOID AS $$
-DECLARE
-    v_exclusive BOOLEAN;
+CREATE OR REPLACE FUNCTION extend_queue_keep_alive_multi(
+    p_queue_names  VARCHAR[],
+    p_intervals_ms BIGINT[],
+    p_generations UUID[] DEFAULT NULL
+) RETURNS TABLE (queue_name VARCHAR, keep_alive_until TIMESTAMPTZ, outcome TEXT) AS $$
+DECLARE r RECORD; deadline TIMESTAMPTZ;
 BEGIN
-    SELECT exclusive INTO v_exclusive
-    FROM queues WHERE name = p_queue_name;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Queue "%" does not exist', p_queue_name
-          USING ERRCODE = 'PMQ02';
+    IF cardinality(p_queue_names) IS DISTINCT FROM cardinality(p_intervals_ms)
+       OR (p_generations IS NOT NULL AND cardinality(p_generations) IS DISTINCT FROM cardinality(p_queue_names))
+       OR EXISTS (SELECT 1 FROM unnest(p_intervals_ms) v WHERE v IS NULL OR v <= 0) THEN
+        RAISE EXCEPTION 'invalid keep alive batch' USING ERRCODE = 'PMQ03';
     END IF;
-
-    IF NOT v_exclusive THEN
-        RAISE EXCEPTION 'Queue "%" is not exclusive; keep-alive does not apply', p_queue_name
-          USING ERRCODE = 'PMQ03';
-    END IF;
-
-    UPDATE queues
-    SET keep_alive_until = NOW() + p_interval
-    WHERE name = p_queue_name;
+    FOR r IN SELECT * FROM unnest(p_queue_names, p_intervals_ms, COALESCE(p_generations, array_fill(NULL::UUID, ARRAY[cardinality(p_queue_names)]))) AS t(name, ms, generation) ORDER BY name LOOP
+        BEGIN
+            SELECT q.keep_alive_until INTO deadline FROM queues q
+            WHERE q.name = r.name AND q.exclusive AND (r.generation IS NULL OR q.generation = r.generation) FOR UPDATE NOWAIT;
+            IF FOUND AND deadline > clock_timestamp() THEN
+                UPDATE queues q SET keep_alive_until = clock_timestamp() + make_interval(secs => r.ms / 1000.0)
+                WHERE q.name = r.name RETURNING q.keep_alive_until INTO deadline;
+                RETURN QUERY SELECT r.name, deadline, 'extended'::TEXT;
+            END IF;
+        EXCEPTION WHEN lock_not_available THEN
+            -- Contention says nothing about ownership. Retry before the known deadline.
+            RETURN QUERY SELECT r.name, NULL::TIMESTAMPTZ, 'busy'::TEXT;
+        END;
+    END LOOP;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1090,13 +1084,13 @@ BEGIN
         RETURNING dlq.queue_name, dlq.message_id
     )
     INSERT INTO queue_messages(queue_name, message_id, status, delivery_attempts, vt)
-    SELECT queue_name, message_id, 'pending', 0, NOW()
+    SELECT queue_name, message_id, 'pending', 0, clock_timestamp()
     FROM moved_messages
     ON CONFLICT (queue_name, message_id) DO UPDATE
       SET status = 'pending',
           delivery_attempts = 0,
           consumer_token = NULL,
-          vt = NOW(),
+          vt = clock_timestamp(),
           processed_at = NULL;
 
     -- Reads ROW_COUNT of the immediately-preceding INSERT (which counts
@@ -1204,7 +1198,7 @@ $$ LANGUAGE plpgsql;
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): The name of the queue.
- *   - p_message_id (INT): The identifier of the message to be deleted.
+ *   - p_message_id (BIGINT): The identifier of the message to be deleted.
  *
  * Returns: VOID.
  */
@@ -1281,7 +1275,7 @@ BEGIN
   DELETE FROM queues q
   WHERE q.exclusive = true  -- Changed from durable = false
     -- Strict expiry, no grace window — see pmq_maintenance_fast.
-    AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= NOW())
+    AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= clock_timestamp())
     AND NOT EXISTS (
         SELECT 1 FROM dead_letter_queue dlq WHERE dlq.queue_name = q.name
     );
@@ -1292,62 +1286,40 @@ $$ LANGUAGE plpgsql;
 -- End of Implementation Script
 -- ============================================================
 
-/* Function: set_vt_batch
- *
- * Description:
- *   Extends the visibility timeout for multiple messages in a single operation.
- *   Orders updates by message_id to prevent deadlocks when multiple consumers
- *   extend overlapping sets of messages.
- *
- * Parameters:
- *   - p_queue_name (VARCHAR): Name of the queue.
- *   - p_message_ids (INTEGER[]): Array of message IDs to extend.
- *   - p_consumer_tokens (VARCHAR[]): Array of consumer tokens (must match array order).
- *   - p_vt (INTEGER): New visibility timeout in seconds.
- *
- * Returns:
- *   TABLE of (message_id, vt) for successfully extended messages.
+/* Cross-queue heartbeats, correlated by (queue, message_id, consumer_token).
+ * Extended rows carry a confirmed vt. Busy rows carry NULL vt; retry within
+ * the known lease budget. Omitted rows have lost ownership or expired.
+ * NOWAIT prevents one contended row from delaying unrelated renewals.
  */
-CREATE OR REPLACE FUNCTION set_vt_batch(
-    p_queue_name VARCHAR(255),
-    p_message_ids BIGINT[],
+CREATE OR REPLACE FUNCTION set_vt_batch_multi(
+    p_queue_names     VARCHAR[],
+    p_message_ids     BIGINT[],
     p_consumer_tokens VARCHAR[],
-    p_vt INTEGER
-) RETURNS TABLE (message_id BIGINT, vt TIMESTAMPTZ) AS $$
+    p_vts             INTEGER[]
+) RETURNS TABLE (queue_name VARCHAR, message_id BIGINT, vt TIMESTAMPTZ, consumer_token VARCHAR, outcome TEXT) AS $$
+DECLARE r RECORD; owned queue_messages%ROWTYPE;
 BEGIN
-    IF p_vt < 0 THEN
-        RAISE EXCEPTION 'p_vt must be >= 0' USING ERRCODE = 'PMQ03';
+    IF cardinality(p_queue_names) IS DISTINCT FROM cardinality(p_message_ids)
+       OR cardinality(p_message_ids) IS DISTINCT FROM cardinality(p_consumer_tokens)
+       OR cardinality(p_consumer_tokens) IS DISTINCT FROM cardinality(p_vts)
+       OR EXISTS (SELECT 1 FROM unnest(p_vts) v WHERE v IS NULL OR v < 0) THEN
+        RAISE EXCEPTION 'invalid visibility timeout batch' USING ERRCODE = 'PMQ03';
     END IF;
-    IF COALESCE(array_length(p_message_ids, 1), 0)
-       IS DISTINCT FROM
-       COALESCE(array_length(p_consumer_tokens, 1), 0) THEN
-        RAISE EXCEPTION 'p_message_ids and p_consumer_tokens must have the same length'
-          USING ERRCODE = 'PMQ03';
-    END IF;
-
-    RETURN QUERY
-    WITH to_update AS (
-        SELECT unnest(p_message_ids) AS msg_id,
-               unnest(p_consumer_tokens) AS token
-    ),
-    -- Lock rows in consistent order to prevent deadlocks
-    locked_rows AS (
-        SELECT qm.queue_name, qm.message_id, qm.consumer_token
-        FROM queue_messages qm
-        JOIN to_update tu ON qm.message_id = tu.msg_id AND qm.consumer_token = tu.token
-        WHERE qm.queue_name = p_queue_name
-          AND qm.status = 'processing'
-          AND qm.vt > NOW()
-        ORDER BY qm.message_id
-        FOR UPDATE
-    )
-    UPDATE queue_messages qm
-    SET vt = NOW() + make_interval(secs => p_vt)
-    FROM locked_rows lr
-    WHERE qm.queue_name = lr.queue_name
-      AND qm.message_id = lr.message_id
-      AND qm.consumer_token = lr.consumer_token
-    RETURNING qm.message_id, qm.vt;
+    FOR r IN SELECT * FROM unnest(p_queue_names, p_message_ids, p_consumer_tokens, p_vts)
+        AS t(qname, id, token, seconds) ORDER BY qname, id LOOP
+        BEGIN
+            SELECT qm.* INTO owned FROM queue_messages qm
+            WHERE qm.queue_name = r.qname AND qm.message_id = r.id FOR UPDATE NOWAIT;
+            IF FOUND AND owned.status = 'processing' AND owned.consumer_token = r.token
+               AND owned.vt > clock_timestamp() THEN
+                UPDATE queue_messages qm SET vt = clock_timestamp() + make_interval(secs => r.seconds)
+                WHERE qm.queue_name = r.qname AND qm.message_id = r.id RETURNING qm.vt INTO owned.vt;
+                RETURN QUERY SELECT r.qname, r.id, owned.vt, r.token, 'extended'::TEXT;
+            END IF;
+        EXCEPTION WHEN lock_not_available THEN
+            RETURN QUERY SELECT r.qname, r.id, NULL::TIMESTAMPTZ, r.token, 'busy'::TEXT;
+        END;
+    END LOOP;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1392,7 +1364,7 @@ $$ LANGUAGE plpgsql;
  *   Retrieves a single message by ID, including its payload.
  *
  * Parameters:
- *   - p_message_id (INT): ID of the message.
+ *   - p_message_id (BIGINT): ID of the message.
  *
  * Returns:
  *   A TABLE with message details and payload.
@@ -1469,17 +1441,48 @@ $$ LANGUAGE plpgsql;
  *   -- Delete messages completed more than 7 days ago
  *   SELECT cleanup_completed_messages(168);
  */
-CREATE OR REPLACE FUNCTION cleanup_completed_messages(
-    p_older_than_hours INTEGER DEFAULT 24
-) RETURNS INTEGER AS $$
-DECLARE
-    v_deleted_count INTEGER;
-BEGIN
-    DELETE FROM queue_messages
-    WHERE status = 'completed'
-      AND processed_at < NOW() - make_interval(hours => p_older_than_hours);
+-- Reference indexes make payload collection independent of queue count.
+CREATE INDEX idx_queue_messages_message_id ON queue_messages(message_id);
+CREATE INDEX idx_dlq_message_id ON dead_letter_queue(message_id);
+CREATE INDEX idx_messages_retention ON messages(published_at, id);
 
-    GET DIAGNOSTICS v_deleted_count = ROW_COUNT;
-    RETURN v_deleted_count;
+-- Run regularly, including when there are no completed deliveries (unrouted
+-- publications and queue/DLQ deletion also leave unreferenced payloads).
+CREATE OR REPLACE FUNCTION cleanup_unreferenced_messages(p_older_than_hours INT DEFAULT 24, p_batch_size INT DEFAULT 1000)
+RETURNS INT AS $$
+DECLARE deleted INT;
+BEGIN
+    IF p_older_than_hours < 0 OR p_batch_size <= 0 THEN
+        RAISE EXCEPTION 'invalid retention or batch size' USING ERRCODE = 'PMQ03';
+    END IF;
+    WITH candidates AS (
+        SELECT m.id FROM messages m
+        WHERE m.published_at < clock_timestamp() - make_interval(hours => p_older_than_hours)
+          AND NOT EXISTS (SELECT 1 FROM queue_messages qm WHERE qm.message_id = m.id)
+          AND NOT EXISTS (SELECT 1 FROM dead_letter_queue d WHERE d.message_id = m.id)
+        ORDER BY m.published_at, m.id LIMIT p_batch_size FOR UPDATE SKIP LOCKED
+    ) DELETE FROM messages m USING candidates c WHERE m.id = c.id;
+    GET DIAGNOSTICS deleted = ROW_COUNT;
+    RETURN deleted;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cleanup_completed_messages(p_older_than_hours INT DEFAULT 24, p_batch_size INT DEFAULT 1000)
+RETURNS INT AS $$
+DECLARE deleted INT;
+BEGIN
+    IF p_older_than_hours < 0 OR p_batch_size <= 0 THEN
+        RAISE EXCEPTION 'invalid retention or batch size' USING ERRCODE = 'PMQ03';
+    END IF;
+    WITH candidates AS (
+        SELECT qm.queue_name, qm.message_id FROM queue_messages qm
+        WHERE qm.status = 'completed'
+          AND qm.processed_at < clock_timestamp() - make_interval(hours => p_older_than_hours)
+        ORDER BY qm.processed_at LIMIT p_batch_size FOR UPDATE SKIP LOCKED
+    ) DELETE FROM queue_messages qm USING candidates c
+      WHERE qm.queue_name = c.queue_name AND qm.message_id = c.message_id;
+    GET DIAGNOSTICS deleted = ROW_COUNT;
+    PERFORM cleanup_unreferenced_messages(p_older_than_hours, p_batch_size);
+    RETURN deleted;
 END;
 $$ LANGUAGE plpgsql;

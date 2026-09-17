@@ -13,7 +13,7 @@ const transientNodeErrorCodes = new Set([
   'EPIPE',
   'ECONNREFUSED',
   'ENOTFOUND',
-  'EAI_AGAIN'
+  'EAI_AGAIN',
 ]);
 
 // Transient SQLSTATE codes for PostgreSQL errors that should trigger a retry:
@@ -23,13 +23,7 @@ const transientNodeErrorCodes = new Set([
 //     (cannot_connect_now): server-side restart / failover; retries succeed
 //     once the server is available.
 // Class 08 (connection_exception) codes are matched by prefix below.
-const transientSQLStateCodes = new Set([
-  '40001',
-  '40P01',
-  '57P01',
-  '57P02',
-  '57P03',
-]);
+const transientSQLStateCodes = new Set(['40001', '40P01', '55P03', '57P01', '57P02', '57P03']);
 
 function isTransientSQLState(code: unknown): boolean {
   if (typeof code !== 'string') return false;
@@ -69,7 +63,8 @@ export function shouldRetry(error: any): boolean {
  */
 export async function withRetry<T>(
   operation: () => Promise<T>,
-  retryPolicy: RetryPolicy
+  retryPolicy: RetryPolicy,
+  retryable: (error: any) => boolean = shouldRetry
 ): Promise<T> {
   let lastError: Error | null = null;
   let attempt = 0;
@@ -80,30 +75,27 @@ export async function withRetry<T>(
       return await operation();
     } catch (error: any) {
       lastError = error;
-      
+
       // Only retry if the error is transient
-      if (!shouldRetry(error)) {
+      if (!retryable(error)) {
         throw error;
       }
-      
+
       attempt++;
-      
+
       // If we've reached maximum attempts, throw the last error
       if (attempt >= retryPolicy.maxAttempts) {
         break;
       }
-      
+
       // Calculate backoff time for next attempt
       await sleep(backoffMs);
-      
+
       // Increase backoff for next attempt, up to the maximum
-      backoffMs = Math.min(
-        backoffMs * retryPolicy.backoffMultiplier,
-        retryPolicy.maxBackoffMs
-      );
+      backoffMs = Math.min(backoffMs * retryPolicy.backoffMultiplier, retryPolicy.maxBackoffMs);
     }
   }
-  
+
   // If we've exhausted all retries, throw the last error
   throw lastError;
 }
@@ -114,7 +106,7 @@ export async function withRetry<T>(
  * @returns A promise that resolves after the specified delay
  */
 export function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -124,7 +116,7 @@ export const DEFAULT_RETRY_POLICY: RetryPolicy = {
   maxAttempts: 5,
   initialBackoffMs: 100,
   backoffMultiplier: 2,
-  maxBackoffMs: 5000
+  maxBackoffMs: 5000,
 };
 
 /**
@@ -134,12 +126,12 @@ export const DEFAULT_RETRY_POLICY: RetryPolicy = {
 export function createDeferred<T>(): [Promise<T>, (value: T) => void, (reason?: any) => void] {
   let resolve!: (value: T) => void;
   let reject!: (reason?: any) => void;
-  
+
   const promise = new Promise<T>((res, rej) => {
     resolve = res;
     reject = rej;
   });
-  
+
   return [promise, resolve, reject];
 }
 
@@ -217,4 +209,26 @@ export interface ConnectionOptions {
   // Client-specific options
   shutdownTimeoutMs?: number;
   retry?: RetryPolicy;
-} 
+}
+/** IDs remain numbers in this API; reject lossy BIGINT conversions. */
+export function messageId(value: unknown): number {
+  const id = Number(value);
+  if (!Number.isSafeInteger(id) || id < 1)
+    throw new RangeError('message ID must be a positive safe integer');
+  return id;
+}
+
+/** One deadline shared by all phases of a drain. The losing work is observed. */
+export async function untilDeadline(work: Promise<unknown>, deadline: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      work,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}

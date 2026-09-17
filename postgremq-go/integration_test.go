@@ -300,7 +300,7 @@ func TestRecoveryFromFailure(t *testing.T) {
 	}
 
 	// First consumer that will fail to process some messages
-	failingConsumer, err := conn.Consume(queueName)
+	failingConsumer, err := conn.Consume(queueName, postgremq.WithVT(1))
 	require.NoError(t, err, "Failed to create failing consumer")
 
 	// Process half the messages successfully, nack the rest

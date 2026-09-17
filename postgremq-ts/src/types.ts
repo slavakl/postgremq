@@ -71,14 +71,24 @@ export interface ConnectionOptions {
   /** Retry policy for transient errors */
   retry?: RetryPolicy;
   /**
-   * Called when the client permanently gives up refreshing the keep-alive
-   * for an exclusive queue (after the bounded quick-retry budget is
-   * exhausted). After this fires the queue will be reaped server-side once
-   * its keep_alive_until lapses, so the application should treat the queue
-   * as lost. The same event is also emitted on the connection's emitter as
-   * `'keepAliveFailure'`. Optional — omit it to fall back to logging only.
+   * Called when a queue becomes fatal for this connection — it is gone and any
+   * consumers on it have been torn down. Fires when the queue is deleted
+   * out-of-band (a consume returns PMQ02) or when an exclusive queue's
+   * keep-alive permanently fails. The error is a QueueFatalError. This is the
+   * queue-level signal; consumers also learn via Consumer.onClose, and it is the
+   * only signal for a producer-only exclusive queue with no consumer. The same
+   * event is emitted on the connection's emitter as `'queueFatal'`. Optional —
+   * omit it to fall back to logging only.
    */
-  onKeepAliveFailure?: (queue: string, error: unknown) => void;
+  onQueueFatal?: (queue: string, error: unknown) => void;
+  /**
+   * Maximum number of in-flight messages the connection-level auto-extension
+   * actor extends in a single set_vt_batch_multi call per tick. Auto-extension
+   * is connection-level (one actor coalesces every consumer's due extensions),
+   * so this is a connection option, not a per-consumer one. Bounds statement
+   * size only — correctness does not depend on it. Default 100. Must be > 0.
+   */
+  extenderBatchSize?: number;
 }
 
 /**
@@ -257,7 +267,12 @@ export interface ConsumerOptions {
      * used to collapse a large VT and let messages expire mid-processing.
      */
     extensionSec?: number;
-    /** Maximum number of messages to process in a single extension batch */
+    /**
+     * @deprecated Ignored. The extension batch cap is now a connection option
+     * (`ConnectionOptions.extenderBatchSize`) because auto-extension is
+     * connection-level — one actor batches across all consumers, so a
+     * per-consumer cap is meaningless.
+     */
     maxBatchSize?: number;
   };
   /** Polling interval in milliseconds (when no messages and no notifications) */

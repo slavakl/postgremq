@@ -39,11 +39,11 @@ func (c *Connection) ConsumeMessages(ctx context.Context, queue string, limit, v
 	return c.consumeMessages(ctx, queue, limit, vt)
 }
 
-// CalculateExtendAt exposes the unexported method so tests can verify
-// extension-timing math directly without spinning up a real Consumer
-// goroutine + database. Tests only.
+// CalculateExtendAt exposes the (now package-level) extension-timing math so
+// tests can verify it directly without spinning up a real Consumer goroutine +
+// database. Tests only.
 func (c *Consumer) CalculateExtendAt(vtUntil time.Time) time.Time {
-	return c.calculateExtendAt(vtUntil)
+	return calculateExtendAt(vtUntil, c.extensionThreshold)
 }
 
 // NewConsumerForTest constructs a Consumer with just the fields needed for
@@ -51,6 +51,26 @@ func (c *Consumer) CalculateExtendAt(vtUntil time.Time) time.Time {
 // touch the database. Tests only.
 func NewConsumerForTest(extensionThreshold float64) *Consumer {
 	return &Consumer{extensionThreshold: extensionThreshold}
+}
+
+// ExtenderRegister drives the connection-level vt-extender actor directly so
+// its batching / composite-key / lease-loss behavior can be tested without a
+// full consumer + database. Tests only.
+func (c *Connection) ExtenderRegister(queue, token string, id int64, vtSec int, threshold float64, vt time.Time, cancel context.CancelFunc) {
+	c.extenderRegister(&extEntry{
+		queue:     queue,
+		token:     token,
+		id:        id,
+		vtSec:     vtSec,
+		threshold: threshold,
+		extendAt:  calculateExtendAt(vt, threshold),
+		cancel:    cancel,
+	})
+}
+
+// ExtenderDeregister removes a message from the extender. Tests only.
+func (c *Connection) ExtenderDeregister(queue string, id int64, token string) {
+	c.extenderDeregister(queue, id, token)
 }
 
 // ValidateConsumeOptionsForTest exposes the unexported validation function

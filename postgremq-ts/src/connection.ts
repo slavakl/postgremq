@@ -22,17 +22,41 @@ import {
   QueueOptions,
   QueueStatistics,
   RetryPolicy,
-  Transaction
+  Transaction,
 } from './types';
 import { Consumer as ConsumerImpl } from './consumer';
 import { HandlerConsumer } from './handler-consumer';
-import { EventEmitter, DEFAULT_RETRY_POLICY, shouldRetry, sleep, withRetry } from './utils';
-import { mapDbError, ConnectionClosedError } from './errors';
+import {
+  EventEmitter,
+  DEFAULT_RETRY_POLICY,
+  shouldRetry,
+  sleep,
+  withRetry,
+  messageId as checkedMessageId,
+  untilDeadline,
+  createDeferred,
+} from './utils';
+import { mapDbError, ConnectionClosedError, QueueFatalError, ValidationError } from './errors';
 
 /** Anything the connection can shut down during close(). Both ConsumerImpl
  *  and HandlerConsumer satisfy this. */
 interface Stoppable {
   stop(): Promise<void>;
+}
+
+/** A consumer the connection can tear down when its queue becomes fatal (gone).
+ *  Both ConsumerImpl and HandlerConsumer implement it. */
+interface FatalConsumer extends Stoppable {
+  getQueueName(): string;
+  getQueueGeneration(): string | undefined;
+  fatal(err: QueueFatalError): void;
+}
+
+function isFatalConsumer(s: Stoppable): s is FatalConsumer {
+  return (
+    typeof (s as Partial<FatalConsumer>).getQueueName === 'function' &&
+    typeof (s as Partial<FatalConsumer>).fatal === 'function'
+  );
 }
 
 /** Subscriber callback fires whenever a NOTIFY arrives on the subscribed
@@ -51,6 +75,33 @@ function quoteIdent(s: string): string {
   return '"' + s.replace(/"/g, '""') + '"';
 }
 
+/** One exclusive queue tracked by the connection-level keep-alive actor. */
+interface KeepAliveEntry {
+  generation: string;
+  intervalSec: number;
+  nextAt: Date; // when to extend next (= last + interval/2)
+  expiresAt: Date;
+}
+
+/** One in-flight message tracked by the connection-level extender actor. */
+interface ExtEntry {
+  queue: string;
+  id: number;
+  token: string;
+  vtSec: number;
+  threshold: number;
+  nextExtensionTime: Date;
+  expiresAt: Date;
+  cancel: () => void; // advisory abort on lease loss (message._cancel)
+  onExtended: (vt: Date) => void; // keep message.vt current after an extension
+}
+
+/** Composite (queue, message_id) key — message_id alone collides across queues
+ *  because distribute_message fans one message into every queue on the topic. */
+function extKey(queue: string, id: number, token: string): string {
+  return queue + '\0' + id + '\0' + token;
+}
+
 // Forward declaration for Consumer
 // export class Consumer {
 //   constructor(queueName: string, connection: Connection, options?: Partial<ConsumerOptions>) {}
@@ -65,7 +116,7 @@ function quoteIdent(s: string): string {
 export class Connection implements IConnection {
   /** PostgreSQL connection pool */
   private pool: Pool;
-  
+
   /** Whether this connection owns the pool (should close it) */
   private ownsPool: boolean;
 
@@ -74,25 +125,60 @@ export class Connection implements IConnection {
 
   /** Flag indicating if client is shutting down */
   private isShuttingDown: boolean = false;
+  private connectPromise: Promise<void> | null = null;
+  private closePromise: Promise<void> | null = null;
+  private closeDeadline = Infinity;
+  private activeIO = new Set<() => void>();
 
   /** Set of active consumers. Holds both iterator-based consumers
    *  (ConsumerImpl) and handler-based ones (HandlerConsumer); both expose
    *  stop() so close() can shut them all down uniformly. */
   private consumers: Set<Stoppable> = new Set();
 
-  /** Map of exclusive queue keep-alive timeouts */
-  private exclusiveQueueTimers: Map<string, NodeJS.Timeout> = new Map();
+  // ---- Connection-level keep-alive actor ----
+  // One timer per connection batches every exclusive queue's keep-alive into a
+  // single extend_queue_keep_alive_multi call per tick (collapsing the former
+  // per-queue timer + interval Maps). Mirrors the Go client's keep-alive actor.
+  /** Per-queue keep-alive schedule, keyed by queue name. */
+  private keepAliveEntries: Map<string, KeepAliveEntry> = new Map();
+  /** Single timer that fires at the earliest pending keep-alive. */
+  private keepAliveTimer: NodeJS.Timeout | null = null;
+  /** True while a keep-alive flush is awaiting the DB (prevents overlap). */
+  private keepAliveFlushing = false;
 
-  /** Map of exclusive queue keep-alive intervals in seconds */
-  private exclusiveQueueIntervals: Map<string, number> = new Map();
+  // ---- Connection-level visibility-timeout extender actor ----
+  // Auto-extension moved off the per-consumer schedule onto one connection
+  // timer that coalesces every consumer's due extensions into a single
+  // set_vt_batch_multi call per tick. Keyed by the COMPOSITE (queue, id) — the
+  // same message_id distributed to two queues is two independent entries.
+  /** In-flight messages awaiting extension, keyed by `${queue}\0${id}`. */
+  private extenderEntries: Map<string, ExtEntry> = new Map();
+  /** Single timer that fires at the earliest pending extension. */
+  private extenderTimer: NodeJS.Timeout | null = null;
+  /** True while an extension flush is awaiting the DB (prevents overlap). */
+  private extenderFlushing = false;
+  /** Backoff floor after a transient extension failure. */
+  private extenderTryAfter: Date | null = null;
+  /** Per-tick cap on messages extended in one call (ConnectionOptions.extenderBatchSize). */
+  private readonly extenderBatchCap: number;
+
+  /** Set once close() has drained consumers and stopped the background actors
+   *  (keep-alive + extender). Gates the actors instead of isShuttingDown so
+   *  they keep running THROUGH the consumer drain (G6/G7) and stop only after,
+   *  mirroring the Go client's separate keepAliveCtx/extenderCtx cancelled last. */
+  private backgroundStopped = false;
 
   /** Emitter for connection-level events the application can observe.
-   *  Currently emits 'keepAliveFailure' (queue, error) when keep-alive for
-   *  an exclusive queue is permanently abandoned. */
+   *  Emits 'queueFatal' (queue, QueueFatalError) when a queue becomes gone and
+   *  its consumers are torn down. */
   private readonly events: EventEmitter = new EventEmitter();
 
-  /** Optional callback invoked alongside the 'keepAliveFailure' event. */
-  private readonly onKeepAliveFailure?: (queue: string, error: unknown) => void;
+  /** Optional callback invoked alongside the 'queueFatal' event. */
+  private readonly onQueueFatal?: (queue: string, error: unknown) => void;
+
+  /** Queues already declared fatal (dedupe queueFatal). Cleared on createQueue
+   *  so a recreated queue can go fatal again. */
+  private readonly fatalQueues: Set<string> = new Set();
 
   /** Retry policy for operations */
   private retryPolicy: RetryPolicy;
@@ -104,8 +190,8 @@ export class Connection implements IConnection {
   private connected: boolean = false;
 
   /** Flag indicating if notification listener is active */
-  private notificationListenerActive: boolean = false;
-  private stoppingNotify: boolean = false;
+  private notifyController: AbortController | null = null;
+  private notifyWake = createDeferred<void>();
 
   /**
    * Refcounted state for each NOTIFY channel we want to receive events on.
@@ -121,6 +207,7 @@ export class Connection implements IConnection {
    * which per-topic channel to subscribe to without querying the database.
    */
   private topicCache: Map<string, string> = new Map();
+  private queueGenerations = new Map<string, string>();
 
   /**
    * Promise used to serialise concurrent listener startup so multiple
@@ -128,17 +215,8 @@ export class Connection implements IConnection {
    */
   private notifyStartupPromise: Promise<void> | null = null;
 
-  /** Consecutive notify-listener reconnect failures, used to derive the
-   *  exponential backoff delay. Reset to 0 on a successful start. */
-  private notifyReconnectAttempts = 0;
   private static readonly NOTIFY_RECONNECT_BASE_MS = 500;
-  private static readonly NOTIFY_RECONNECT_MAX_MS = 30_000;
-
-  /** Pending notify-listener reconnect timer (set by handleNotifyClientError).
-   *  Tracked so close()/stopNotificationListener can clear it — otherwise a
-   *  live timer (delay up to 30s) keeps the Node event loop alive past
-   *  close() and hangs short-lived processes. */
-  private notifyReconnectTimer: NodeJS.Timeout | null = null;
+  private static readonly NOTIFY_RECONNECT_MAX_MS = 30000;
 
   /**
    * Create a new connection manager
@@ -153,23 +231,39 @@ export class Connection implements IConnection {
     } else {
       // Create new pool from connection string or config
       const poolConfig: PoolConfig = options.config || {};
-      
+
       if (options.connectionString) {
         poolConfig.connectionString = options.connectionString;
       }
-      
+
       this.pool = new Pool(poolConfig);
       this.ownsPool = true;
     }
-    
+
     // Set up retry policy
     this.retryPolicy = options.retry || DEFAULT_RETRY_POLICY;
-    
-    // Set shutdown timeout
-    this.shutdownTimeoutMs = options.shutdownTimeoutMs || 30000;
 
-    // Optional keep-alive give-up callback (also surfaced via the emitter).
-    this.onKeepAliveFailure = options.onKeepAliveFailure;
+    // Set shutdown timeout
+    this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? 30000;
+    for (const [name, value] of Object.entries({
+      shutdownTimeoutMs: this.shutdownTimeoutMs,
+      ...this.retryPolicy,
+    })) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > 2147483647)
+        throw new Error(`${name} must be positive and finite`);
+    }
+    if (!Number.isSafeInteger(this.retryPolicy.maxAttempts))
+      throw new Error('maxAttempts must be an integer');
+
+    // Optional queue-fatal callback (also surfaced via the emitter).
+    this.onQueueFatal = options.onQueueFatal;
+
+    // Connection-level extension batch cap (statement-size guard).
+    const extenderBatchSize = options.extenderBatchSize ?? 100;
+    if (!Number.isSafeInteger(extenderBatchSize) || extenderBatchSize <= 0) {
+      throw new Error('extenderBatchSize must be positive');
+    }
+    this.extenderBatchCap = extenderBatchSize;
 
     // Install a single pool-level error handler to avoid unhandled errors from idle clients
     try {
@@ -217,96 +311,63 @@ export class Connection implements IConnection {
    * @returns Promise that resolves when connected
    * @throws ConnectionClosedError if close() has already been called.
    */
-  async connect(): Promise<void> {
-    if (this.isShuttingDown) {
-      throw new ConnectionClosedError();
-    }
-    if (this.connected) {
-      return;
-    }
-
-    try {
-      // Test the connection by getting a client and releasing it
-      const client = await this.pool.connect();
-      await client.query('SELECT 1');
-      client.release();
-
-      this.connected = true;
-    } catch (error: any) {
-      throw new Error(`Failed to connect to PostgreSQL: ${error.message}`);
-    }
+  connect(): Promise<void> {
+    if (this.isShuttingDown) return Promise.reject(new ConnectionClosedError());
+    if (this.connected) return Promise.resolve();
+    if (!this.connectPromise)
+      this.connectPromise = this.runDatabase(async (client) => {
+        await client.query('SELECT 1');
+        if (this.isShuttingDown) throw new ConnectionClosedError();
+        this.connected = true;
+      }).finally(() => {
+        this.connectPromise = null;
+      });
+    return this.connectPromise;
   }
 
   /**
    * Close the connection and clean up resources
    * @returns Promise that resolves when disconnected
    */
-  async close(): Promise<void> {
-    if (!this.connected || this.isShuttingDown) {
-      return;
-    }
-
-    try {
+  close(): Promise<void> {
+    if (!this.closePromise) {
       this.isShuttingDown = true;
+      this.closeDeadline = Date.now() + this.shutdownTimeoutMs;
+      this.closePromise = this.drain();
+    }
+    return this.closePromise;
+  }
 
-      // Stop all consumers BEFORE setting isShuttingDown
-      // This allows consumers to complete their shutdown process
-      const consumerStopPromises = Array.from(this.consumers).map(consumer => {
-        return consumer.stop().catch(error => {
-          console.error(`Error stopping consumer: ${error}`);
-        });
-      });
-
-      // Wait for consumers to stop with timeout
-      let timeoutId: NodeJS.Timeout | null = null;
-      const timeoutPromise = new Promise<void>((resolve) => {
-        timeoutId = setTimeout(resolve, this.shutdownTimeoutMs);
-      });
-      await Promise.race([Promise.all(consumerStopPromises), timeoutPromise]);
-      if (timeoutId) clearTimeout(timeoutId);
-
-      // Clear all exclusive queue keep-alive timers
-      for (const [queueName, timer] of this.exclusiveQueueTimers.entries()) {
-        clearTimeout(timer);
-      }
-      this.exclusiveQueueTimers.clear();
-      this.exclusiveQueueIntervals.clear();
-      
-      // Close notification listener
-      await this.stopNotificationListener();
-      
-      // Close the pool if we own it (with timeout to avoid hangs under load)
-      if (this.ownsPool) {
-        let poolTimeoutId: NodeJS.Timeout | null = null;
-        const poolTimeout = new Promise<void>((resolve) => {
-          poolTimeoutId = setTimeout(resolve, this.shutdownTimeoutMs);
-        });
-        await Promise.race([this.pool.end(), poolTimeout]);
-        if (poolTimeoutId) clearTimeout(poolTimeoutId);
-      }
-      
-      // Clean up channel state
+  private async drain(): Promise<void> {
+    const timer = setTimeout(() => {
+      for (const abort of this.activeIO) abort();
+    }, this.getShutdownTimeoutMs());
+    try {
+      await untilDeadline(
+        Promise.allSettled(Array.from(this.consumers, (c) => c.stop())),
+        this.closeDeadline
+      );
+      this.backgroundStopped = true;
+      if (this.keepAliveTimer) clearTimeout(this.keepAliveTimer);
+      if (this.extenderTimer) clearTimeout(this.extenderTimer);
+      this.keepAliveTimer = this.extenderTimer = null;
+      this.keepAliveEntries.clear();
+      this.extenderEntries.clear();
+      await untilDeadline(this.stopNotificationListener(), this.closeDeadline);
+      this.connected = false;
+      this.consumers.clear();
       this.channelStates.clear();
       this.topicCache.clear();
-
-      this.connected = false;
-      // Keep isShuttingDown true - connection cannot be reused after close
-    } catch (error: any) {
-      const message = error?.message ?? String(error);
-      const isExpectedShutdownError =
-        message.includes('terminating connection') ||
-        message.includes('Connection terminated unexpectedly') ||
-        message.includes('Connection close timeout');
-
-      if (isExpectedShutdownError) {
-        console.warn(`Ignoring shutdown error during connection close: ${message}`);
-        this.connected = false;
-        return;
-      }
-
-      console.error(`Error during connection close: ${message}`);
-      throw error;
+      for (const abort of this.activeIO) abort();
+      if (this.ownsPool) await untilDeadline(this.pool.end(), this.closeDeadline);
+    } finally {
+      clearTimeout(timer);
     }
+  }
+
+  /** Remaining drain budget; consumers use the same deadline during Close. */
+  getShutdownTimeoutMs(): number {
+    return Math.max(0, Math.min(this.shutdownTimeoutMs, this.closeDeadline - Date.now()));
   }
 
   /**
@@ -314,80 +375,88 @@ export class Connection implements IConnection {
    * @internal
    * @returns Promise that resolves when listener is started
    */
-  private async startNotificationListener(): Promise<void> {
-    if (this.notifyClient || this.isShuttingDown || this.notificationListenerActive) {
-      return;
-    }
-    if (this.notifyStartupPromise) {
-      return this.notifyStartupPromise;
-    }
+  private startNotificationListener(): void {
+    if (this.notifyStartupPromise || this.isShuttingDown || !this.channelStates.size) return;
+    const controller = new AbortController();
+    this.notifyController = controller;
+    this.notifyStartupPromise = this.notificationLoop(controller.signal).finally(() => {
+      this.notifyStartupPromise = null;
+      this.notifyController = null;
+      // A subscriber may have arrived during teardown of the previous session.
+      this.startNotificationListener();
+    });
+  }
 
-    this.notifyStartupPromise = (async () => {
+  private async notificationLoop(signal: AbortSignal): Promise<void> {
+    let backoff = Connection.NOTIFY_RECONNECT_BASE_MS;
+    while (!signal.aborted && !this.isShuttingDown && this.channelStates.size) {
       try {
-        // Acquire dedicated client for LISTEN/NOTIFY.
-        const client = await this.pool.connect();
-
-        // Re-check after the await: if a consumer.stop() raced our
-        // pool.connect() and dropped consumers.size to 0 (or we're
-        // shutting down), the client we just acquired has nobody to
-        // own it. Releasing it here prevents a notify-client leak —
-        // pre-fix this path would happily install handlers, issue
-        // LISTENs against an empty subscriber set, and never release.
-        if (this.isShuttingDown || this.consumers.size === 0) {
-          try { client.release(); } catch {}
-          return;
-        }
-        this.notifyClient = client;
-
-        // Dispatch by channel name. PostgreMQ NOTIFYs carry no payload;
-        // the channel (`pmq:t:<topic>` for publishes, `pmq:q:<queue>` for
-        // nack/release/requeue) is itself the wake-up signal and the
-        // subscriber re-fetches via consume_message on receipt.
-        // LISTEN/UNLISTEN are issued directly on this same client by
-        // subscribeChannel, so no control channel is needed.
-        client.on('notification', (msg) => {
-          if (!msg.channel) return;
-          const state = this.channelStates.get(msg.channel);
-          if (!state || state.subscribers.size === 0) {
-            return;
-          }
-          for (const cb of state.subscribers) {
+        await this.runDatabase(
+          async (client) => {
+            this.notifyClient = client;
+            const actual = new Set<string>();
+            let failed: Error | undefined;
+            const onError = (error: Error) => {
+              failed = error;
+              this.notifyWake[1]();
+            };
+            const onNotification = (msg: { channel: string }) => {
+              for (const callback of this.channelStates.get(msg.channel)?.subscribers ?? []) {
+                try {
+                  callback();
+                } catch (error) {
+                  console.error('Notification callback failed:', error);
+                }
+              }
+            };
+            client.on('error', onError);
+            client.on('notification', onNotification);
             try {
-              cb();
-            } catch (err) {
-              console.error('Subscriber callback error:', err);
+              while (!signal.aborted && this.channelStates.size) {
+                const wake = (this.notifyWake = createDeferred<void>());
+                if (failed) throw failed;
+                for (const channel of actual) {
+                  if (!this.channelStates.has(channel)) {
+                    await client.query('UNLISTEN ' + quoteIdent(channel));
+                    actual.delete(channel);
+                  }
+                }
+                for (const [channel, state] of this.channelStates) {
+                  if (!actual.has(channel)) {
+                    await client.query('LISTEN ' + quoteIdent(channel));
+                    actual.add(channel);
+                  }
+                  state.listening = true;
+                }
+                backoff = Connection.NOTIFY_RECONNECT_BASE_MS;
+                if (failed) throw failed;
+                await wake[0];
+              }
+            } finally {
+              client.removeListener('notification', onNotification);
+              client.removeListener('error', onError);
+              if (this.notifyClient === client) this.notifyClient = null;
+              for (const state of this.channelStates.values()) state.listening = false;
             }
-          }
-        });
-
-        client.on('error', (error) => {
-          this.handleNotifyClientError(error);
-        });
-
-        // Re-issue LISTEN for any channels that already have subscribers
-        // (typical after an automatic reconnect).
-        for (const [channel, state] of this.channelStates) {
-          if (state.refCount > 0 && !state.listening) {
-            await client.query('LISTEN ' + quoteIdent(channel));
-            state.listening = true;
-          }
+          },
+          Infinity,
+          signal
+        );
+      } catch (error) {
+        if (!signal.aborted && !this.isShuttingDown) {
+          await new Promise<void>((resolve) => {
+            const done = () => {
+              clearTimeout(timer);
+              signal.removeEventListener('abort', done);
+              resolve();
+            };
+            const timer = setTimeout(done, backoff);
+            signal.addEventListener('abort', done, { once: true });
+          });
+          backoff = Math.min(backoff * 2, Connection.NOTIFY_RECONNECT_MAX_MS);
         }
-
-        this.notificationListenerActive = true;
-        // Successful start — clear the reconnect counter.
-        this.notifyReconnectAttempts = 0;
-      } catch (error: any) {
-        if (this.notifyClient) {
-          try { this.notifyClient.release(); } catch {}
-          this.notifyClient = null;
-        }
-        this.notificationListenerActive = false;
-        throw new Error(`Failed to start notification listener: ${error.message}`);
-      } finally {
-        this.notifyStartupPromise = null;
       }
-    })();
-    return this.notifyStartupPromise;
+    }
   }
 
   /**
@@ -402,43 +471,18 @@ export class Connection implements IConnection {
       state = { refCount: 0, listening: false, subscribers: new Set() };
       this.channelStates.set(channel, state);
     }
-    state.refCount += 1;
     state.subscribers.add(callback);
-
-    if (state.refCount === 1 && this.notifyClient && !state.listening) {
-      // Fire-and-forget LISTEN; the new connection handler also issues this
-      // on reconnect so we don't need to await here.
-      const c = this.notifyClient;
-      const stateRef = state;
-      c.query('LISTEN ' + quoteIdent(channel))
-        .then(() => { stateRef.listening = true; })
-        .catch((err) => {
-          if (this.isShuttingDown) return;
-          console.warn(`LISTEN ${channel} failed:`, err?.message ?? err);
-          // Without recovery, the channel's refCount stays >0 but no LISTEN
-          // is active — consumers fall back to polling forever. Treat as a
-          // client failure so handleNotifyClientError tears down and the
-          // reconnect path re-issues every desired LISTEN.
-          this.handleNotifyClientError(err);
-        });
-    }
-
+    state.refCount = state.subscribers.size;
+    this.notifyWake[1]();
+    this.startNotificationListener();
     return () => {
-      const s = this.channelStates.get(channel);
-      if (!s) return;
-      s.subscribers.delete(callback);
-      s.refCount -= 1;
-      if (s.refCount <= 0) {
-        this.channelStates.delete(channel);
-        if (this.notifyClient && s.listening && !this.isShuttingDown) {
-          const c = this.notifyClient;
-          c.query('UNLISTEN ' + quoteIdent(channel)).catch((err) => {
-            if (!this.isShuttingDown) {
-              console.warn(`UNLISTEN ${channel} failed:`, err?.message ?? err);
-            }
-          });
-        }
-      }
+      const current = this.channelStates.get(channel);
+      if (current !== state) return;
+      current.subscribers.delete(callback);
+      current.refCount = current.subscribers.size;
+      if (!current.refCount) this.channelStates.delete(channel);
+      this.notifyWake[1]();
+      if (!this.channelStates.size) void this.stopNotificationListener();
     };
   }
 
@@ -448,11 +492,7 @@ export class Connection implements IConnection {
    * that drops both subscriptions.
    * @internal
    */
-  subscribeForConsumer(
-    queue: string,
-    topic: string,
-    callback: SubscriberCallback
-  ): () => void {
+  subscribeForConsumer(queue: string, topic: string, callback: SubscriberCallback): () => void {
     const offTopic = this.subscribeChannel('pmq:t:' + topic, callback);
     const offQueue = this.subscribeChannel('pmq:q:' + queue, callback);
     return () => {
@@ -474,74 +514,16 @@ export class Connection implements IConnection {
     }
     const cached = this.topicCache.get(queue);
     if (cached) return cached;
-    throw new Error(`Queue "${queue}" topic unknown — pass options.topic to consume() or call createQueue() first`);
+    throw new Error(
+      `Queue "${queue}" topic unknown — pass options.topic to consume() or call createQueue() first`
+    );
   }
 
-  
   /**
    * Handle errors from the notification client
    * @internal
    * @param error - The error that occurred
    */
-  private handleNotifyClientError(error: any): void {
-    if (this.isShuttingDown) {
-      // Expected during shutdown when connections are terminated by server
-      console.debug('Notification listener error during shutdown (ignored):', error?.message ?? error);
-    } else {
-      console.error('Notification listener error:', error);
-    }
-    
-    // Clean up
-    if (this.notifyClient) {
-      try {
-        this.notifyClient.release();
-      } catch (releaseError) {
-        console.error('Error releasing notification client:', releaseError);
-      }
-      this.notifyClient = null;
-    }
-
-    this.notificationListenerActive = false;
-
-    // Reset per-channel listening flags so the next startNotificationListener
-    // re-issues LISTEN on the new client. Without this, the `!state.listening`
-    // guard in startNotificationListener skips channels that were marked
-    // listening on the now-dead client, leaving consumers without wake events.
-    for (const state of this.channelStates.values()) {
-      state.listening = false;
-    }
-    
-    // Schedule a reconnect with exponential backoff. The setTimeout
-    // breaks any potential recursion through startNotificationListener
-    // and gives the failing pool/network time to recover. Backoff grows
-    // 500ms → 1s → 2s → 4s … capped at 30s. Reset on a successful
-    // start (see startNotificationListener). We bail entirely when no
-    // consumers remain or we're shutting down — pre-fix this loop ran
-    // every 1s forever even after the last consumer left.
-    if (this.isShuttingDown || this.consumers.size === 0 || this.stoppingNotify) {
-      return;
-    }
-    const delay = Math.min(
-      Connection.NOTIFY_RECONNECT_BASE_MS * Math.pow(2, this.notifyReconnectAttempts),
-      Connection.NOTIFY_RECONNECT_MAX_MS,
-    );
-    this.notifyReconnectAttempts += 1;
-    if (this.notifyReconnectTimer) {
-      clearTimeout(this.notifyReconnectTimer);
-    }
-    const timer = setTimeout(() => {
-      this.notifyReconnectTimer = null;
-      if (this.isShuttingDown || this.consumers.size === 0 || this.stoppingNotify) {
-        return;
-      }
-      this.startNotificationListener().catch(err => {
-        console.error('Failed to restart notification listener:', err);
-      });
-    }, delay);
-    // Don't let a pending reconnect keep the process alive on its own.
-    if (typeof timer.unref === 'function') timer.unref();
-    this.notifyReconnectTimer = timer;
-  }
 
   /**
    * Register a consumer with this connection
@@ -549,6 +531,7 @@ export class Connection implements IConnection {
    * @param consumer - The consumer to register
    */
   registerConsumer(consumer: Stoppable): void {
+    if (this.isShuttingDown) throw new ConnectionClosedError();
     this.consumers.add(consumer);
   }
 
@@ -562,7 +545,7 @@ export class Connection implements IConnection {
     // If there are no more consumers, proactively stop the notification listener
     // to avoid lingering clients and open handles under heavy load.
     if (this.consumers.size === 0) {
-      this.stopNotificationListener().catch(err => {
+      this.stopNotificationListener().catch((err) => {
         // Safe to ignore during normal shutdown
         console.debug('Error stopping notification listener (ignored):', err);
       });
@@ -574,51 +557,10 @@ export class Connection implements IConnection {
    * Ensures the dedicated client is unlistened, listeners removed, and released.
    */
   private async stopNotificationListener(): Promise<void> {
-    if (this.stoppingNotify) return;
-    this.stoppingNotify = true;
-    // Cancel any pending reconnect so it can't fire (and keep the event loop
-    // alive) after the listener has been torn down.
-    if (this.notifyReconnectTimer) {
-      clearTimeout(this.notifyReconnectTimer);
-      this.notifyReconnectTimer = null;
-    }
-    // If a startup is in-flight, await it first. The startup IIFE checks
-    // consumers.size on resume and releases the client itself if we got
-    // here first, so this await handles both orderings: either start
-    // installs the client and we tear it down below, or start sees
-    // shutdown and releases on its own (notifyClient stays null and we
-    // return cleanly).
-    if (this.notifyStartupPromise) {
-      try { await this.notifyStartupPromise; } catch {}
-    }
-    const client = this.notifyClient;
-    if (!client) {
-      this.notificationListenerActive = false;
-      this.stoppingNotify = false;
-      return;
-    }
-    try {
-      try {
-        await client.query('UNLISTEN *');
-      } catch {}
-      // Remove all handlers to avoid error storms during shutdown
-      try { client.removeAllListeners('notification'); } catch {}
-      try { client.removeAllListeners('error'); } catch {}
-      try { client.release(); } catch {}
-    } finally {
-      if (this.notifyClient === client) {
-        this.notifyClient = null;
-      }
-      this.notificationListenerActive = false;
-      this.stoppingNotify = false;
-      // The released client's LISTENs are gone; clear flags so a future
-      // startNotificationListener will re-issue them on the new client.
-      for (const state of this.channelStates.values()) {
-        state.listening = false;
-      }
-    }
+    this.notifyController?.abort();
+    this.notifyWake[1]();
+    await this.notifyStartupPromise;
   }
-
 
   /**
    * Execute an operation with retry logic
@@ -629,20 +571,66 @@ export class Connection implements IConnection {
    */
   async executeWithRetry<T>(
     operation: (client: PoolClient) => Promise<T>,
-    retryPolicy: RetryPolicy = this.retryPolicy
+    retryPolicy: RetryPolicy = this.retryPolicy,
+    retryable: (error: any) => boolean = shouldRetry
   ): Promise<T> {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
-    return withRetry(async () => {
-      const client = await this.pool.connect();
-      try {
-        return await operation(client);
-      } finally {
-        client.release();
+
+    return withRetry(() => this.runDatabase(operation), retryPolicy, retryable);
+  }
+
+  /** A pooled operation owns acquisition, its deadline, and release. On timeout
+   * destroy the socket: a rejected Promise alone does not cancel PostgreSQL I/O. */
+  private async runDatabase<T>(
+    operation: (client: PoolClient) => Promise<T>,
+    budgetMs = 30000,
+    signal?: AbortSignal
+  ): Promise<T> {
+    let client: PoolClient | undefined;
+    let ended = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abort!: () => void;
+    const timeout = new Promise<never>((_, reject) => {
+      abort = () => {
+        if (ended) return;
+        ended = true;
+        if (client) client.release(true);
+        reject(new Error('Database operation deadline exceeded'));
+      };
+      const budget = Math.min(budgetMs, this.closeDeadline - Date.now());
+      if (Number.isFinite(budget)) timer = setTimeout(abort, Math.max(0, budget));
+    });
+    this.activeIO.add(abort);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    const work = (async () => {
+      const acquired = await this.pool.connect();
+      if (ended) {
+        acquired.release();
+        throw new Error('Database acquisition deadline exceeded');
       }
-    }, retryPolicy);
+      client = acquired;
+      return operation(acquired);
+    })();
+    try {
+      return await Promise.race([work, timeout]);
+    } catch (error) {
+      if (signal && !ended) {
+        ended = true;
+        client?.release(true);
+      }
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+      this.activeIO.delete(abort);
+      signal?.removeEventListener('abort', abort);
+      if (!ended) {
+        ended = true;
+        client?.release();
+      }
+    }
   }
 
   /**
@@ -671,7 +659,7 @@ export class Connection implements IConnection {
     const result = await queryable.query(query, params);
     // BIGINT columns arrive as strings from node-pg by default; convert at
     // the read boundary to keep the rest of the client on `number`.
-    return Number(result.rows[0].publish_message);
+    return checkedMessageId(result.rows[0].publish_message);
   }
 
   /**
@@ -681,20 +669,19 @@ export class Connection implements IConnection {
    * @param options - Publishing options
    * @returns Promise resolving to the message ID
    */
-  async publish(
-    topic: string,
-    payload: any,
-    options: PublishOptions = {}
-  ): Promise<number> {
-    if (!this.connected) {
+  async publish(topic: string, payload: any, options: PublishOptions = {}): Promise<number> {
+    if (!this.connected || this.isShuttingDown) {
       throw new Error('Client is not connected');
     }
 
     try {
       // executeWithRetry hands us a pooled client, which satisfies the
       // Transaction (query-bearing) shape publishOn expects.
-      return await this.executeWithRetry((client) =>
-        this.publishOn(client, topic, payload, options));
+      return await this.executeWithRetry(
+        (client) => this.publishOn(client, topic, payload, options),
+        this.retryPolicy,
+        (error) => ['40001', '40P01'].includes(error?.code ?? error?.sqlState)
+      );
     } catch (err) {
       throw mapDbError(err);
     }
@@ -744,7 +731,7 @@ export class Connection implements IConnection {
     payload: any,
     options: PublishOptions = {}
   ): Promise<number> {
-    if (!this.connected) {
+    if (!this.connected || this.isShuttingDown) {
       throw new Error('Client is not connected');
     }
 
@@ -762,17 +749,10 @@ export class Connection implements IConnection {
    * @returns A new consumer instance
    */
   consume(queue: string, options: Partial<ConsumerOptions> = {}): ConsumerImpl {
-    if (!this.connected) {
+    if (!this.connected || this.isShuttingDown) {
       throw new Error('Client is not connected');
     }
-    
-    // Start notification listener if it's not already active
-    if (!this.notificationListenerActive) {
-      this.startNotificationListener().catch(error => {
-        console.error('Failed to start notification listener:', error);
-      });
-    }
-    
+
     const consumer = new ConsumerImpl(queue, this, options);
     this.registerConsumer(consumer);
     return consumer;
@@ -784,8 +764,8 @@ export class Connection implements IConnection {
    * Each message is dispatched to `handler`. The push-based counterpart to
    * consume()'s `for await` iteration, mirroring the Go client's
    * ConsumeHandler. Settlement rules:
-   *   - handler returns without ack/nack/release  -> message auto-acked
-   *   - handler throws                            -> message auto-nacked
+   *   - live handler returns without settlement  -> message auto-acked
+   *   - handler throws or returns cancelled       -> message auto-nacked
    *   - handler settles the message itself        -> no automatic action
    *
    * `options.maxInFlight` bounds how many handlers run concurrently (0 =
@@ -809,18 +789,12 @@ export class Connection implements IConnection {
     handler: MessageHandler,
     options: Partial<HandlerConsumerOptions> = {}
   ): HandlerConsumer {
-    if (!this.connected) {
+    if (!this.connected || this.isShuttingDown) {
       throw new Error('Client is not connected');
     }
 
-    // Start notification listener if it's not already active (same as consume).
-    if (!this.notificationListenerActive) {
-      this.startNotificationListener().catch(error => {
-        console.error('Failed to start notification listener:', error);
-      });
-    }
-
     const { maxInFlight = 0, ...consumerOptions } = options;
+    consumerOptions.topic = this.resolveTopic(queue, consumerOptions.topic);
     // The underlying consumer is NOT registered with the connection — the
     // HandlerConsumer is, so close() drives the full handler-aware shutdown
     // (wait for in-flight handlers) rather than just stopping the consumer.
@@ -837,7 +811,7 @@ export class Connection implements IConnection {
    * @returns Promise that resolves when the topic is created
    */
   async createTopic(topic: string): Promise<void> {
-    if (!this.connected) {
+    if (!this.connected || this.isShuttingDown) {
       throw new Error('Client is not connected');
     }
 
@@ -864,7 +838,7 @@ export class Connection implements IConnection {
     exclusive: boolean = false,
     options: QueueOptions = {}
   ): Promise<void> {
-    if (!this.connected) {
+    if (!this.connected || this.isShuttingDown) {
       throw new Error('Client is not connected');
     }
 
@@ -874,11 +848,19 @@ export class Connection implements IConnection {
         const maxDeliveryAttempts = options.maxDeliveryAttempts ?? 0;
         // 5 minutes — matches the SQL function default and the Go client.
         const keepAliveSeconds = options.keepAliveInterval ?? 300;
+        if (!Number.isFinite(keepAliveSeconds) || keepAliveSeconds < 0.001)
+          throw new Error('keepAliveInterval must be at least 0.001 seconds');
+        if (
+          !Number.isSafeInteger(maxDeliveryAttempts) ||
+          maxDeliveryAttempts < 0 ||
+          maxDeliveryAttempts > 2147483647
+        )
+          throw new Error('maxDeliveryAttempts must be >= 0 and a finite integer <= 2147483647');
 
         // Scale seconds to INTERVAL via "$5 * interval '1 sec'" so the SQL
         // function can stay typed as INTERVAL without us needing a per-driver
         // serializer for it.
-        await client.query(
+        const created = await client.query(
           "SELECT create_queue($1, $2, $3, $4, $5 * interval '1 sec')",
           [name, topic, maxDeliveryAttempts, exclusive, keepAliveSeconds]
         );
@@ -890,8 +872,10 @@ export class Connection implements IConnection {
         // refreshed client-side and got reaped after ~300s if consumption
         // paused. Use the same default (300s) as the server-side
         // keep_alive_until set above and as Go's 5-minute default.
+        const generation = created.rows[0].create_queue as string;
+        this.queueGenerations.set(name, generation);
         if (exclusive) {
-          this.startQueueKeepAlive(name, keepAliveSeconds);
+          this.keepAliveRegister(name, keepAliveSeconds, generation);
         }
       });
     } catch (err) {
@@ -900,6 +884,9 @@ export class Connection implements IConnection {
     // Cache the queue->topic mapping so consume() can subscribe to the
     // per-topic publish channel without an extra DB lookup.
     this.topicCache.set(name, topic);
+    // Recreating a queue clears any prior fatal mark so it can be consumed (and,
+    // if it dies again, declared fatal) anew.
+    this.fatalQueues.delete(name);
   }
 
   /**
@@ -911,7 +898,7 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     try {
       await this.executeWithRetry(async (client) => {
         await client.query('SELECT delete_topic($1)', [topic]);
@@ -931,9 +918,6 @@ export class Connection implements IConnection {
       throw new Error('Client is not connected');
     }
 
-    // Cancel any keep-alive timer for this queue
-    this.stopQueueKeepAlive(queue);
-
     await this.executeWithRetry(async (client) => {
       await client.query('SELECT delete_queue($1)', [queue]);
     });
@@ -942,6 +926,8 @@ export class Connection implements IConnection {
     // a different topic later, the next consume() call must re-resolve from
     // a fresh source (explicit option or createQueue) instead of reading a
     // stale entry.
+    this.keepAliveDeregister(queue);
+    this.queueGenerations.delete(queue);
     this.topicCache.delete(queue);
   }
 
@@ -953,10 +939,10 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     return this.executeWithRetry(async (client) => {
       const result = await client.query('SELECT * FROM list_topics()');
-      return result.rows.map(row => row.topic);
+      return result.rows.map((row) => row.topic);
     });
   }
 
@@ -968,16 +954,16 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     return this.executeWithRetry(async (client) => {
       const result = await client.query('SELECT * FROM list_queues()');
-      
-      return result.rows.map(row => ({
+
+      return result.rows.map((row) => ({
         queueName: row.queue_name,
         topicName: row.topic_name,
         maxDeliveryAttempts: row.max_delivery_attempts,
         exclusive: row.exclusive,
-        keepAliveUntil: row.keep_alive_until
+        keepAliveUntil: row.keep_alive_until,
       }));
     });
   }
@@ -991,28 +977,25 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     return this.executeWithRetry(async (client) => {
-      const result = await client.query(
-        'SELECT * FROM get_queue_statistics($1)',
-        [queue || null]
-      );
-      
+      const result = await client.query('SELECT * FROM get_queue_statistics($1)', [queue || null]);
+
       if (result.rows.length === 0) {
         return {
           pendingCount: 0,
           processingCount: 0,
           completedCount: 0,
-          totalCount: 0
+          totalCount: 0,
         };
       }
-      
+
       const row = result.rows[0];
       return {
         pendingCount: parseInt(row.pending_count, 10),
         processingCount: parseInt(row.processing_count, 10),
         completedCount: parseInt(row.completed_count, 10),
-        totalCount: parseInt(row.total_count, 10)
+        totalCount: parseInt(row.total_count, 10),
       };
     });
   }
@@ -1057,11 +1040,11 @@ export class Connection implements IConnection {
     return this.executeWithRetry(async (client) => {
       const result = await client.query('SELECT * FROM list_dlq_messages()');
 
-      return result.rows.map(row => ({
+      return result.rows.map((row) => ({
         queueName: row.queue_name,
-        messageId: Number(row.message_id),
+        messageId: checkedMessageId(row.message_id),
         retryCount: row.retry_count,
-        publishedAt: row.published_at
+        publishedAt: row.published_at,
       }));
     });
   }
@@ -1075,7 +1058,7 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     await this.executeWithRetry(async (client) => {
       await client.query('SELECT requeue_dlq_messages($1)', [queue]);
     });
@@ -1089,7 +1072,7 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     await this.executeWithRetry(async (client) => {
       await client.query('SELECT purge_dlq()');
     });
@@ -1103,7 +1086,7 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     await this.executeWithRetry(async (client) => {
       await client.query('SELECT purge_all_messages()');
     });
@@ -1116,15 +1099,13 @@ export class Connection implements IConnection {
    * @returns Promise that resolves when the message is deleted
    */
   async deleteQueueMessage(queue: string, messageID: number): Promise<void> {
+    checkedMessageId(messageID);
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     await this.executeWithRetry(async (client) => {
-      await client.query(
-        'SELECT delete_queue_message($1, $2)',
-        [queue, messageID]
-      );
+      await client.query('SELECT delete_queue_message($1, $2)', [queue, messageID]);
     });
   }
 
@@ -1137,20 +1118,17 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     return this.executeWithRetry(async (client) => {
-      const result = await client.query(
-        'SELECT * FROM list_messages($1)',
-        [queue]
-      );
-      
-      return result.rows.map(row => ({
-        messageId: Number(row.message_id),
+      const result = await client.query('SELECT * FROM list_messages($1)', [queue]);
+
+      return result.rows.map((row) => ({
+        messageId: checkedMessageId(row.message_id),
         status: row.status,
         publishedAt: row.published_at,
         deliveryAttempts: row.delivery_attempts,
         vt: row.vt,
-        processedAt: row.processed_at
+        processedAt: row.processed_at,
       }));
     });
   }
@@ -1161,26 +1139,24 @@ export class Connection implements IConnection {
    * @returns Promise that resolves to the message information or null if not found
    */
   async getMessage(messageID: number): Promise<PublishedMessage | null> {
+    checkedMessageId(messageID);
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     return this.executeWithRetry(async (client) => {
-      const result = await client.query(
-        'SELECT * FROM get_message($1)',
-        [messageID]
-      );
-      
+      const result = await client.query('SELECT * FROM get_message($1)', [messageID]);
+
       if (result.rows.length === 0) {
         return null;
       }
-      
+
       const row = result.rows[0];
       return {
-        messageId: Number(row.message_id),
+        messageId: checkedMessageId(row.message_id),
         topicName: row.topic_name,
         payload: row.payload,
-        publishedAt: row.published_at
+        publishedAt: row.published_at,
       };
     });
   }
@@ -1193,11 +1169,34 @@ export class Connection implements IConnection {
    * @param limit - Maximum number of messages to fetch
    * @returns Promise resolving to array of raw messages
    */
+  async resolveQueueGeneration(queue: string): Promise<string> {
+    const cached = this.queueGenerations.get(queue);
+    if (cached) return cached;
+    const generation = await this.runDatabase(async (client) => {
+      const result = await client.query('SELECT generation FROM queues WHERE name=$1', [queue]);
+      if (!result.rows.length)
+        throw mapDbError({ code: 'PMQ02', message: `Queue "${queue}" does not exist` });
+      return result.rows[0].generation as string;
+    });
+    if (!this.queueGenerations.has(queue)) this.queueGenerations.set(queue, generation);
+    return generation;
+  }
+
   async consumeMessages(
     queueName: string,
     visibilityTimeout: number,
-    limit: number = 1
+    limit: number = 1,
+    generation?: string
   ): Promise<any[]> {
+    if (
+      !Number.isSafeInteger(visibilityTimeout) ||
+      visibilityTimeout < 0 ||
+      visibilityTimeout > 2147483647 ||
+      !Number.isSafeInteger(limit) ||
+      limit <= 0 ||
+      limit > 2147483647
+    )
+      throw new ValidationError('invalid visibility timeout or batch size');
     if (!this.connected || this.isShuttingDown) {
       throw new Error('Client is not connected or shutting down');
     }
@@ -1210,24 +1209,28 @@ export class Connection implements IConnection {
     // skip the just-claimed rows and claim a SECOND disjoint batch — orphaning
     // the first batch in 'processing' with delivery_attempts already burned.
     // Recovery is the next fetch tick + vt expiry, not a retry. Mirrors Go's
-    // consumeMessages, which is also deliberately un-retried. (Genuinely
-    // idempotent ops — ack/nack/release/setVt/publish — keep the retry.)
-    const client = await this.pool.connect();
+    // consumeMessages, which is also deliberately un-retried. Publication
+    // retries only confirmed transaction aborts; settlement uses token fencing.
     try {
-      const result = await client.query(
-        'SELECT * FROM consume_message($1, $2, $3)',
-        [queueName, visibilityTimeout, limit]
+      return await this.runDatabase(
+        async (client) => {
+          const result = await client.query('SELECT * FROM consume_message($1, $2, $3, $4)', [
+            queueName,
+            visibilityTimeout,
+            limit,
+            generation ?? null,
+          ]);
+          // message_id is BIGINT; convert at the read boundary so callers see a
+          // number (matches Message.id and the rest of the public surface).
+          return result.rows.map((row) => ({
+            ...row,
+            message_id: checkedMessageId(row.message_id),
+          }));
+        },
+        Math.max(1000, visibilityTimeout * 500)
       );
-      // message_id is BIGINT; convert at the read boundary so callers see a
-      // number (matches Message.id and the rest of the public surface).
-      return result.rows.map(row => ({
-        ...row,
-        message_id: Number(row.message_id),
-      }));
     } catch (err) {
       throw mapDbError(err);
-    } finally {
-      client.release();
     }
   }
 
@@ -1246,17 +1249,14 @@ export class Connection implements IConnection {
     consumerToken: string,
     tx?: Transaction
   ): Promise<void> {
+    checkedMessageId(messageId);
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     if (tx) {
       try {
-        await tx.query('SELECT ack_message($1, $2, $3)', [
-          queueName,
-          messageId,
-          consumerToken
-        ]);
+        await tx.query('SELECT ack_message($1, $2, $3)', [queueName, messageId, consumerToken]);
       } catch (err) {
         throw mapDbError(err);
       }
@@ -1265,11 +1265,7 @@ export class Connection implements IConnection {
 
     try {
       await this.executeWithRetry(async (client) => {
-        await client.query('SELECT ack_message($1, $2, $3)', [
-          queueName,
-          messageId,
-          consumerToken
-        ]);
+        await client.query('SELECT ack_message($1, $2, $3)', [queueName, messageId, consumerToken]);
       });
     } catch (err) {
       throw mapDbError(err);
@@ -1291,10 +1287,11 @@ export class Connection implements IConnection {
     consumerToken: string,
     delayUntil?: Date
   ): Promise<void> {
+    checkedMessageId(messageId);
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     try {
       await this.executeWithRetry(async (client) => {
         if (delayUntil) {
@@ -1302,13 +1299,13 @@ export class Connection implements IConnection {
             queueName,
             messageId,
             consumerToken,
-            delayUntil
+            delayUntil,
           ]);
         } else {
           await client.query('SELECT nack_message($1, $2, $3)', [
             queueName,
             messageId,
-            consumerToken
+            consumerToken,
           ]);
         }
       });
@@ -1325,21 +1322,18 @@ export class Connection implements IConnection {
    * @param consumerToken - The consumer token
    * @returns Promise that resolves when the message is released
    */
-  async releaseMessage(
-    queueName: string,
-    messageId: number,
-    consumerToken: string
-  ): Promise<void> {
+  async releaseMessage(queueName: string, messageId: number, consumerToken: string): Promise<void> {
+    checkedMessageId(messageId);
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     try {
       await this.executeWithRetry(async (client) => {
         await client.query('SELECT release_message($1, $2, $3)', [
           queueName,
           messageId,
-          consumerToken
+          consumerToken,
         ]);
       });
     } catch (err) {
@@ -1362,56 +1356,20 @@ export class Connection implements IConnection {
     consumerToken: string,
     visibilityTimeout: number
   ): Promise<Date> {
+    checkedMessageId(messageId);
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
-    try {
-      return await this.executeWithRetry(async (client) => {
-        const result = await client.query(
-          'SELECT set_vt($1, $2, $3, $4) AS new_vt',
-          [queueName, messageId, consumerToken, visibilityTimeout]
-        );
-        return new Date(result.rows[0].new_vt);
-      });
-    } catch (err) {
-      throw mapDbError(err);
-    }
-  }
 
-  /**
-   * Set the visibility timeout for multiple messages
-   * @internal
-   * @param queueName - The queue name
-   * @param messageIds - Array of message IDs
-   * @param consumerTokens - Array of consumer tokens
-   * @param visibilityTimeout - The new visibility timeout in seconds
-   * @returns Promise that resolves to array of [messageId, new expiration date] tuples
-   */
-  async setMessagesVtBatch(
-    queueName: string,
-    messageIds: number[],
-    consumerTokens: string[],
-    visibilityTimeout: number
-  ): Promise<Array<[number, Date]>> {
-    if (!this.connected) {
-      throw new Error('Client is not connected');
-    }
-    
     try {
       return await this.executeWithRetry(async (client) => {
-        const result = await client.query(
-          'SELECT * FROM set_vt_batch($1, $2, $3, $4)',
-          [queueName, messageIds, consumerTokens, visibilityTimeout]
-        );
-        // set_vt_batch returns columns (message_id, vt). The single-row
-        // setMessageVt above uses an explicit AS new_vt alias; the batch
-        // version doesn't, so read row.vt directly. (Reading row.new_vt
-        // here silently produced Invalid Date for every returned tuple.)
-        return result.rows.map(row => [
-          Number(row.message_id),
-          new Date(row.vt)
+        const result = await client.query('SELECT set_vt($1, $2, $3, $4) AS new_vt', [
+          queueName,
+          messageId,
+          consumerToken,
+          visibilityTimeout,
         ]);
+        return new Date(result.rows[0].new_vt);
       });
     } catch (err) {
       throw mapDbError(err);
@@ -1428,44 +1386,15 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     return this.executeWithRetry(async (client) => {
-      const result = await client.query(
-        'SELECT get_next_visible_time($1) AS next_time',
-        [queueName]
-      );
-      
+      const result = await client.query('SELECT get_next_visible_time($1) AS next_time', [
+        queueName,
+      ]);
+
       const nextTime = result.rows[0].next_time;
       return nextTime ? new Date(nextTime) : null;
     });
-  }
-
-  /**
-   * Extend the keep-alive time for an exclusive queue.
-   *
-   * Resolves on success. Rejects with QueueNotFoundError (PMQ02) if the queue
-   * doesn't exist, or ValidationError (PMQ03) if it exists but is not
-   * exclusive — the SQL function distinguishes these rather than returning a
-   * single ambiguous boolean.
-   *
-   * @param queueName - The queue name
-   * @param seconds - The number of seconds to extend by
-   */
-  async extendQueueKeepAlive(queueName: string, seconds: number): Promise<void> {
-    if (!this.connected) {
-      throw new Error('Client is not connected');
-    }
-
-    try {
-      await this.executeWithRetry(async (client) => {
-        await client.query(
-          'SELECT extend_queue_keep_alive($1, make_interval(secs => $2))',
-          [queueName, seconds]
-        );
-      });
-    } catch (err) {
-      throw mapDbError(err);
-    }
   }
 
   /**
@@ -1477,7 +1406,7 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     await this.executeWithRetry(async (client) => {
       await client.query('SELECT clean_up_queue($1)', [queue]);
     });
@@ -1492,7 +1421,7 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     await this.executeWithRetry(async (client) => {
       await client.query('SELECT clean_up_topic($1)', [topic]);
     });
@@ -1506,7 +1435,7 @@ export class Connection implements IConnection {
     if (!this.connected) {
       throw new Error('Client is not connected');
     }
-    
+
     await this.executeWithRetry(async (client) => {
       await client.query('SELECT delete_inactive_queues()');
     });
@@ -1523,9 +1452,10 @@ export class Connection implements IConnection {
     }
 
     return this.executeWithRetry(async (client) => {
-      const result = olderThanHours !== undefined
-        ? await client.query('SELECT cleanup_completed_messages($1) AS deleted', [olderThanHours])
-        : await client.query('SELECT cleanup_completed_messages() AS deleted');
+      const result =
+        olderThanHours !== undefined
+          ? await client.query('SELECT cleanup_completed_messages($1) AS deleted', [olderThanHours])
+          : await client.query('SELECT cleanup_completed_messages() AS deleted');
 
       return Number(result.rows[0].deleted);
     });
@@ -1541,14 +1471,16 @@ export class Connection implements IConnection {
 
   /**
    * Subscribe to a connection-level event. Currently emits:
-   *   - 'keepAliveFailure' (queue: string, error: unknown): the client has
-   *     permanently given up refreshing the keep-alive for an exclusive
-   *     queue; it will be reaped server-side once keep_alive_until lapses.
+   *   - 'queueFatal' (queue: string, error: QueueFatalError): the queue is gone
+   *     (deleted out-of-band, or an exclusive queue whose keep-alive permanently
+   *     failed) and any consumers on it have been torn down. Consumers also
+   *     learn via Consumer.onClose; this is the only signal for a producer-only
+   *     exclusive queue with no consumer.
    *
    * @param event - The event name
    * @param listener - The callback
    */
-  on(event: 'keepAliveFailure', listener: (queue: string, error: unknown) => void): void;
+  on(event: 'queueFatal', listener: (queue: string, error: unknown) => void): void;
   on(event: string, listener: (...args: any[]) => void): void {
     this.events.on(event, listener);
   }
@@ -1562,110 +1494,384 @@ export class Connection implements IConnection {
     this.events.off(event, listener);
   }
 
+  // ===================================================================
+  // Connection-level keep-alive actor
+  // ===================================================================
+
   /**
-   * Start keep-alive timer for an exclusive queue
+   * Upsert an exclusive queue into the keep-alive schedule. Called by
+   * createQueue. Dedupes by queue name (createQueue may be called twice).
    * @internal
-   * @param queueName - The queue name
-   * @param keepAliveSeconds - The keep-alive period in seconds
    */
-  private startQueueKeepAlive(queueName: string, keepAliveSeconds: number): void {
-    // Stop any existing timer for this queue
-    this.stopQueueKeepAlive(queueName);
-    
-    // Store the keep-alive interval
-    this.exclusiveQueueIntervals.set(queueName, keepAliveSeconds);
-    
-    // Calculate when to send the keep-alive (at half the keep-alive period)
-    const extendIntervalMs = Math.floor(keepAliveSeconds * 1000 / 2);
-    
-    // Set up the timer
-    const timer = setTimeout(() => {
-      this.sendQueueKeepAlive(queueName);
-    }, extendIntervalMs);
-    
-    // Store the timer reference
-    this.exclusiveQueueTimers.set(queueName, timer);
+  private keepAliveRegister(queueName: string, intervalSec: number, generation: string): void {
+    const nextAt = new Date(Date.now() + Math.floor((intervalSec * 1000) / 2));
+    this.keepAliveEntries.set(queueName, {
+      generation,
+      intervalSec,
+      nextAt,
+      expiresAt: new Date(Date.now() + intervalSec * 1000),
+    });
+    this.armKeepAlive();
   }
-  
+
   /**
-   * Stop keep-alive timer for a queue
+   * Remove a queue from the keep-alive schedule. No-op if absent. Called by
+   * deleteQueue so an intentional delete doesn't fire a spurious failure.
    * @internal
-   * @param queueName - The queue name
    */
-  private stopQueueKeepAlive(queueName: string): void {
-    const timer = this.exclusiveQueueTimers.get(queueName);
-    if (timer) {
-      clearTimeout(timer);
-      this.exclusiveQueueTimers.delete(queueName);
-      this.exclusiveQueueIntervals.delete(queueName);
+  private keepAliveDeregister(queueName: string): void {
+    this.keepAliveEntries.delete(queueName);
+    this.armKeepAlive();
+  }
+
+  /** (Re)arm the single keep-alive timer to fire at the earliest pending
+   *  nextAt. No-op while a flush is in flight (the flush re-arms when done) or
+   *  after the background actors have been stopped. @internal */
+  private armKeepAlive(): void {
+    if (this.keepAliveTimer) {
+      clearTimeout(this.keepAliveTimer);
+      this.keepAliveTimer = null;
     }
+    if (this.keepAliveFlushing || this.backgroundStopped) return;
+    let earliest: number | null = null;
+    for (const e of this.keepAliveEntries.values()) {
+      const t = e.nextAt.getTime();
+      if (earliest === null || t < earliest) earliest = t;
+    }
+    if (earliest === null) return;
+    const wait = Math.max(0, earliest - Date.now());
+    this.keepAliveTimer = setTimeout(() => {
+      void this.flushKeepAlive();
+    }, wait);
   }
-  
-  /**
-   * Send a keep-alive for an exclusive queue
-   * @internal
-   * @param queueName - The queue name
-   * @param retryCount - Number of consecutive retry attempts (internal use)
-   */
-  private async sendQueueKeepAlive(queueName: string, retryCount: number = 0): Promise<void> {
-    // Get the keep-alive interval for this queue
-    const keepAliveSeconds = this.exclusiveQueueIntervals.get(queueName);
-    if (!keepAliveSeconds || this.isShuttingDown || !this.connected) {
+
+  /** Extend every due queue in one extend_queue_keep_alive_multi call, then
+   *  reschedule kept queues / drop+notify permanently-failed ones / bounded-
+   *  retry transient failures. @internal */
+  private async flushKeepAlive(): Promise<void> {
+    if (this.keepAliveFlushing || this.backgroundStopped) return;
+    const due = Array.from(this.keepAliveEntries).filter(
+      ([, e]) => e.nextAt.getTime() <= Date.now()
+    );
+    if (!due.length) {
+      this.armKeepAlive();
       return;
     }
-    
-    // Maximum number of quick retries before going back to normal schedule
-    const MAX_QUICK_RETRIES = 3;
-    // Delay for quick retries in milliseconds
-    const QUICK_RETRY_DELAY_MS = 5000; // 5 seconds
-    
+    this.keepAliveFlushing = true;
     try {
-      // Extend the keep-alive. Success = resolves; any failure throws and is
-      // handled in the catch below (extend_queue_keep_alive no longer returns
-      // a boolean — it raises PMQ02/PMQ03 on missing / non-exclusive queues).
-      await this.extendQueueKeepAlive(queueName, keepAliveSeconds);
-
-      if (retryCount > 0) {
-        console.info(`Successfully extended keep-alive for exclusive queue ${queueName} after ${retryCount} retries`);
-      } else {
-        console.debug(`Extended keep-alive for exclusive queue ${queueName} by ${keepAliveSeconds} seconds`);
+      let leases: Map<string, { until: Date; busy: boolean }> | undefined;
+      try {
+        leases = await this.runDatabase(
+          async (client) => {
+            const result = await client.query(
+              'SELECT queue_name, keep_alive_until, outcome FROM extend_queue_keep_alive_multi($1, $2, $3)',
+              [
+                due.map(([n]) => n),
+                due.map(([, e]) => Math.floor(e.intervalSec * 1000)),
+                due.map(([, e]) => e.generation),
+              ]
+            );
+            return new Map(
+              result.rows.map((r) => [
+                r.queue_name,
+                { until: new Date(r.keep_alive_until), busy: r.outcome === 'busy' },
+              ])
+            );
+          },
+          Math.min(1000, ...due.map(([, e]) => e.expiresAt.getTime() - Date.now()))
+        );
+      } catch {
+        /* Retry only while the last confirmed lease remains live. */
       }
-
-      // Schedule the next keep-alive at normal interval (half the keep-alive period)
-      if (!this.isShuttingDown) {
-        const extendIntervalMs = Math.floor(keepAliveSeconds * 1000 / 2);
-        const timer = setTimeout(() => {
-          this.sendQueueKeepAlive(queueName, 0);
-        }, extendIntervalMs);
-        this.exclusiveQueueTimers.set(queueName, timer);
+      for (const [name, e] of due) {
+        if (this.keepAliveEntries.get(name) !== e) continue;
+        const lease = leases?.get(name);
+        if (lease && !lease.busy) {
+          e.expiresAt = lease.until;
+          e.nextAt = new Date(Date.now() + (lease.until.getTime() - Date.now()) / 2);
+        } else if ((!leases || lease?.busy) && e.expiresAt.getTime() > Date.now())
+          e.nextAt = new Date(Math.min(Date.now() + 100, e.expiresAt.getTime()));
+        else {
+          this.keepAliveEntries.delete(name);
+          this.queueFatal(name, undefined, e.generation);
+        }
       }
-    } catch (error) {
-      console.error(`Error extending keep-alive for exclusive queue ${queueName}:`, error);
-      
-      // If we've reached max retries, stop the keep-alive timer and surface
-      // the give-up so the application can react (the queue will be reaped
-      // server-side once keep_alive_until lapses). We emit an observable
-      // event AND invoke the optional callback, in addition to logging.
-      if (retryCount >= MAX_QUICK_RETRIES) {
-        console.error(`Giving up on extending keep-alive for exclusive queue ${queueName} after ${retryCount} retries`);
-        this.stopQueueKeepAlive(queueName);
-        this.events.emit('keepAliveFailure', queueName, error);
-        if (this.onKeepAliveFailure) {
-          try {
-            this.onKeepAliveFailure(queueName, error);
-          } catch (cbErr) {
-            console.error(`onKeepAliveFailure callback threw for queue ${queueName}:`, cbErr);
-          }
+    } finally {
+      this.keepAliveFlushing = false;
+      this.armKeepAlive();
+    }
+  }
+
+  /**
+   * queueFatal handles a queue that has become unrecoverably gone — deleted out
+   * of band (a consume returns PMQ02), or an exclusive queue whose keep-alive
+   * permanently failed. Idempotent per queue. It stops keeping the queue alive,
+   * tears down every consumer bound to it (their normal stop() cancels handlers
+   * and deregisters in-flight messages from the extender), then signals: each
+   * consumer's onClose, plus the connection-level 'queueFatal' event /
+   * onQueueFatal handler — the only signal for a producer-only exclusive queue
+   * with no consumer. consumer.fatal is non-blocking, so this returns promptly;
+   * each consumer's onClose fires once it finishes draining.
+   * @internal — called by the keep-alive actor and by consumers on a PMQ02 fetch.
+   */
+  queueFatal(queue: string, cause?: Error, generation?: string): void {
+    if (
+      generation &&
+      this.queueGenerations.has(queue) &&
+      this.queueGenerations.get(queue) !== generation
+    )
+      return;
+    if (this.fatalQueues.has(queue)) return;
+    this.fatalQueues.add(queue);
+    const err = new QueueFatalError(queue, cause);
+
+    // Stop keeping a dead queue alive (no-op if not exclusive / not registered).
+    this.keepAliveDeregister(queue);
+
+    // Tear down every consumer on this queue (consumers can share a queue).
+    for (const cons of Array.from(this.consumers)) {
+      if (
+        isFatalConsumer(cons) &&
+        cons.getQueueName() === queue &&
+        (!generation || cons.getQueueGeneration() === generation)
+      ) {
+        cons.fatal(err);
+      }
+    }
+
+    // Queue-level signal (also the only signal for producer-only queues).
+    this.events.emit('queueFatal', queue, err);
+    if (this.onQueueFatal) {
+      try {
+        this.onQueueFatal(queue, err);
+      } catch (cbErr) {
+        console.error(`onQueueFatal callback threw for queue ${queue}:`, cbErr);
+      }
+    } else {
+      console.error(`Queue ${queue} is gone:`, err);
+    }
+  }
+
+  /**
+   * Batch keep-alive extension. Returns the queue names actually kept alive;
+   * a requested queue omitted from the result failed permanently (gone or
+   * non-exclusive). Idempotent → uses the retry policy.
+   * @internal
+   */
+  async extendQueueKeepAliveMulti(
+    names: string[],
+    intervalsMs: number[],
+    generations?: string[]
+  ): Promise<Array<{ queue: string; until: Date | null; busy: boolean }>> {
+    if (!this.connected) {
+      throw new Error('Client is not connected');
+    }
+    if (names.length === 0) return [];
+    try {
+      return await this.executeWithRetry(async (client) => {
+        const result = await client.query(
+          'SELECT queue_name, keep_alive_until, outcome FROM extend_queue_keep_alive_multi($1, $2, $3)',
+          [names, intervalsMs, generations ?? null]
+        );
+        return result.rows.map((row: any) => ({
+          queue: row.queue_name as string,
+          until: row.keep_alive_until ? new Date(row.keep_alive_until) : null,
+          busy: row.outcome === 'busy',
+        }));
+      });
+    } catch (err) {
+      throw mapDbError(err);
+    }
+  }
+
+  // ===================================================================
+  // Connection-level visibility-timeout extender actor
+  // ===================================================================
+
+  /**
+   * Register an in-flight message for auto-extension. Buffered/idempotent:
+   * every (queue, id, token) has an independent lifetime.
+   * @internal
+   */
+  extenderRegister(e: {
+    queue: string;
+    id: number;
+    token: string;
+    vtSec: number;
+    threshold: number;
+    vt: Date;
+    cancel: () => void;
+    onExtended: (vt: Date) => void;
+  }): void {
+    if (this.backgroundStopped) return;
+    const now = Date.now();
+    const remaining = Math.max(0, e.vt.getTime() - now);
+    const nextExtensionTime = new Date(now + remaining * e.threshold);
+    this.extenderEntries.set(extKey(e.queue, e.id, e.token), {
+      queue: e.queue,
+      id: e.id,
+      token: e.token,
+      vtSec: e.vtSec,
+      threshold: e.threshold,
+      nextExtensionTime,
+      expiresAt: e.vt,
+      cancel: e.cancel,
+      onExtended: e.onExtended,
+    });
+    this.armExtender();
+  }
+
+  /** Deregister a settled message from auto-extension. No-op if absent. @internal */
+  extenderDeregister(queue: string, id: number, token: string): void {
+    this.extenderEntries.delete(extKey(queue, id, token));
+    this.armExtender();
+  }
+
+  /** (Re)arm the single extension timer to fire at the earliest pending
+   *  extension (respecting the transient-failure backoff floor). @internal */
+  private armExtender(): void {
+    if (this.extenderTimer) {
+      clearTimeout(this.extenderTimer);
+      this.extenderTimer = null;
+    }
+    if (this.extenderFlushing || this.backgroundStopped) return;
+    let earliest: number | null = null;
+    for (const e of this.extenderEntries.values()) {
+      const t = e.nextExtensionTime.getTime();
+      if (earliest === null || t < earliest) earliest = t;
+    }
+    if (earliest === null) {
+      if (this.extenderTryAfter === null) return;
+      earliest = this.extenderTryAfter.getTime();
+    } else if (this.extenderTryAfter && this.extenderTryAfter.getTime() > earliest) {
+      earliest = this.extenderTryAfter.getTime();
+    }
+    const wait = Math.max(0, earliest - Date.now());
+    this.extenderTimer = setTimeout(() => {
+      void this.flushExtender();
+    }, wait);
+  }
+
+  /** Extend every due message in one set_vt_batch_multi call (correlated by the
+   *  composite (queue, id, token) key), reschedule the extended ones, and cancel +
+   *  drop lease-lost ones. Transient failures back off ~1s. @internal */
+  private async flushExtender(): Promise<void> {
+    if (this.extenderFlushing || this.backgroundStopped) return;
+    const now = Date.now();
+    const due: ExtEntry[] = [];
+    for (const e of this.extenderEntries.values()) {
+      if (e.nextExtensionTime.getTime() <= now) {
+        due.push(e);
+        if (due.length >= this.extenderBatchCap) break;
+      }
+    }
+    if (due.length === 0) {
+      this.extenderTryAfter = null;
+      this.armExtender();
+      return;
+    }
+    this.extenderFlushing = true;
+    try {
+      this.extenderTryAfter = null;
+      const queues = due.map((e) => e.queue);
+      const ids = due.map((e) => e.id);
+      const tokens = due.map((e) => e.token);
+      const vts = due.map((e) => e.vtSec);
+
+      let results: Array<{ queue: string; id: number; vt: Date; token: string; busy: boolean }>;
+      try {
+        results = await this.setVtBatchMulti(
+          queues,
+          ids,
+          tokens,
+          vts,
+          Math.min(1000, ...due.map((e) => e.expiresAt.getTime() - Date.now()))
+        );
+      } catch (error) {
+        // Transient (past executeWithRetry's budget): keep entries, defer ~1s.
+        // extendAt is the soft halfway deadline, so there's headroom before the
+        // real server-side lease lapses.
+        for (const e of due) {
+          if (this.extenderEntries.get(extKey(e.queue, e.id, e.token)) !== e) continue;
+          if (e.expiresAt.getTime() <= Date.now()) {
+            this.extenderEntries.delete(extKey(e.queue, e.id, e.token));
+            e.cancel();
+          } else e.nextExtensionTime = new Date(Math.min(Date.now() + 1000, e.expiresAt.getTime()));
+        }
+        if (!this.isShuttingDown) {
+          console.warn(`Transient error extending ${due.length} messages: ${error}; will retry`);
         }
         return;
       }
-      
-      // Otherwise, retry quickly
-      console.info(`Will retry extending keep-alive for exclusive queue ${queueName} in ${QUICK_RETRY_DELAY_MS}ms`);
-      const timer = setTimeout(() => {
-        this.sendQueueKeepAlive(queueName, retryCount + 1);
-      }, QUICK_RETRY_DELAY_MS);
-      this.exclusiveQueueTimers.set(queueName, timer);
+
+      const extended = new Map(results.map((r) => [extKey(r.queue, r.id, r.token), r]));
+
+      const after = Date.now();
+      for (const e of due) {
+        const k = extKey(e.queue, e.id, e.token);
+        const current = this.extenderEntries.get(k);
+        const result = extended.get(k);
+        if (current !== e) continue;
+        if (result?.busy && e.expiresAt.getTime() > after) {
+          e.nextExtensionTime = new Date(Math.min(after + 100, e.expiresAt.getTime()));
+          continue;
+        }
+        const newVt = result?.busy ? undefined : result?.vt;
+        if (newVt) {
+          e.expiresAt = newVt;
+          // Only touch the CURRENT entry — it may have been deregistered or
+          // re-registered (new token) while the call was in flight.
+          if (current === e) {
+            const remaining = Math.max(0, newVt.getTime() - after);
+            e.nextExtensionTime = new Date(after + remaining * e.threshold);
+            e.onExtended(newVt);
+          }
+        } else {
+          // Omitted = lease lost: advise the handler and drop the entry.
+          if (current === e) this.extenderEntries.delete(k);
+          e.cancel();
+        }
+      }
+    } finally {
+      this.extenderFlushing = false;
+      this.armExtender();
     }
   }
-} 
+
+  /**
+   * Cross-queue batch visibility-timeout extension. Returns the rows actually
+   * extended; correlate by the COMPOSITE (queue, id) pair. Idempotent → uses
+   * the retry policy.
+   * @internal
+   */
+  async setVtBatchMulti(
+    queues: string[],
+    ids: number[],
+    tokens: string[],
+    vts: number[],
+    budgetMs = 1000
+  ): Promise<Array<{ queue: string; id: number; vt: Date; token: string; busy: boolean }>> {
+    if (!this.connected) {
+      throw new Error('Client is not connected');
+    }
+    ids.forEach(checkedMessageId);
+    if (queues.length === 0) return [];
+    try {
+      return await this.runDatabase(async (client) => {
+        const result = await client.query(
+          'SELECT queue_name, message_id, vt, consumer_token, outcome FROM set_vt_batch_multi($1, $2, $3, $4)',
+          [queues, ids, tokens, vts]
+        );
+        return result.rows.map((row: any) => ({
+          queue: row.queue_name as string,
+          id: checkedMessageId(row.message_id),
+          vt: new Date(row.vt),
+          token: row.consumer_token,
+          busy: row.outcome === 'busy',
+        }));
+      }, budgetMs);
+    } catch (err) {
+      throw mapDbError(err);
+    }
+  }
+}

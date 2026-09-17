@@ -2,6 +2,7 @@ package postgremq_go
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -73,6 +74,9 @@ func validateConnectionOptions(options *Connection) error {
 	if options.shutdownTimeout < 0 {
 		return fmt.Errorf("shutdown timeout must be positive")
 	}
+	if options.extenderBatchSize <= 0 {
+		return fmt.Errorf("extender batch size must be positive")
+	}
 	if options.retryConfig.Disabled {
 		return nil
 	}
@@ -85,10 +89,31 @@ func validateConnectionOptions(options *Connection) error {
 	if options.retryConfig.MaxBackoff <= 0 {
 		return fmt.Errorf("max backoff must be positive")
 	}
-	if options.retryConfig.BackoffMultiplier <= 0 {
+	if math.IsNaN(options.retryConfig.BackoffMultiplier) || math.IsInf(options.retryConfig.BackoffMultiplier, 0) || options.retryConfig.BackoffMultiplier <= 0 {
 		return fmt.Errorf("backoff multiplier must be positive")
 	}
 	return nil
+}
+
+// WithQueueFatalHandler installs a callback invoked when a queue becomes fatal
+// for this connection — it is gone and any consumers on it have been torn down.
+//
+// This fires when the queue is deleted out-of-band (a consume returns PMQ02) or
+// when an exclusive queue's keep-alive permanently fails (omitted from
+// extend_queue_keep_alive_multi's result = gone/non-exclusive). The error is a
+// *QueueFatalError (matching errors.Is(err, ErrQueueGone)). It is the queue-level
+// signal; consumers also learn via Consumer.NotifyClose. This handler is the only
+// signal for a producer-only exclusive queue that has no consumer.
+//
+// The handler runs on its own goroutine, so it may block; it must be safe to
+// call concurrently with other Connection operations. Without a handler, fatal
+// queues are logged.
+//
+// Mirrors the TS client's onQueueFatal / 'queueFatal' event.
+func WithQueueFatalHandler(fn func(queue string, err error)) ConnectionOption {
+	return func(c *Connection) {
+		c.onQueueFatal = fn
+	}
 }
 
 // WithLogger installs a Logger (Printf-style) adapter used for warnings and errors.
@@ -180,11 +205,11 @@ func WithKeepAliveInterval(d time.Duration) QueueOption {
 
 // consumeOptions holds configuration for message consumption.
 type consumeOptions struct {
+	generation         string
 	batchSize          int
 	checkTimeout       time.Duration
 	vt                 int
 	noAutoExtension    bool
-	extendBatchSize    int
 	extensionThreshold float64
 	topic              string
 }
@@ -239,7 +264,6 @@ func defaultConsumeOptions() consumeOptions {
 		checkTimeout:       10 * time.Second,
 		vt:                 0,
 		noAutoExtension:    false,
-		extendBatchSize:    100,
 		extensionThreshold: 0.5,
 	}
 }
@@ -251,13 +275,13 @@ func validateConsumeOptions(options *consumeOptions) error {
 	if options.vt == 0 && options.noAutoExtension {
 		return fmt.Errorf("no auto extension is not supported without lock timeout")
 	}
-	if options.batchSize <= 0 {
+	if options.batchSize <= 0 || int64(options.batchSize) > 2147483647 {
 		return fmt.Errorf("batch size must be positive")
 	}
-	if options.vt < 0 {
+	if options.vt < 0 || int64(options.vt) > 2147483647 {
 		return fmt.Errorf("lock timeout must be positive")
 	}
-	if options.extensionThreshold <= 0 || options.extensionThreshold >= 1 {
+	if math.IsNaN(options.extensionThreshold) || options.extensionThreshold <= 0 || options.extensionThreshold >= 1 {
 		return fmt.Errorf("extension threshold must be in (0, 1)")
 	}
 	return nil
@@ -368,23 +392,23 @@ func WithTopic(topic string) ConsumeOption {
 	}
 }
 
-// WithExtendBatchSize limits how many messages are extended in a single batch.
+// WithExtenderBatchSize limits how many in-flight messages the connection-level
+// auto-extension actor extends in a single set_vt_batch_multi call per tick.
 //
-// When auto-extension is enabled, the Consumer batches visibility timeout
-// extensions for efficiency. This option sets the maximum batch size.
+// Auto-extension is connection-level: one actor coalesces the due extensions of
+// every consumer on the Connection into one batched round-trip. This bounds the
+// statement size of that call (correctness does not depend on it — the SQL's
+// global ordering makes any batch deadlock-safe).
 //
 // Parameters:
-//   - size: Maximum messages per extension batch. Default is 100.
+//   - size: Maximum messages per extension batch. Default is 100. Must be > 0.
 //
-// Larger batch sizes reduce database round-trips but may cause delays in
-// extending individual messages. The batch is processed when the first
-// message in the batch hits the extension threshold (default 50% of VT —
-// see WithExtensionThreshold).
-//
-// Only applicable when auto-extension is enabled (default).
-func WithExtendBatchSize(size int) ConsumeOption {
-	return func(o *consumeOptions) {
-		o.extendBatchSize = size
+// Larger batch sizes reduce database round-trips at the cost of larger
+// statements; the actor simply pops more entries per tick (the rest follow on
+// the next tick).
+func WithExtenderBatchSize(size int) ConnectionOption {
+	return func(c *Connection) {
+		c.extenderBatchSize = size
 	}
 }
 

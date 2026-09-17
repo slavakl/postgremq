@@ -39,19 +39,27 @@ type Connection struct {
 	eventListener       *EventListener
 	eventListenerDoOnce sync.Once
 	logger              LevelLogger
-	keepAliveCtx        context.Context
-	keepAliveCancel     context.CancelFunc // To stop keep-alive loops
-	keepAliveWg         sync.WaitGroup
-	retryConfig         RetryConfig
-	closedFlag          chan struct{}
-	closeOnce           sync.Once
+	onQueueFatal        func(queue string, err error) // fired when a queue becomes fatal (gone)
+	fatalQueues         sync.Map                      // set of queues already declared fatal (dedupe queueFatal)
+	extenderBatchSize   int                           // per-tick cap on messages extended in one set_vt_batch_multi call
+	// Connection-level background actors (see actor.go). Both run on their own
+	// context and are stopped LAST in Close() (keep-alive G7 / extender G6).
+	keepAlive    *actor[*kaEntry, string, kaResult]
+	extender     *actor[*extEntry, extKey, extResult]
+	retryConfig  RetryConfig
+	closedFlag   chan struct{}
+	drainingFlag chan struct{}
+	ioCtx        context.Context
+	ioCancel     context.CancelFunc
+	closeOnce    sync.Once
 	// topicCache maps queue name -> topic name. Populated by CreateQueue
 	// in this session, and also by Consume when WithTopic is provided
 	// explicitly. Consume avoids any SQL round-trip when the entry is
 	// present; queues that exist in the database but were not created via
 	// this Connection (and are not passed WithTopic) error from Consume
 	// with ErrQueueNotFound.
-	topicCache sync.Map
+	topicCache       sync.Map
+	queueGenerations sync.Map
 }
 
 // Dial creates a new Connection, building an underlying pgxpool.Pool from the
@@ -96,19 +104,35 @@ func newConnection(_ context.Context, pool Pool, ownPool bool, opts ...Connectio
 		cancel:              cancel,
 		consumers:           nil,
 		logger:              NoopLogger{},
-		keepAliveWg:         sync.WaitGroup{},
 		retryConfig:         defaultRetryConfig(),
 		closedFlag:          make(chan struct{}),
+		drainingFlag:        make(chan struct{}),
 		eventListenerDoOnce: sync.Once{},
+		extenderBatchSize:   defaultExtenderBatchSize, // overridable via WithExtenderBatchSize
 	}
-	conn.keepAliveCtx, conn.keepAliveCancel = context.WithCancel(context.Background()) // not using connection context here as we want to keep keep-alive running until consumers are stopped
 	for _, opt := range opts {
 		opt(conn)
 	}
 	if err := validateConnectionOptions(conn); err != nil {
+		cancel()
+		if ownPool {
+			pool.Close()
+		}
 		return nil, err
 	}
+	conn.ioCtx, conn.ioCancel = context.WithCancel(context.Background())
 	conn.eventListener = newEventListener(ctx, pool, conn.logger)
+
+	// Start the connection-level background actors. One idle goroutine each (vs.
+	// lazy start) is the simpler, race-free choice — they sit blocked on their
+	// select with no work until the first register. Built AFTER the options loop
+	// so the extender's batch cap is known and the keep-alive actor never races a
+	// write to onKeepAliveFailure. Each owns its own context (not conn.ctx) and
+	// is stopped LAST in Close() so it outlives the consumer drain (G6/G7).
+	conn.keepAlive = newActor[*kaEntry, string, kaResult](newKeepAliveScheduler(conn), 64, 64)
+	conn.extender = newActor[*extEntry, extKey, extResult](newExtScheduler(conn, conn.extenderBatchSize), 256, 256)
+	conn.keepAlive.start()
+	conn.extender.start()
 
 	return conn, nil
 }
@@ -133,7 +157,15 @@ func (c *Connection) Close() error {
 	// teardown twice. The first caller performs the shutdown; any concurrent or
 	// later caller returns nil cleanly.
 	c.closeOnce.Do(func() {
-		close(c.closedFlag)
+		c.mu.Lock()
+		close(c.drainingFlag)
+		consumers := append([]Stoppable(nil), c.consumers...)
+		c.mu.Unlock()
+		var drainTimer *time.Timer
+		if c.shutdownTimeout > 0 {
+			drainTimer = time.AfterFunc(c.shutdownTimeout, c.ioCancel)
+			defer drainTimer.Stop()
+		}
 		c.cancel()
 
 		// Stop the event listener first. This closes every consumer's wake
@@ -144,9 +176,6 @@ func (c *Connection) Close() error {
 
 		// Stop all consumers and wait for in-flight messages to complete.
 		var wg sync.WaitGroup
-		c.mu.RLock()
-		consumers := c.consumers
-		c.mu.RUnlock()
 		for _, consumer := range consumers {
 			wg.Add(1)
 			go func(cons Stoppable) {
@@ -166,17 +195,21 @@ func (c *Connection) Close() error {
 			select {
 			case <-done:
 				// All consumers finished gracefully
-			case <-time.After(c.shutdownTimeout):
+			case <-c.ioCtx.Done():
 
-				c.logger.Warnf("Excedded timeout for consumers to finish. Will shutdown connection")
+				c.logger.Warnf("Exceeded timeout for consumers to finish. Will shutdown connection")
 			}
 		} else {
 			wg.Wait()
 		}
 
-		// Stop keep-alive loops
-		c.keepAliveCancel()
-		c.keepAliveWg.Wait() // waiting for all keep-alive loops to finish
+		// Stop the connection-level background actors. Both intentionally
+		// outlive the consumer drain (keep-alive: G7; extender: G6) and are
+		// stopped here, after consumers have drained, in any order.
+		c.ioCancel()
+		close(c.closedFlag)
+		c.keepAlive.stop()
+		c.extender.stop()
 
 		// Close pool if we own it
 		if c.ownPool {
@@ -229,14 +262,18 @@ func (c *Connection) CreateQueue(ctx context.Context, name, topic string, exclus
 		opt(&options)
 	}
 
+	if options.keepAliveInterval < time.Millisecond {
+		return fmt.Errorf("keep alive interval must be at least 1ms")
+	}
+	var generation string
 	err := c.withRetry(ctx, func(ctx context.Context) error {
-		_, err := c.pool.Exec(ctx,
+		err := c.pool.QueryRow(ctx,
 			"SELECT create_queue($1, $2, $3, $4, $5 * interval '1 ms')",
-			name,                                     // p_queue_name
-			topic,                                    // p_topic_name
-			options.maxDeliveryAttempts,              // p_max_attempts
-			exclusive,                                // p_exclusive
-			options.keepAliveInterval.Milliseconds()) // p_keep_alive_interval (ms scaled to INTERVAL)
+			name,                                                       // p_queue_name
+			topic,                                                      // p_topic_name
+			options.maxDeliveryAttempts,                                // p_max_attempts
+			exclusive,                                                  // p_exclusive
+			options.keepAliveInterval.Milliseconds()).Scan(&generation) // p_keep_alive_interval (ms scaled to INTERVAL)
 		if err != nil {
 			return mapPgError(fmt.Errorf("failed to create queue: %w", err))
 		}
@@ -245,9 +282,15 @@ func (c *Connection) CreateQueue(ctx context.Context, name, topic string, exclus
 	if err != nil {
 		return err
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.queueGenerations.Store(name, generation)
 	c.topicCache.Store(name, topic)
+	// Recreating a queue clears any prior fatal mark so it can be consumed (and,
+	// if it dies again, declared fatal) anew.
+	c.fatalQueues.Delete(name)
 	if exclusive {
-		c.startKeepAlive(name, options.keepAliveInterval)
+		c.keepAliveRegister(name, options.keepAliveInterval.Milliseconds(), generation)
 	}
 	return nil
 }
@@ -342,8 +385,8 @@ func (c *Connection) PublishWithTx(ctx context.Context, tx Tx, topic string, pay
 //   - Backpressure: Messages are fetched in batches (WithBatchSize) and new
 //     fetches are driven by LISTEN/NOTIFY and polling (WithCheckTimeout).
 //
-// No ctx parameter: this constructor performs no I/O. Consumer lifetime is
-// owned by Consumer.Stop() and Connection.Close().
+// Consumer lifetime is owned by Stop and Close. An uncached queue generation
+// is resolved with a bounded bootstrap query before registration.
 //
 // Shutdown:
 //   - Consumer.Stop() releases buffered messages that were not delivered to the
@@ -359,6 +402,10 @@ func (c *Connection) Consume(queue string, opts ...ConsumeOption) (*Consumer, er
 		return nil, err
 	}
 	options.topic = topic
+	options.generation, err = c.resolveQueueGeneration(queue)
+	if err != nil {
+		return nil, err
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -440,11 +487,15 @@ func (c *Connection) ConsumeHandler(
 		return nil, err
 	}
 
-	topic, err := c.resolveTopic(queue, options.consumeOptions.topic)
+	topic, err := c.resolveTopic(queue, options.topic)
 	if err != nil {
 		return nil, err
 	}
-	options.consumeOptions.topic = topic
+	options.topic = topic
+	options.generation, err = c.resolveQueueGeneration(queue)
+	if err != nil {
+		return nil, err
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -478,117 +529,146 @@ func (c *Connection) ConsumeHandler(
 	return hc, nil
 }
 
-// MessageExtension identifies a message to extend in a batch visibility timeout operation.
-//
-// Used as input to SetVTBatch to specify which messages should have their
-// visibility timeouts extended.
-type MessageExtension struct {
-	// ID is the message ID to extend.
-	ID int64
-	// ConsumerToken is the consumer token that currently owns the message.
-	// Must match the token in the database for the extension to succeed.
-	ConsumerToken string
+// fatalConsumer is implemented by both *Consumer and *HandlerConsumer so the
+// connection can tear down every consumer bound to a now-gone queue.
+type fatalConsumer interface {
+	Stoppable
+	queueName() string
+	queueGeneration() string
+	fatal(err error)
 }
 
-// MessageLock represents the result of a successful visibility timeout extension.
+// queueFatal handles a queue that has become unrecoverably gone — deleted out of
+// band (a consume returns PMQ02), or an exclusive queue whose keep-alive
+// permanently failed (omitted from extend_queue_keep_alive_multi = gone or
+// non-exclusive). It is idempotent per queue. It stops keeping the queue alive,
+// tears down every consumer bound to it (their normal drain cancels handlers and
+// deregisters in-flight messages from the extender), then fires the queue-fatal
+// handler — the only signal for a producer-only exclusive queue with no consumer.
 //
-// Returned by SetVTBatch to indicate which messages were successfully extended
-// and their new visibility timeout expiration timestamps.
-type MessageLock struct {
+// Callers invoke it as `go c.queueFatal(...)`: it runs off the actor / consumer
+// loops, so a blocking user handler can't stall them. consumer.fatal only
+// cancels (non-blocking) — we don't wait for the drain here; each consumer's
+// NotifyClose delivers the after-cleanup signal once it finishes draining.
+func (c *Connection) queueFatal(queue string, cause error, generations ...string) {
+	c.mu.RLock()
+	if len(generations) > 0 {
+		if current, ok := c.queueGenerations.Load(queue); ok && current != generations[0] {
+			c.mu.RUnlock()
+			return
+		}
+	}
+	if _, dup := c.fatalQueues.LoadOrStore(queue, struct{}{}); dup {
+		c.mu.RUnlock()
+		return
+	}
+	wrapped := &QueueFatalError{Queue: queue, Err: cause}
+
+	// Stop keeping a dead queue alive (no-op if not exclusive / not registered).
+	c.keepAliveDeregister(queue)
+
+	// Tear down every consumer on this queue (consumers can share a queue).
+	consumers := make([]Stoppable, len(c.consumers))
+	copy(consumers, c.consumers)
+	c.mu.RUnlock()
+	for _, cons := range consumers {
+		if fc, ok := cons.(fatalConsumer); ok && fc.queueName() == queue && (len(generations) == 0 || fc.queueGeneration() == generations[0]) {
+			fc.fatal(wrapped)
+		}
+	}
+
+	// Queue-level signal (also the only signal for producer-only queues).
+	if c.onQueueFatal != nil {
+		c.onQueueFatal(queue, wrapped)
+	} else {
+		c.logger.Errorf("Queue %s is gone: %v", queue, wrapped)
+	}
+}
+
+// MultiExtension identifies one message to extend in a cross-queue batch
+// visibility-timeout operation (SetVTBatchMulti). It carries the queue and a
+// per-message VT, so one call can extend every in-flight message a Connection
+// owns across all of its queues.
+type MultiExtension struct {
+	// Queue is the queue the message belongs to.
+	Queue string
+	// ID is the message ID to extend.
+	ID int64
+	// Token is the consumer token that currently owns the message.
+	Token string
+	// VTSec is the new visibility timeout in seconds.
+	VTSec int
+}
+
+// MultiLock reports an extension or a busy row. Correlate by Queue, ID and
+// Token. Busy means retry within the previously confirmed deadline; VT is zero.
+type MultiLock struct {
+	// Queue is the queue the extended message belongs to.
+	Queue string
 	// ID is the message ID that was extended.
 	ID int64
 	// VT is the new visibility timeout expiration timestamp.
-	VT time.Time
+	VT    time.Time
+	Token string
+	Busy  bool
 }
 
-// SetVTBatch extends visibility timeout for a batch of in-flight messages.
+// SetVTBatchMulti extends visibility timeouts for a batch of in-flight messages
+// spanning any number of queues, in a single database round-trip. It is the
+// connection-level auto-extension primitive (the extender actor coalesces every
+// consumer's due extensions into one call per tick).
 //
-// This method is optimized for extending multiple messages in a single database
-// round-trip. It orders updates by message_id to prevent deadlocks when multiple
-// consumers extend overlapping sets of messages.
+// Returns the messages actually extended; a requested (Queue, ID) absent from
+// the result lost its lease server-side (status no longer 'processing', vt
+// already passed, or token mismatch) — correlate by the COMPOSITE (Queue, ID)
+// identity (including Token), never message_id alone.
 //
-// Parameters:
-//   - ctx: Context for cancellation and timeout control.
-//   - queue: Name of the queue.
-//   - locks: Slice of MessageExtension containing message IDs and consumer tokens.
-//   - vt: New visibility timeout in seconds.
-//
-// Returns a slice of MessageLock containing only the successfully extended messages.
-// Messages that failed to extend (e.g., already completed, token mismatch, or
-// visibility timeout already expired) are omitted from the result.
-//
-// The operation uses the configured retry policy for transient errors.
-//
-// This method is primarily used internally by the Consumer's auto-extension
-// mechanism but can be called directly for manual batch extension.
-func (c *Connection) SetVTBatch(ctx context.Context, queue string, locks []MessageExtension, vt int) ([]MessageLock, error) {
-	if err := c.checkClosed(); err != nil {
-		return nil, err
-	}
-
-	if len(locks) == 0 {
+// The operation uses the configured retry policy: extension is idempotent (G8).
+func (c *Connection) SetVTBatchMulti(ctx context.Context, exts []MultiExtension) ([]MultiLock, error) {
+	if len(exts) == 0 {
 		return nil, nil
 	}
 
-	ids := make([]int64, len(locks))
-	tokens := make([]string, len(locks))
-	for i, lock := range locks {
-		ids[i] = lock.ID
-		tokens[i] = lock.ConsumerToken
+	queues := make([]string, len(exts))
+	ids := make([]int64, len(exts))
+	tokens := make([]string, len(exts))
+	vts := make([]int32, len(exts)) // p_vts is INTEGER[]
+	for i, e := range exts {
+		if e.VTSec < 0 || int64(e.VTSec) > 2147483647 {
+			return nil, fmt.Errorf("visibility timeout must be between 0 and 2147483647")
+		}
+		queues[i] = e.Queue
+		ids[i] = e.ID
+		tokens[i] = e.Token
+		vts[i] = int32(e.VTSec)
 	}
 
-	var extendedIDs []MessageLock
+	var locks []MultiLock
 	err := c.withRetry(ctx, func(ctx context.Context) error {
+		locks = locks[:0]
 		rows, err := c.pool.Query(ctx,
-			"SELECT message_id, vt FROM set_vt_batch($1, $2, $3, $4)",
-			queue, ids, tokens, vt)
+			"SELECT queue_name, message_id, vt, consumer_token, outcome FROM set_vt_batch_multi($1, $2, $3, $4)",
+			queues, ids, tokens, vts)
 		if err != nil {
-			return mapPgError(fmt.Errorf("failed to set message visibility timeout: %w", err))
+			return mapPgError(fmt.Errorf("failed to set message visibility timeout (multi): %w", err))
 		}
 		defer rows.Close()
-
 		for rows.Next() {
-			var newLock MessageLock
-			if err := rows.Scan(&newLock.ID, &newLock.VT); err != nil {
+			var l MultiLock
+			var vt *time.Time
+			var outcome string
+			if err := rows.Scan(&l.Queue, &l.ID, &vt, &l.Token, &outcome); err != nil {
 				return mapPgError(err)
 			}
-			extendedIDs = append(extendedIDs, newLock)
+			if vt != nil {
+				l.VT = *vt
+			}
+			l.Busy = outcome == "busy"
+			locks = append(locks, l)
 		}
 		return mapPgError(rows.Err())
 	})
-
-	return extendedIDs, err
-}
-
-// keep-alive loop for non-durable queues
-func (c *Connection) startKeepAlive(queue string, interval time.Duration) {
-	c.keepAliveWg.Add(1)
-	go func() {
-
-		defer c.keepAliveWg.Done()
-		next := time.After(interval / 2)
-		for {
-			select {
-			case <-c.keepAliveCtx.Done():
-				return
-			case <-next:
-				if err := c.sendKeepAlive(c.keepAliveCtx, queue, interval); err != nil {
-					// PMQ02 (queue gone) / PMQ03 (not exclusive) are
-					// permanent: retrying can never succeed, so stop the loop
-					// instead of logging every second forever. Matches the TS
-					// client, which gives up after a bounded retry budget.
-					if errors.Is(err, ErrQueueNotFound) || errors.Is(err, ErrValidation) {
-						c.logger.Errorf("Stopping keep-alive for queue %s: %v", queue, err)
-						return
-					}
-					c.logger.Errorf("Failed to send keep-alive for queue %s: %v", queue, err)
-					next = time.After(1 * time.Second) // retry transient errors in a second
-				} else {
-					next = time.After(interval / 2)
-				}
-			}
-		}
-	}()
+	return locks, err
 }
 
 // // Database methods
@@ -616,11 +696,11 @@ func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, pa
 	var messageID int64
 	var err error
 	if retry {
-		err = c.withRetry(ctx, func(ctx context.Context) error {
+		err = c.withRetryPolicy(ctx, func(ctx context.Context) error {
 			var err error
 			messageID, err = publish(ctx)
 			return err
-		})
+		}, isAbortedTransaction)
 	} else {
 		messageID, err = publish(ctx)
 	}
@@ -630,7 +710,7 @@ func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, pa
 	return messageID, nil
 }
 
-func (c *Connection) consumeMessages(ctx context.Context, queue string, limit int, vt int) ([]*Message, error) {
+func (c *Connection) consumeMessages(ctx context.Context, queue string, limit int, vt int, generations ...string) ([]*Message, error) {
 	if c.isClosed() {
 		return nil, ErrConnectionClosed
 	}
@@ -645,9 +725,13 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 	// already retries the next tick on error, which is the correct
 	// recovery path: don't double-consume, let vt expiry redeliver the
 	// stranded batch. (REVIEW.md §3.3)
+	var generation *string
+	if len(generations) > 0 && generations[0] != "" {
+		generation = &generations[0]
+	}
 	rows, err := c.pool.Query(ctx,
-		"SELECT message_id, payload, consumer_token, delivery_attempts, vt, published_at FROM consume_message($1, $2, $3)",
-		queue, vt, limit)
+		"SELECT message_id, payload, consumer_token, delivery_attempts, vt, published_at FROM consume_message($1, $2, $3, $4)",
+		queue, vt, limit, generation)
 	if err != nil {
 		return nil, mapPgError(fmt.Errorf("failed to consume messages: %w", err))
 	}
@@ -686,18 +770,6 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 	return messages, mapPgError(rows.Err())
 }
 
-func (c *Connection) sendKeepAlive(ctx context.Context, queue string, interval time.Duration) error {
-	return c.withRetry(ctx, func(ctx context.Context) error {
-		_, err := c.pool.Exec(ctx, "SELECT extend_queue_keep_alive($1, $2 * interval '1 ms')",
-			queue, interval.Milliseconds(),
-		)
-		// extend_queue_keep_alive raises PMQ02 (queue gone) / PMQ03
-		// (non-exclusive) instead of returning FALSE; surface them as typed
-		// errors so the keep-alive loop logs a clean message.
-		return mapPgError(err)
-	})
-}
-
 func (c *Connection) ackMessage(ctx context.Context, queue string, messageID int64, consumerToken string) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
 		_, err := c.pool.Exec(ctx,
@@ -712,8 +784,8 @@ func (c *Connection) ackMessage(ctx context.Context, queue string, messageID int
 
 // ackMessageWithTx acknowledges a message within an existing transaction
 func (c *Connection) ackMessageWithTx(ctx context.Context, tx Tx, queue string, messageID int64, consumerToken string) error {
-	if err := c.checkClosed(); err != nil {
-		return err
+	if c.isClosed() {
+		return ErrConnectionClosed
 	}
 
 	_, err := tx.Exec(ctx,
@@ -768,6 +840,11 @@ func (c *Connection) isClosed() bool {
 
 // checkClosed returns an error if the connection is stopped
 func (c *Connection) checkClosed() error {
+	select {
+	case <-c.drainingFlag:
+		return ErrConnectionClosed
+	default:
+	}
 	if c.isClosed() {
 		return ErrConnectionClosed
 	}
@@ -1090,6 +1167,8 @@ func (c *Connection) DeleteQueue(ctx context.Context, queue string) error {
 		return err
 	})
 	if err == nil {
+		c.keepAliveDeregister(queue)
+		c.queueGenerations.Delete(queue)
 		// Drop the cached topic mapping so a future Consume on a recreated
 		// queue (possibly with a different topic) doesn't subscribe to the
 		// stale topic channel.
@@ -1342,4 +1421,33 @@ func (c *Connection) getNextVisibleTime(ctx context.Context, queue string) (time
 		return nil
 	})
 	return nextTime, err
+}
+
+func (c *Connection) unregisterConsumer(consumer Stoppable) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, current := range c.consumers {
+		if current == consumer {
+			c.consumers = append(c.consumers[:i], c.consumers[i+1:]...)
+			return
+		}
+	}
+}
+
+// Bind each consumer once, before taking the connection's registration lock.
+func (c *Connection) resolveQueueGeneration(queue string) (string, error) {
+	if err := c.checkClosed(); err != nil {
+		return "", err
+	}
+	if cached, ok := c.queueGenerations.Load(queue); ok {
+		return cached.(string), nil
+	}
+	ctx, cancel := context.WithTimeout(c.ioCtx, time.Second)
+	defer cancel()
+	var generation string
+	err := c.pool.QueryRow(ctx, "SELECT generation::text FROM queues WHERE name=$1", queue).Scan(&generation)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrQueueNotFound
+	}
+	return generation, mapPgError(err)
 }

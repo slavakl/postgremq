@@ -324,12 +324,7 @@ export async function getSharedTestDatabase(): Promise<TestDatabase> {
     sharedTestDb = new TestDatabase();
     await sharedTestDb.start();
 
-    // Register cleanup on process exit
-    process.on('exit', () => {
-      if (sharedTestDb) {
-        sharedTestDb.stop().catch(console.error);
-      }
-    });
+
   }
 
   // Clean up data between tests
@@ -364,4 +359,10 @@ export async function assertThrows(
       `Expected error message to include "${expectedMessage}", but got: "${thrown.message ?? thrown}"`
     );
   }
+}
+
+/** Await cleanup from Jest's afterAll; exit handlers cannot await async I/O. */
+export async function stopSharedTestDatabase(): Promise<void> {
+  const db = sharedTestDb; sharedTestDb = null;
+  if (db) await db.stop();
 }

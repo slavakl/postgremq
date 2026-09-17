@@ -302,77 +302,41 @@ describe('Consumer', () => {
   });
 
   describe('Concurrent Consumers', () => {
-    test.skip('should distribute messages across multiple consumers', async () => {
-      // Publish 10 messages
+    test('should distribute messages across multiple consumers', async () => {
+      const published = [];
       for (let i = 0; i < 10; i++) {
-        await connection.publish('consumer-test-topic', generateTestPayload(i));
+        published.push(await connection.publish('consumer-test-topic', generateTestPayload(i)));
       }
 
-      await sleep(100);
-
-      // Create 2 consumers
-      const consumer1 = connection.consume('consumer-test-queue', {
-        batchSize: 5,
+      const consumers = [0, 1].map(() => connection.consume('consumer-test-queue', {
+        batchSize: 1,
         visibilityTimeoutSec: 30
-      });
-
-      const consumer2 = connection.consume('consumer-test-queue', {
-        batchSize: 5,
-        visibilityTimeoutSec: 30
-      });
-
-      const received: Set<number> = new Set();
-      const consumer1Messages: any[] = [];
-      const consumer2Messages: any[] = [];
-
-      // Consume concurrently with timeout
-      const consumeWithTimeout = async (consumer: any, name: string, storage: any[]) => {
-        const messages = consumer.messages();
-        const endTime = Date.now() + 3000; // 3 second timeout
-
-        while (Date.now() < endTime && received.size < 10) {
-          try {
-            const result = await Promise.race([
-              messages.next(),
-              sleep(500).then(() => ({ done: true, value: undefined }))
-            ]);
-
-            if (result.done || !result.value) {
-              break;
-            }
-
-            // Only process if we haven't seen this message yet
-            if (!received.has(result.value.id)) {
-              received.add(result.value.id);
-              storage.push(result.value);
-              await result.value.ack();
-            }
-          } catch (error) {
-            // Ignore errors and continue
-            break;
-          }
+      }));
+      const received: number[][] = [[], []];
+      let releaseFirstDelivery!: () => void;
+      const firstDeliveries = new Promise<void>(resolve => { releaseFirstDelivery = resolve; });
+      const workers = consumers.map(async (consumer, index) => {
+        for await (const message of consumer.messages()) {
+          received[index].push(message.id);
+          // Hold each worker's first delivery until both have claimed work.
+          // The queue guarantees exclusive claims, not scheduling fairness.
+          if (received.every(ids => ids.length > 0)) releaseFirstDelivery();
+          await firstDeliveries;
+          await message.ack();
         }
-      };
+      });
 
-      // Run both consumers
-      await Promise.all([
-        consumeWithTimeout(consumer1, 'consumer1', consumer1Messages),
-        consumeWithTimeout(consumer2, 'consumer2', consumer2Messages)
-      ]);
+      try {
+        await waitFor(() => received.flat().length === published.length);
+      } finally {
+        releaseFirstDelivery();
+        await Promise.all(consumers.map(consumer => consumer.stop()));
+        await Promise.all(workers);
+      }
 
-      // Stop consumers
-      await consumer1.stop();
-      await consumer2.stop();
-
-      // Verify all 10 messages were consumed
-      expect(received.size).toBe(10);
-
-      // Both consumers should have received at least some messages
-      expect(consumer1Messages.length).toBeGreaterThan(0);
-      expect(consumer2Messages.length).toBeGreaterThan(0);
-
-      // Total should be 10
-      expect(consumer1Messages.length + consumer2Messages.length).toBe(10);
+      expect(received.every(ids => ids.length > 0)).toBe(true);
+      expect(received.flat().sort((a, b) => a - b)).toEqual(published.sort((a, b) => a - b));
+      expect((await connection.getQueueStatistics('consumer-test-queue')).completedCount).toBe(10);
     }, 15000);
   });
 

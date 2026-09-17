@@ -679,16 +679,6 @@ describe('Concurrency', () => {
       // Wait for VT to expire
       await sleep(1500);
 
-      // Try to ack - should throw error (token invalid after VT expired)
-      let ackFailed = false;
-      try {
-        await message.ack();
-        // If ack succeeds, message is gone and test will fail
-      } catch (error) {
-        // Expected - token is invalid after VT expired
-        ackFailed = true;
-      }
-
       // Another consumer should be able to get the message
       const consumer2 = connection.consume('race-vt-queue', {
         batchSize: 1,
@@ -707,6 +697,7 @@ describe('Concurrency', () => {
       const { value: message2 } = result as any;
 
       expect(message2.id).toBe(message.id);
+      await expect(message.ack()).rejects.toThrow(); // the new token fences the old handler
       await message2.ack();
 
       await consumer2.stop();

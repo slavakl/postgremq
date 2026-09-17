@@ -31,7 +31,7 @@ module.exports = {
   // detectOpenHandles is intentionally OFF: it implies --runInBand (serial),
   // which defeats maxWorkers. Re-enable it temporarily (or run
   // `jest --detectOpenHandles`) only when debugging a leaked handle.
-  forceExit: true,
+  forceExit: false,
   setupFilesAfterEnv: ['<rootDir>/src/__tests__/setup.ts'],
   // Each test runs in its own freshly-created database (createIsolatedTestConnection),
   // and each worker process reuses a single shared container (getSharedTestDatabase),

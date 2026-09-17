@@ -7,8 +7,8 @@ import (
 
 // MessageHandler processes a message. The handler should call msg.Ack() or msg.Nack()
 // to acknowledge or reject the message. If the handler returns without calling
-// either, the message is automatically acked. If the handler panics, the message
-// is automatically nacked.
+// either, it is auto-acked only if its context is still live. A cancelled
+// return or panic is auto-nacked; explicit settlement takes precedence.
 //
 // The context is cancelled when the consumer is stopping - handlers should
 // check ctx.Done() and return promptly.
@@ -73,6 +73,7 @@ func (hc *HandlerConsumer) start() {
 // dispatchLoop reads from consumer and dispatches to handlers
 func (hc *HandlerConsumer) dispatchLoop() {
 	defer hc.wg.Done()
+	defer func() { hc.handlerWg.Wait(); <-hc.consumer.done; hc.conn.unregisterConsumer(hc) }()
 
 	for {
 		// Acquire slot first (if maxInFlight is set)
@@ -119,33 +120,22 @@ func (hc *HandlerConsumer) runHandler(msg *Message) {
 		hc.handlerWg.Done()
 	}()
 
-	// Track if message was completed (acked/nacked) by the handler
-	completed := false
-	originalOnComplete := msg.onComplete
-	msg.onComplete = func(m *Message) {
-		completed = true
-		if originalOnComplete != nil {
-			originalOnComplete(m)
-		}
-	}
-
-	// Execute handler with panic recovery (use msg.StoppedCtx as handler context)
 	panicked := hc.callHandler(msg)
-
-	// If handler panicked, nack the message
-	if panicked {
-		if err := msg.Nack(context.Background()); err != nil {
-			hc.logger.Errorf("failed to nack message %d after panic: %v", msg.ID, err)
-		}
+	if msg.settlementStarted.Load() {
 		return
 	}
-
-	// If handler didn't ack/nack, auto-ack
-	if !completed {
-		if err := msg.Ack(context.Background()); err != nil {
-			hc.logger.Errorf("failed to auto-ack message %d: %v", msg.ID, err)
-		}
+	// Cancellation does not establish successful processing. Explicit Ack is
+	// allowed, but an unfinished handler returning on cancellation is retried.
+	var err error
+	if panicked || msg.StoppedCtx.Err() != nil {
+		err = msg.Nack(hc.conn.ioCtx)
+	} else {
+		err = msg.Ack(hc.conn.ioCtx)
 	}
+	if err != nil {
+		hc.logger.Errorf("failed to settle message %d: %v", msg.ID, err)
+	}
+
 }
 
 // callHandler calls the handler with panic recovery. Returns true if panicked.
@@ -183,3 +173,21 @@ func (hc *HandlerConsumer) Stop() {
 	// Wait for consumer stop to fully complete
 	<-consumerStopped
 }
+
+// queueName reports the queue this handler consumer is bound to (implements
+// fatalConsumer for the connection's queueFatal routing).
+func (hc *HandlerConsumer) queueName() string { return hc.consumer.queue }
+
+// fatal tears the handler consumer down because its queue is gone. It delegates
+// to the underlying consumer: the dispatch loop exits when Messages() closes and
+// in-flight handlers are cancelled via their StoppedCtx.
+func (hc *HandlerConsumer) fatal(err error) { hc.consumer.fatal(err) }
+
+// NotifyClose registers ch to receive the reason this consumer closed — for a
+// handler consumer this is the primary way to learn the queue is gone, since
+// there is no Messages() loop to end. See Consumer.NotifyClose.
+func (hc *HandlerConsumer) NotifyClose(ch chan error) chan error {
+	return hc.consumer.NotifyClose(ch)
+}
+
+func (hc *HandlerConsumer) queueGeneration() string { return hc.consumer.generation }

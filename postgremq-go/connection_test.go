@@ -77,10 +77,7 @@ func (r *MockRows) Err() error                                   { return r.ErrA
 func (r *MockRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
 func (r *MockRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *MockRows) Next() bool {
-	if r.idx >= len(r.ScanFuncs) {
-		return false
-	}
-	return true
+	return r.idx < len(r.ScanFuncs)
 }
 func (r *MockRows) Scan(dest ...any) error {
 	if r.idx >= len(r.ScanFuncs) {

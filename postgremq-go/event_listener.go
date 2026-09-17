@@ -279,7 +279,13 @@ func (el *EventListener) session() error {
 	if err != nil {
 		return fmt.Errorf("acquire listen connection: %w", err)
 	}
-	defer conn.Release()
+	defer func() {
+		// A LISTEN session must never return subscriptions to the shared pool.
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		_ = conn.Conn().Close(ctx)
+		conn.Release()
+	}()
 
 	if _, err := conn.Exec(el.ctx, "LISTEN "+quoteIdent(el.controlChannel)); err != nil {
 		return fmt.Errorf("listen control channel: %w", err)

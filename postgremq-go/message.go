@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,17 +16,11 @@ const (
 	MessageStatusCompleted  = "completed"  // Message has been successfully processed
 )
 
-const (
-	messageAck = iota
-	messageNack
-	messageRelease
-)
-
 // Message represents a single queue message fetched by a Consumer.
 //
-// Methods Ack, Nack and Release are idempotent at the client level
-// (additional calls will be ignored by the client object) but will return
-// an error if the underlying server state no longer matches (e.g., token
+// Only the first Ack, Nack, Release or AckWithTx performs SQL. Additional
+// terminal calls return ErrLeaseLost. The first call also returns an error
+// if the underlying server state no longer matches (e.g., token
 // mismatch or message no longer in processing state).
 type Message struct {
 	// ID is the unique message identifier.
@@ -43,19 +38,19 @@ type Message struct {
 
 	// StoppedCtx is a context that is cancelled when Consumer.Stop() or
 	// Connection.Close() is called. Applications can monitor this context
-	// to detect shutdown and release messages early.
+	// to detect shutdown; nack unfinished attempted work, or ack completed work.
 	StoppedCtx context.Context
 
 	// internal fields
 	queue         string
 	consumerToken string
 
-	conn         *Connection
-	onComplete   func(*Message)
-	completeOnce sync.Once
-	cancel       context.CancelFunc
-	trackingID   string
-	vtMu         sync.RWMutex // Protects VT field from concurrent read/write
+	conn              *Connection
+	onComplete        func(*Message)
+	settlementStarted atomic.Bool
+	cancel            context.CancelFunc
+	trackingID        string
+	vtMu              sync.RWMutex // Protects VT field from concurrent read/write
 }
 
 // Ack acknowledges the message, marking it as successfully processed.
@@ -77,14 +72,12 @@ type Message struct {
 //   - Records processed_at timestamp
 //   - Removes the message from the consumer's internal tracking
 //
-// This method is idempotent at the client level - calling it multiple times
-// on the same Message instance will only execute once.
+// A Message instance executes only one terminal operation. Repeated calls
+// return ErrLeaseLost.
 //
 // The operation uses the configured retry policy for transient errors.
 func (m *Message) Ack(ctx context.Context) error {
-	err := m.conn.ackMessage(ctx, m.queue, m.ID, m.consumerToken)
-	m.complete(messageAck, err)
-	return err
+	return m.settle(func() error { return m.conn.ackMessage(ctx, m.queue, m.ID, m.consumerToken) })
 }
 
 // AckWithTx acknowledges the message within an existing database transaction.
@@ -123,22 +116,9 @@ func (m *Message) Ack(ctx context.Context) error {
 //	}
 //	return tx.Commit(ctx)
 func (m *Message) AckWithTx(ctx context.Context, tx Tx) error {
-	err := m.conn.ackMessageWithTx(ctx, tx, m.queue, m.ID, m.consumerToken)
-	// Untrack on the call (complete() untracks unconditionally), matching plain
-	// Ack. We cannot observe the caller's commit/rollback — the transaction
-	// lifecycle is the caller's.
-	//
-	// Consequence on rollback: the ack is undone server-side, so the message
-	// stays 'processing' until its visibility timeout lapses and is then
-	// redelivered. That is the correct outcome of an abandoned transaction.
-	// Residual (pre-existing) race: between this call and the caller's commit
-	// the message is no longer auto-extended, so a commit that outlives the
-	// remaining VT could let the row expire and be redelivered even though the
-	// ack ultimately lands. Keep transactions short relative to the VT. Fully
-	// closing this would require an after-commit hook, which the caller-owned
-	// transaction model does not expose.
-	m.complete(messageAck, err)
-	return err
+	// Completion transfers transaction responsibility to the caller. On
+	// rollback the delivery becomes available again when its lease expires.
+	return m.settle(func() error { return m.conn.ackMessageWithTx(ctx, tx, m.queue, m.ID, m.consumerToken) })
 }
 
 // Nack negatively acknowledges the message, returning it to the queue for redelivery.
@@ -180,14 +160,7 @@ func (m *Message) Nack(ctx context.Context, opts ...MessageOption) error {
 	for _, opt := range opts {
 		opt(options)
 	}
-	var err error
-	if options != nil && options.delayUntil != nil {
-		err = m.conn.nackMessage(ctx, m.queue, m.ID, m.consumerToken, options.delayUntil)
-	} else {
-		err = m.conn.nackMessage(ctx, m.queue, m.ID, m.consumerToken, nil)
-	}
-	m.complete(messageNack, err)
-	return err
+	return m.settle(func() error { return m.conn.nackMessage(ctx, m.queue, m.ID, m.consumerToken, options.delayUntil) })
 }
 
 // Release returns the message back to the queue WITHOUT incrementing delivery attempts.
@@ -218,9 +191,7 @@ func (m *Message) Nack(ctx context.Context, opts ...MessageOption) error {
 // This method is automatically called by Consumer.Stop() for buffered messages
 // that haven't been delivered to the application.
 func (m *Message) Release(ctx context.Context) error {
-	err := m.conn.releaseMessage(ctx, m.queue, m.ID, m.consumerToken)
-	m.complete(messageRelease, err)
-	return err
+	return m.settle(func() error { return m.conn.releaseMessage(ctx, m.queue, m.ID, m.consumerToken) })
 }
 
 // SetVT extends the visibility timeout for this in-flight message.
@@ -257,8 +228,8 @@ func (m *Message) Release(ctx context.Context) error {
 //	    log.Printf("Failed to extend VT: %v", err)
 //	}
 func (m *Message) SetVT(ctx context.Context, vt int) (time.Time, error) {
-	if err := m.conn.checkClosed(); err != nil {
-		return time.Time{}, err
+	if m.conn.isClosed() {
+		return time.Time{}, ErrConnectionClosed
 	}
 
 	var newVT time.Time
@@ -275,31 +246,6 @@ func (m *Message) SetVT(ctx context.Context, vt int) (time.Time, error) {
 	m.VT = newVT
 	m.vtMu.Unlock()
 	return newVT, nil
-}
-
-// complete removes the message from the consumer's in-flight tracking and
-// auto-extension. It is called by Ack/Nack/Release/AckWithTx once the
-// application is done with the message.
-//
-// Untracking is UNCONDITIONAL — it happens whether or not the settle succeeded.
-// This is required by the Consumer.Stop() contract: shutdown cancels every
-// in-flight message's StoppedCtx and then waits for each to be settled, draining
-// the in-flight set as complete() fires. A settle is therefore terminal for
-// tracking by design. Skipping untrack on error would strand a message that
-// failed to settle (e.g. ErrLeaseLost / PMQ01 — the row is no longer ours and
-// can never be acked) in the in-flight set forever and deadlock Stop().
-//
-// Note also that Ack/Nack/Release already retry transient DB errors internally
-// before surfacing an error here, so an error reaching complete() is effectively
-// terminal — there is nothing to keep the lease alive for.
-//
-// op is currently unused; retained for potential future per-operation handling.
-func (m *Message) complete(op int, err error) {
-	if m.onComplete != nil {
-		m.completeOnce.Do(func() {
-			m.onComplete(m)
-		})
-	}
 }
 
 // GetVT returns the current visibility timeout in a thread-safe manner.
@@ -322,12 +268,29 @@ func (m *Message) GetVT() time.Time {
 // (by the consume_message SQL function). It is used to verify ownership when
 // acknowledging, nacking, releasing, or extending the message.
 //
-// The token format is: "{timestamp}-{random}" where timestamp includes microsecond
-// precision and the random component is derived from the transaction ID.
+// The token is a UUID generated by PostgreSQL for each claim.
 //
 // Returns the consumer token as a string.
 //
 // This method is primarily useful for debugging or logging purposes.
 func (m *Message) ConsumerToken() string {
 	return m.consumerToken
+}
+
+func (m *Message) setVT(vt time.Time) { m.vtMu.Lock(); m.VT = vt; m.vtMu.Unlock() }
+
+// The first terminal operation owns both SQL settlement and completion.
+// Concurrent/repeated terminal calls return ErrLeaseLost immediately, without
+// running SQL or removing the winning operation's tracking.
+func (m *Message) settle(operation func() error) error {
+	if !m.settlementStarted.CompareAndSwap(false, true) {
+		return ErrLeaseLost
+	}
+	// Only the owner completes tracking, after SQL finishes. Completion is
+	// unconditional: a failed settlement must also stop renewal and let the
+	// consumer drain. Retries within operation retain ownership until they end.
+	if m.onComplete != nil {
+		defer m.onComplete(m)
+	}
+	return operation()
 }

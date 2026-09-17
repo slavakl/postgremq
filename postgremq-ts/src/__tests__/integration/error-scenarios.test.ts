@@ -281,45 +281,27 @@ describe('Error Scenarios', () => {
   });
 
   describe('Dead Letter Queue Edge Cases', () => {
-    test.skip('should handle max delivery attempts = 0 (no DLQ)', async () => {
+    test('should handle max delivery attempts = 0 (no DLQ)', async () => {
       await connection.createTopic('no-dlq-topic');
       await connection.createQueue('no-dlq-queue', 'no-dlq-topic', false, {
-        maxDeliveryAttempts: 0 // Infinite retries
+        maxDeliveryAttempts: 0
       });
+      const id = await connection.publish('no-dlq-topic', generateTestPayload());
 
-      await connection.publish('no-dlq-topic', generateTestPayload());
-
-      // Nack many times
-      for (let i = 0; i < 5; i++) {
-        const consumer = connection.consume('no-dlq-queue', {
-          batchSize: 1,
-          visibilityTimeoutSec: 30,
-          autoExtension: {
-            enabled: false  // Disable auto-extension so messages become available after nack
-          }
-        });
-
-        const messages = consumer.messages();
-        const { value: message } = await messages.next();
-
-        expect(message.deliveryAttempts).toBe(i + 1);
-
-        await message.nack();
-        await consumer.stop();
-        await sleep(1000); // Give ample time for nack to process and message to become available
+      // Explicit claims avoid a background consumer prefetching the next
+      // attempt while the test inspects pending state.
+      for (let attempt = 1; attempt <= 10; attempt++) {
+        const rows = await connection.consumeMessages('no-dlq-queue', 30, 1);
+        expect(rows).toHaveLength(1);
+        expect(Number(rows[0].message_id)).toBe(id);
+        expect(rows[0].delivery_attempts).toBe(attempt);
+        await connection.nackMessage('no-dlq-queue', id, rows[0].consumer_token);
       }
 
-      // Message should still be in queue, not DLQ
-      const dlqMessages = await connection.listDLQMessages();
-      expect(dlqMessages.length).toBe(0);
-
+      expect(await connection.listDLQMessages()).toHaveLength(0);
       const stats = await connection.getQueueStatistics('no-dlq-queue');
       expect(stats.pendingCount).toBe(1);
-
-      // Cleanup
-      await connection.cleanUpQueue('no-dlq-queue');
-      await connection.deleteQueue('no-dlq-queue');
-      await connection.deleteTopic('no-dlq-topic');
+      expect(stats.processingCount).toBe(0);
     });
 
     test('should handle DLQ operations on empty DLQ', async () => {
@@ -596,26 +578,26 @@ describe('Error Scenarios', () => {
      * kept running, vt eventually expired, another consumer could pick up
      * the same message, and the original consumer's ack returned PMQ01.
      */
-    test('survives a single transient setMessagesVtBatch error', async () => {
+    test('survives a single transient setVtBatchMulti error', async () => {
       await connection.createTopic('autoext-transient-topic');
       await connection.createQueue('autoext-transient-queue', 'autoext-transient-topic', false, {
         maxDeliveryAttempts: 0
       });
 
-      // Publish 3 messages so the consumer takes the batch path
-      // (dueForExtension.length > 1 → setMessagesVtBatch).
+      // Publish 3 messages so the connection-level extender batches them into a
+      // single setVtBatchMulti call.
       for (let i = 0; i < 3; i++) {
         await connection.publish('autoext-transient-topic', { idx: i });
       }
 
       // Capture the real implementation BEFORE spying so we can delegate
       // to it on the success path. jest.spyOn (vs `(conn as any).X = ...`)
-      // ensures a future rename of setMessagesVtBatch surfaces at runtime
+      // ensures a future rename of setVtBatchMulti surfaces at runtime
       // rather than silently falling back to the real method.
-      const realSetVtBatch = connection.setMessagesVtBatch.bind(connection);
+      const realSetVtBatch = connection.setVtBatchMulti.bind(connection);
       let callCount = 0;
-      const spy = jest.spyOn(connection, 'setMessagesVtBatch')
-        .mockImplementation(async (...args: Parameters<typeof connection.setMessagesVtBatch>) => {
+      const spy = jest.spyOn(connection, 'setVtBatchMulti')
+        .mockImplementation(async (...args: Parameters<typeof connection.setVtBatchMulti>) => {
           callCount++;
           if (callCount === 1) {
             throw new Error('simulated transient network failure');
@@ -889,7 +871,7 @@ describe('Error Scenarios', () => {
       }
 
       let attempts = 0;
-      const spy = jest.spyOn(connection, 'setMessagesVtBatch')
+      const spy = jest.spyOn(connection, 'setVtBatchMulti')
         .mockImplementation(async () => {
           attempts++;
           throw new Error('simulated permanent transient failure');

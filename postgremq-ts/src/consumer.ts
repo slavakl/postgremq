@@ -6,8 +6,8 @@
 import { ConsumerOptions } from './types';
 import { Connection } from './connection';
 import { Message } from './message';
-import { createDeferred, sleep } from './utils';
-import { ValidationError } from './errors';
+import { createDeferred, sleep, untilDeadline } from './utils';
+import { ValidationError, QueueNotFoundError, QueueFatalError } from './errors';
 
 /**
  * Validate consumer options at construction, mirroring the Go client's
@@ -21,6 +21,16 @@ import { ValidationError } from './errors';
  * default has been applied.
  */
 export function validateConsumerOptions(options: Partial<ConsumerOptions>): void {
+  for (const [name, value] of Object.entries({
+    batchSize: options.batchSize,
+    visibilityTimeoutSec: options.visibilityTimeoutSec,
+    pollingIntervalMs: options.pollingIntervalMs,
+    extensionSec: options.autoExtension?.extensionSec,
+    maxBatchSize: options.autoExtension?.maxBatchSize,
+  })) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value > 2147483647))
+      throw new ValidationError(`${name} must be a finite integer <= 2147483647`);
+  }
   if (options.batchSize !== undefined && options.batchSize <= 0) {
     throw new ValidationError('batchSize must be positive');
   }
@@ -32,8 +42,12 @@ export function validateConsumerOptions(options: Partial<ConsumerOptions>): void
   }
   const ext = options.autoExtension;
   if (ext) {
-    if (ext.extensionThreshold !== undefined &&
-        (ext.extensionThreshold <= 0 || ext.extensionThreshold >= 1)) {
+    if (
+      ext.extensionThreshold !== undefined &&
+      (!Number.isFinite(ext.extensionThreshold) ||
+        ext.extensionThreshold <= 0 ||
+        ext.extensionThreshold >= 1)
+    ) {
       throw new ValidationError('extensionThreshold must be in (0, 1)');
     }
     if (ext.extensionSec !== undefined && ext.extensionSec <= 0) {
@@ -42,117 +56,6 @@ export function validateConsumerOptions(options: Partial<ConsumerOptions>): void
     if (ext.maxBatchSize !== undefined && ext.maxBatchSize <= 0) {
       throw new ValidationError('autoExtension.maxBatchSize must be positive');
     }
-  }
-}
-
-/**
- * Track which message is due next for visibility timeout extension
- */
-interface MessageExtensionInfo {
-  messageId: number;
-  consumerToken: string;
-  nextExtensionTime: Date;
-}
-
-/**
- * Schedule of in-flight messages awaiting auto-extension, sorted by
- * `nextExtensionTime` (primary) then `messageId` (secondary, for stable
- * order). The class encapsulates the sorted-insert invariant and the
- * "vt is too old" cap so the Consumer can think in terms of add / remove
- * / replace / due / headTime instead of array math.
- */
-class ExtensionQueue {
-  private items: MessageExtensionInfo[] = [];
-
-  /**
-   * @param visibilityTimeoutSec — the consumer's configured VT, used to
-   *        derive the next-extension time and the staleness cap.
-   * @param threshold — fraction of the VT to use as the safety margin
-   *        before extending. 0.5 means "extend at the halfway point".
-   */
-  constructor(
-    private readonly visibilityTimeoutSec: number,
-    private readonly threshold: number,
-  ) {}
-
-  get size(): number {
-    return this.items.length;
-  }
-
-  /** Time at which the soonest extension is scheduled, or null if empty. */
-  headTime(): Date | null {
-    return this.items.length > 0 ? this.items[0].nextExtensionTime : null;
-  }
-
-  /** Up to `limit` items whose `nextExtensionTime` is at or before `now`. */
-  due(now: Date, limit: number): MessageExtensionInfo[] {
-    const out: MessageExtensionInfo[] = [];
-    for (const item of this.items) {
-      if (item.nextExtensionTime > now) break;  // sorted: rest are later
-      out.push(item);
-      if (out.length >= limit) break;
-    }
-    return out;
-  }
-
-  /**
-   * Schedule `message` for extension. The first attempt fires once
-   * `threshold` of the *remaining* lease (vt - now) has elapsed —
-   * mirroring Go's calculateExtendAt — leaving the rest as headroom for
-   * latency and the extension call itself. No-op if the message's vt is
-   * older than 3× the lease window (likely already expired or stuck). If
-   * the computed extension time is already in the past (e.g. a very short
-   * remaining lease), schedule it for `now` so it's extended immediately
-   * rather than silently dropped — dropping it would leave the message
-   * untracked and let it expire mid-processing.
-   */
-  add(message: Message): void {
-    const now = Date.now();
-    const MAX_AGE_MS = this.visibilityTimeoutSec * 3 * 1000;
-    if (message.vt.getTime() < now - MAX_AGE_MS) return;
-    // Wait `threshold` of the remaining lease, then extend. Derived from
-    // the message's actual vt so schedule and lease stay consistent even
-    // when the lease was just extended to a different value.
-    const remainingMs = Math.max(0, message.vt.getTime() - now);
-    const extensionTime = new Date(now + remainingMs * this.threshold);
-
-    const idx = this.findInsertionIndex(extensionTime, message.id);
-    this.items.splice(idx, 0, {
-      messageId: message.id,
-      consumerToken: message.consumerToken,
-      nextExtensionTime: extensionTime,
-    });
-  }
-
-  /** Drop the entry for `messageId`. No-op if absent. */
-  remove(messageId: number): void {
-    this.items = this.items.filter(i => i.messageId !== messageId);
-  }
-
-  /** Replace the entry for `message.id` with one carrying `message`'s
-   *  current vt. Equivalent to `remove(message.id)` + `add(message)`. */
-  replace(message: Message): void {
-    this.remove(message.id);
-    this.add(message);
-  }
-
-  /** Binary-search the insertion index that preserves the sort order. */
-  private findInsertionIndex(extensionTime: Date, messageId: number): number {
-    let low = 0;
-    let high = this.items.length;
-    const targetTime = extensionTime.getTime();
-    while (low < high) {
-      const mid = Math.floor((low + high) / 2);
-      const midTime = this.items[mid].nextExtensionTime.getTime();
-      // Primary: nextExtensionTime ascending. Secondary: messageId ascending.
-      if (midTime > targetTime ||
-          (midTime === targetTime && this.items[mid].messageId > messageId)) {
-        high = mid;
-      } else {
-        low = mid + 1;
-      }
-    }
-    return low;
   }
 }
 
@@ -168,13 +71,14 @@ class ExtensionQueue {
 export class Consumer {
   /** Queue name */
   private readonly queueName: string;
-  
+  private generation?: string;
+
   /** Connection manager reference */
   private readonly connection: Connection;
-  
+
   /** Consumer options */
   private readonly options: Required<ConsumerOptions>;
-  
+
   /** Default options for the consumer */
   private static readonly DEFAULT_OPTIONS: Required<ConsumerOptions> = {
     batchSize: 10,
@@ -183,20 +87,31 @@ export class Consumer {
       enabled: true,
       extensionThreshold: 0.5,
       extensionSec: 30,
-      maxBatchSize: 100
+      maxBatchSize: 100,
     },
     pollingIntervalMs: 1000,
-    topic: ''
+    topic: '',
   };
-  
+
   /** Map of in-flight messages by ID */
-  private inFlightMessages: Map<number, Message> = new Map();
-  
+  private inFlightMessages: Map<string, Message> = new Map();
+
   /** Buffer of fetched messages waiting to be consumed */
   private messageBuffer: Message[] = [];
-  
+
   /** Flag indicating if the consumer is actively running */
   private running: boolean = false;
+  private stopPromise: Promise<void> | null = null;
+  private drained = createDeferred<void>();
+
+  /** The reason this consumer closed: a QueueFatalError on a fatal teardown
+   *  (the queue is gone), or undefined on a normal stop. Delivered to onClose
+   *  listeners once stop() completes. */
+  private fatalErr?: QueueFatalError;
+  /** Registered onClose listeners, fired once when the consumer closes. */
+  private closeListeners: Array<(err?: Error) => void> = [];
+  /** True once the close outcome has been delivered to listeners. */
+  private closeSignalled: boolean = false;
 
   /** Flag indicating if the consumer is actively fetching messages */
   private fetching: boolean = false;
@@ -214,34 +129,18 @@ export class Consumer {
 
   /** Notification unsubscribe function */
   private unsubscribe: (() => void) | null = null;
-  
-  /** Auto-extension timer handle */
-  private nextExtensionTimer: NodeJS.Timeout | null = null;
-  
+
   /** Reference to the current iterator for signaling availability */
   private iteratorSignal: [Promise<void>, () => void] | null = null;
-  
+
   /** Timer for the next scheduled fetch */
   private nextFetchTimer: NodeJS.Timeout | null = null;
-  
+
   /** Flag indicating if the last fetch returned a full batch */
   private lastFetchWasFull: boolean = false;
-  
+
   /** Threshold for triggering new fetches (1/3 of batchSize) */
   private readonly fetchThreshold: number;
-  
-  /** Schedule of in-flight messages awaiting auto-extension. */
-  private readonly queue: ExtensionQueue;
-
-  /** Flag to indicate if an extension operation is currently in progress */
-  private extending: boolean = false;
-
-  /** Earliest moment at which the next extension call may run, regardless
-   *  of what the head of the queue says. Set by processExtensions on a
-   *  transient failure to defer the next attempt by ~1s and avoid
-   *  tight-looping against a dead DB. Cleared on entry to the next call.
-   *  Mirrors Go's `tryAfter` in extendLoop. */
-  private tryAfter: Date | null = null;
 
   /**
    * Create a new Consumer
@@ -249,11 +148,7 @@ export class Consumer {
    * @param connection - Connection manager instance
    * @param options - Consumer options
    */
-  constructor(
-    queueName: string,
-    connection: Connection,
-    options: Partial<ConsumerOptions> = {}
-  ) {
+  constructor(queueName: string, connection: Connection, options: Partial<ConsumerOptions> = {}) {
     this.queueName = queueName;
     this.connection = connection;
 
@@ -274,17 +169,12 @@ export class Consumer {
       ...normalized,
       autoExtension: {
         ...Consumer.DEFAULT_OPTIONS.autoExtension,
-        ...normalized.autoExtension
-      }
+        ...normalized.autoExtension,
+      },
     };
-    
+
     // Calculate the fetch threshold once (1/3 of batch size)
     this.fetchThreshold = Math.max(1, Math.floor(this.options.batchSize / 3));
-
-    this.queue = new ExtensionQueue(
-      this.options.visibilityTimeoutSec,
-      this.options.autoExtension.extensionThreshold ?? 0.5,
-    );
   }
 
   /**
@@ -294,14 +184,11 @@ export class Consumer {
    * initial fetch happen on the same tick.
    */
   private start(): void {
-    if (this.running) {
+    if (this.running || this.stopPromise) {
       return;
     }
 
-    const topic = this.connection.resolveTopic(
-      this.queueName,
-      this.options.topic || undefined
-    );
+    const topic = this.connection.resolveTopic(this.queueName, this.options.topic || undefined);
 
     this.running = true;
     this.unsubscribe = this.connection.subscribeForConsumer(
@@ -310,9 +197,9 @@ export class Consumer {
       this.handleNotification.bind(this)
     );
 
-    if (this.options.autoExtension.enabled) {
-      this.scheduleNextExtension();
-    }
+    // Auto-extension is no longer a per-consumer timer: in-flight messages are
+    // registered with the connection-level extender actor as they are fetched
+    // (addToQueue) and deregistered when they settle (handleMessageComplete).
 
     // Start with an initial fetch
     this.triggerFetch();
@@ -328,164 +215,35 @@ export class Consumer {
     this.triggerFetch();
   }
 
-  /** Track `message` for auto-extension, then update the timer. No-op
-   *  if auto-extension is disabled. */
+  /** Register `message` with the connection-level extender. No-op if
+   *  auto-extension is disabled. The extender holds an advisory cancel
+   *  (message._cancel) for lease loss and updates message.vt on each
+   *  extension via onExtended. */
   private addToQueue(message: Message): void {
     if (!this.options.autoExtension.enabled) return;
-    this.queue.add(message);
-    this.scheduleNextExtension();
+    this.connection.extenderRegister({
+      queue: this.queueName,
+      id: message.id,
+      token: message.consumerToken,
+      // Re-extend by the configured consume VT (matching Go). The extender's
+      // schedule is derived from the returned vt, so lease and next-extension
+      // time stay consistent even after a large VT.
+      vtSec: this.options.visibilityTimeoutSec,
+      threshold: this.options.autoExtension.extensionThreshold ?? 0.5,
+      vt: message.vt,
+      cancel: () => message._cancel(),
+      onExtended: (vt: Date) => {
+        message.vt = vt;
+      },
+    });
   }
 
-  /** Drop tracking for `messageId`. No-op if auto-extension is disabled
-   *  or the message isn't tracked. */
-  private removeFromQueue(messageId: number): void {
-    if (!this.options.autoExtension.enabled) return;
-    this.queue.remove(messageId);
-  }
-  
-  /**
-   * Schedule the next extension based on the extension queue
-   */
-  private scheduleNextExtension(): void {
-    if (this.nextExtensionTimer) {
-      clearTimeout(this.nextExtensionTimer);
-      this.nextExtensionTimer = null;
-    }
-
-    const head = this.queue.headTime();
-    if (!head || !this.running) return;
-
-    // Target = max(head's planned time, tryAfter). tryAfter is set on a
-    // transient failure to defer the next attempt; otherwise null.
-    let targetTime = head;
-    if (this.tryAfter && this.tryAfter > targetTime) {
-      targetTime = this.tryAfter;
-    }
-    const waitTime = Math.max(0, targetTime.getTime() - Date.now());
-
-    if (waitTime === 0) {
-      this.processExtensions();
-      return;
-    }
-
-    this.nextExtensionTimer = setTimeout(() => {
-      this.processExtensions();
-    }, waitTime);
-  }
-  
-  /** How long to defer the next extension call after a transient failure.
-   *  Avoids tight-looping against a dead DB. */
-  private static readonly TRANSIENT_RETRY_MS = 1000;
-
-  /** Maximum time stop() will wait for an in-flight fetch to complete
-   *  before giving up. The fetch may have already claimed messages
-   *  server-side; if it doesn't return in time, those messages are
-   *  re-delivered after vt expiry. 30s matches the default vt. */
-  private static readonly FETCH_DRAIN_TIMEOUT_MS = 30_000;
-
-  /**
-   * Process extensions that are due. Always uses set_vt_batch — even for
-   * a single message — to keep one code path. set_vt_batch silently omits
-   * rows that no longer match the (token, status='processing', vt>NOW())
-   * predicate, so missing rows are interpreted as "lease lost server-side"
-   * and we cancel their handlers.
-   *
-   * Outcomes:
-   *   - Success: each returned id has its vt updated and is re-scheduled.
-   *     Each requested id missing from the response is "lease lost
-   *     server-side" — cancel its handler, drop from tracking.
-   *   - Thrown error (transient — DB blip past Connection's retry budget):
-   *     keep items in the queue, set tryAfter so the next call defers
-   *     ~1s. The next attempt will either succeed or report rows missing
-   *     (→ cancel + drop).
-   */
-  private async processExtensions(): Promise<void> {
-    if (this.extending || !this.running) return;
-    this.extending = true;
-
-    try {
-      // We're running now — reset any deferral; a fresh failure below
-      // will set it again.
-      this.tryAfter = null;
-
-      const now = new Date();
-      // Always re-extend by the configured consume VT (matching Go). The
-      // ExtensionQueue schedule is derived from the returned vt, so the
-      // lease the SQL grants and the next-extension time stay consistent.
-      // Using an independent, smaller amount here would collapse a large
-      // VT and let the message expire before the next scheduled extension.
-      const extensionSec = this.options.visibilityTimeoutSec;
-      const maxBatchSize = this.options.autoExtension.maxBatchSize ?? 100;
-
-      const dueForExtension = this.queue.due(now, maxBatchSize);
-      if (dueForExtension.length === 0) return;
-
-      const messageIds = dueForExtension.map(info => info.messageId);
-      const consumerTokens = dueForExtension.map(info => info.consumerToken);
-
-      let results: Array<[number, Date]>;
-      try {
-        results = await this.connection.setMessagesVtBatch(
-          this.queueName, messageIds, consumerTokens, extensionSec,
-        );
-      } catch (error) {
-        // Transient: leave items in queue, defer next attempt globally.
-        this.tryAfter = new Date(Date.now() + Consumer.TRANSIENT_RETRY_MS);
-        if (!this.connection.isClientShuttingDown()) {
-          console.warn(`Transient error extending ${dueForExtension.length} messages: ${error}; will retry`);
-        }
-        return;
-      }
-
-      const extendedIds = new Set<number>();
-      for (const [messageId, newVt] of results) {
-        const message = this.inFlightMessages.get(messageId);
-        if (message) {
-          message.vt = newVt;
-          this.queue.replace(message);
-          extendedIds.add(messageId);
-        }
-      }
-
-      // Missing from results = lease lost server-side.
-      let leaseLost = 0;
-      for (const info of dueForExtension) {
-        if (extendedIds.has(info.messageId)) continue;
-        const msg = this.inFlightMessages.get(info.messageId);
-        if (msg) {
-          // Signal the handler (advisory abort) that the lease is gone, then
-          // drop the message from in-flight tracking and the extension queue.
-          // Without the inFlight removal, a handler that honors the abort by
-          // returning without ack/nack/release leaks the entry until stop(),
-          // growing memory and slowing shutdown. handleMessageComplete also
-          // removes it from the extension queue, so no separate remove() is
-          // needed here.
-          msg._cancel();
-          leaseLost++;
-          this.handleMessageComplete(info.messageId);
-        } else {
-          this.queue.remove(info.messageId);
-        }
-      }
-
-      if (leaseLost > 0 && !this.connection.isClientShuttingDown()) {
-        console.debug(`Extended ${extendedIds.size}/${dueForExtension.length} (${leaseLost} lease lost; handlers cancelled)`);
-      }
-    } finally {
-      this.extending = false;
-      if (this.running) this.scheduleNextExtension();
-    }
-  }
-
-  /**
-   * Handle message completion (called when a message is acked, nacked, or released)
-   * @param messageId - The ID of the completed message
-   */
-  private handleMessageComplete(messageId: number): void {
-    this.inFlightMessages.delete(messageId);
-    this.removeFromQueue(messageId);
-    // We don't trigger fetch here — message completion is not the same
-    // as message consumption from the buffer.
+  /** Deregister `messageId` from the connection-level extender. No-op if
+   *  auto-extension is disabled. */
+  private handleMessageComplete(message: Message): void {
+    this.inFlightMessages.delete(message.consumerToken);
+    this.connection.extenderDeregister(this.queueName, message.id, message.consumerToken);
+    if (this.inFlightMessages.size === 0) this.drained[1]();
   }
 
   /**
@@ -497,17 +255,17 @@ export class Consumer {
       clearTimeout(this.nextFetchTimer);
       this.nextFetchTimer = null;
     }
-    
+
     // If already fetching or not running, don't start another fetch
     if (this.fetching || !this.running) {
       return;
     }
-    
+
     // If buffer is full, don't fetch now (will trigger after consumption)
     if (this.messageBuffer.length >= this.options.batchSize) {
       return;
     }
-    
+
     // Execute fetch with inline error handling. Capture the promise
     // synchronously so stop() can await it before tearing down — see the
     // fetchInFlight comment.
@@ -544,19 +302,45 @@ export class Consumer {
         this.options.batchSize - this.messageBuffer.length,
         this.options.batchSize
       );
-      
+
       if (fetchCount <= 0) {
         this.fetching = false;
         return;
       }
-      
-      // Fetch messages
-      const rawMessages = await this.connection.consumeMessages(
-        this.queueName,
-        this.options.visibilityTimeoutSec,
-        fetchCount
-      );
-      
+
+      // Fetch messages. A PMQ02 here means the queue was deleted out-of-band:
+      // it's fatal for this consumer (it can never get messages again). Escalate
+      // to the connection's queueFatal — which tears this consumer (and any
+      // siblings on the queue) down and fires the queue-fatal signal — instead
+      // of letting the error fall through to the 1s fetch-retry loop forever.
+      let rawMessages;
+      try {
+        this.generation ??= await this.connection.resolveQueueGeneration(this.queueName);
+        if (!this.running) return;
+        rawMessages = await this.connection.consumeMessages(
+          this.queueName,
+          this.options.visibilityTimeoutSec,
+          fetchCount,
+          this.generation
+        );
+      } catch (err) {
+        if (err instanceof QueueNotFoundError) {
+          this.connection.queueFatal(this.queueName, err, this.generation);
+          return;
+        }
+        throw err;
+      }
+
+      // A fetch result belongs to the consumer lifetime that started it.
+      // After stop it can only be released, never delivered or auto-extended.
+      if (!this.running) {
+        await Promise.allSettled(
+          rawMessages.map((m) =>
+            this.connection.releaseMessage(this.queueName, m.message_id, m.consumer_token)
+          )
+        );
+        return;
+      }
       // Process fetched messages
       for (const rawMessage of rawMessages) {
         // Create Message object
@@ -568,39 +352,40 @@ export class Consumer {
           rawMessage.delivery_attempts,
           new Date(rawMessage.vt),
           new Date(rawMessage.published_at),
-          this.handleMessageComplete.bind(this),
+          () => this.handleMessageComplete(message),
           {
             ack: this.connection.ackMessage.bind(this.connection),
             nack: this.connection.nackMessage.bind(this.connection),
             release: this.connection.releaseMessage.bind(this.connection),
-            setVt: this.connection.setMessageVt.bind(this.connection)
+            setVt: this.connection.setMessageVt.bind(this.connection),
           }
         );
-        
+
         // Add to buffer and in-flight tracking
         this.messageBuffer.push(message);
-        this.inFlightMessages.set(message.id, message);
+        if (this.inFlightMessages.size === 0) this.drained = createDeferred<void>();
+        this.inFlightMessages.set(message.consumerToken, message);
         this.addToQueue(message);
       }
-      
+
       // Check if we received a full batch
       this.lastFetchWasFull = rawMessages.length === fetchCount;
-      
+
       // Signal iterator if waiting
       if (this.iteratorSignal && this.messageBuffer.length > 0) {
         this.iteratorSignal[1]();
         this.iteratorSignal = null;
       }
-      
+
       // If we got a partial batch, schedule next fetch based on visibility times
       if (rawMessages.length < fetchCount && this.running) {
-        this.scheduleNextFetch();
+        await this.scheduleNextFetch();
       }
     } finally {
       this.fetching = false;
     }
   }
-  
+
   /**
    * Schedule the next fetch based on message visibility times
    */
@@ -608,24 +393,25 @@ export class Consumer {
     try {
       // Get the next visible time from the database
       const nextVisibleTime = await this.connection.getNextVisibleTime(this.queueName);
-      
+
       if (!this.running) return;
-      
+
       let waitTime = this.options.pollingIntervalMs;
-      
+
       if (nextVisibleTime) {
         const now = new Date();
         const timeUntilNextVisible = Math.max(0, nextVisibleTime.getTime() - now.getTime());
-        
+
         // Use the shorter of the two wait times
         waitTime = Math.min(timeUntilNextVisible, this.options.pollingIntervalMs);
       }
-      
+
       // Schedule the next fetch
       this.nextFetchTimer = setTimeout(() => this.triggerFetch(), waitTime);
     } catch (error) {
+      if (!this.running) return;
       console.error(`Error scheduling next fetch: ${error}`);
-      
+
       // On error, retry in one second
       if (this.running) {
         this.nextFetchTimer = setTimeout(() => this.triggerFetch(), 1000);
@@ -637,192 +423,89 @@ export class Consumer {
    * Stop the consumer
    * @returns Promise that resolves when consumer is stopped
    */
-  async stop(): Promise<void> {
-    if (!this.running) {
-      return;
+  stop(): Promise<void> {
+    if (!this.stopPromise) {
+      this.running = false;
+      this.stopPromise = this.drain();
     }
+    return this.stopPromise;
+  }
 
-    this.running = false;
-
-    // Signal every in-flight handler that the consumer is shutting down so
-    // it can short-circuit work — the application can still finish acking,
-    // nacking, or releasing a message after the signal fires (the abort is
-    // advisory). Mirrors Go's Consumer.Stop() which cancels every
-    // in-flight message's StoppedCtx during shutdown.
-    for (const message of this.inFlightMessages.values()) {
-      message._cancel();
+  private async drain(): Promise<void> {
+    const deadline = Date.now() + this.connection.getShutdownTimeoutMs();
+    if (this.nextFetchTimer) clearTimeout(this.nextFetchTimer);
+    this.nextFetchTimer = null;
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    this.iteratorSignal?.[1]();
+    this.iteratorSignal = null;
+    for (const message of this.inFlightMessages.values()) message._cancel();
+    // Only buffered messages are known to be unattempted. A forced drain
+    // abandons running leases without resetting delivery attempts.
+    const buffered = this.messageBuffer.splice(0);
+    const releases = Promise.allSettled(buffered.map((m) => m.release()));
+    await untilDeadline(Promise.all([releases, this.fetchInFlight]), deadline);
+    if (this.inFlightMessages.size) await untilDeadline(this.drained[0], deadline);
+    for (const m of this.inFlightMessages.values()) {
+      this.connection.extenderDeregister(this.queueName, m.id, m.consumerToken);
     }
-
-    // Clear the next fetch timer
-    if (this.nextFetchTimer) {
-      clearTimeout(this.nextFetchTimer);
-      this.nextFetchTimer = null;
-    }
-
-    // Clear the extension timer
-    if (this.nextExtensionTimer) {
-      clearTimeout(this.nextExtensionTimer);
-      this.nextExtensionTimer = null;
-    }
-
-    // Unsubscribe from notifications (fire-and-forget UNLISTEN inside).
-    if (this.unsubscribe) {
-      this.unsubscribe();
-      this.unsubscribe = null;
-    }
-
-    // Signal iterator if waiting - MUST do this before releasing messages
-    // This ensures the iterator returns done immediately
-    if (this.iteratorSignal) {
-      this.iteratorSignal[1]();
-      this.iteratorSignal = null;
-    }
-
-    // Wait for any in-flight fetchMessages to complete so its messages
-    // reach the buffer / inFlight tracking before we drain. Without
-    // this, a fetch that already claimed rows server-side would orphan
-    // them: they'd be locked in 'processing' with no one to release.
-    // Bounded by FETCH_DRAIN_TIMEOUT_MS so a wedged fetch can't block
-    // shutdown indefinitely. The timer is cleared on the success path
-    // to avoid an UnhandledPromiseRejection on the discarded branch.
-    if (this.fetchInFlight) {
-      let timeoutId: NodeJS.Timeout | null = null;
-      try {
-        const timeout = new Promise<never>((_, reject) => {
-          timeoutId = setTimeout(
-            () => reject(new Error('fetch did not complete within drain timeout')),
-            Consumer.FETCH_DRAIN_TIMEOUT_MS,
-          );
-        });
-        await Promise.race([this.fetchInFlight, timeout]);
-      } catch (err) {
-        if (!this.connection.isClientShuttingDown()) {
-          console.warn(`Consumer stop: ${err}; messages claimed by the in-flight fetch may be redelivered after vt expiry`);
-        }
-      } finally {
-        if (timeoutId) clearTimeout(timeoutId);
-      }
-    }
-
-    // Release any buffered messages (similar to Go closing the channel and releasing buffered messages)
-    await this.releaseBufferedMessages();
-
-    // Wait for all in-flight messages to complete with a shorter timeout
-    // This allows ack/nack/release operations to finish
-    if (this.inFlightMessages.size > 0) {
-      const startTime = Date.now();
-      const timeout = 2000; // 2 second timeout for in-flight messages (reduced from 5s)
-
-      while (this.inFlightMessages.size > 0) {
-        await sleep(50); // Check every 50ms
-
-        // Timeout if messages aren't completing
-        if (Date.now() - startTime > timeout) {
-          // Only log if not in connection shutdown (prevents "Cannot log after tests are done" warnings)
-          if (!this.connection.isClientShuttingDown()) {
-            console.debug(`Consumer stop: releasing ${this.inFlightMessages.size} in-flight messages after ${timeout}ms timeout`);
-          }
-
-          // Force release any remaining in-flight messages
-          // This matches the Go implementation which cancels contexts for all in-flight messages
-          const remainingMessages = Array.from(this.inFlightMessages.values());
-
-          // Release all in parallel for speed
-          const releasePromises = remainingMessages.map(async (message) => {
-            try {
-              await message.release();
-            } catch (error) {
-              // Expected during shutdown - message may already be processed
-              // Only log if not in connection shutdown
-              if (!this.connection.isClientShuttingDown()) {
-                console.debug(`Message ${message.id} release failed during shutdown (expected): ${error}`);
-              }
-              // Remove from tracking even if release fails
-              this.handleMessageComplete(message.id);
-            }
-          });
-
-          // Wait for all releases with a short timeout (capped at 500ms).
-          // Use a clearable timer so we don't leak an active setTimeout
-          // past shutdown when the releases finish first.
-          let releaseTimeoutId: NodeJS.Timeout | null = null;
-          try {
-            const cap = new Promise<void>((resolve) => {
-              releaseTimeoutId = setTimeout(resolve, 500);
-            });
-            await Promise.race([Promise.all(releasePromises), cap]);
-          } catch {
-            // Ignore errors during shutdown
-          } finally {
-            if (releaseTimeoutId) clearTimeout(releaseTimeoutId);
-          }
-
-          break;
-        }
-      }
-    }
-
-    // Unregister from connection
+    this.inFlightMessages.clear();
     this.connection.unregisterConsumer(this);
+    this.signalClose();
   }
 
   /**
-   * Release all buffered messages back to the queue
+   * getQueueName reports the queue this consumer is bound to. Used by the
+   * connection's queueFatal routing to find consumers on a gone queue.
+   * @internal
    */
-  private async releaseBufferedMessages(): Promise<void> {
-    // Create array of release promises
-    const promises: Promise<void>[] = [];
+  getQueueGeneration(): string | undefined {
+    return this.generation;
+  }
 
-    for (const message of this.messageBuffer) {
-      try {
-        // Only release if it's still in flight (hasn't been processed yet)
-        if (this.inFlightMessages.has(message.id)) {
-          promises.push(
-            message.release().catch(err => {
-              // Silently ignore release errors for messages that are no longer in processing state
-              // This can happen if VT expired and another consumer picked it up
-              const errorStr = err.toString();
-              const isExpectedError = errorStr.includes('not in processing state') ||
-                                       errorStr.includes('token mismatch');
+  getQueueName(): string {
+    return this.queueName;
+  }
 
-              // Only log if not in connection shutdown and not an expected error
-              if (!this.connection.isClientShuttingDown() && !isExpectedError) {
-                console.error(`Failed to release buffered message ${message.id}: ${err}`);
-              }
-              // Don't rethrow - continue with other releases
-            })
-          );
-        }
-      } catch (error) {
-        console.error(`Error releasing buffered message ${message.id}: ${error}`);
-      }
+  /**
+   * fatal tears the consumer down because its queue is gone. It records the
+   * reason (delivered to onClose) and runs the normal stop() teardown
+   * (handlers cancelled via their AbortSignal, in-flight deregistered from the
+   * extender). Non-blocking and idempotent. @internal
+   */
+  fatal(err: QueueFatalError): void {
+    if (!this.fatalErr) this.fatalErr = err;
+    void this.stop();
+  }
+
+  /**
+   * onClose registers a listener for when this consumer closes. It fires once
+   * with a QueueFatalError if the consumer was torn down because its queue is
+   * gone, or with no argument on a normal stop(). If the consumer has already
+   * closed, the listener fires on the next microtask. Mirrors the RabbitMQ Go
+   * client's Channel.NotifyClose.
+   */
+  onClose(listener: (err?: Error) => void): void {
+    if (this.closeSignalled) {
+      const err = this.fatalErr;
+      queueMicrotask(() => listener(err));
+      return;
     }
+    this.closeListeners.push(listener);
+  }
 
-    // Clear the buffer
-    this.messageBuffer = [];
-
-    // Wait for all releases to complete with a 2s cap. Failed releases
-    // are expected when VT expires; we just want to bound shutdown time.
-    //
-    // The previous implementation used `Promise.race([all, setTimeout(reject)])`
-    // — when `all` resolves first, the setTimeout still fires later and
-    // triggers an UnhandledPromiseRejection on a Promise nobody is
-    // listening to (Node crashes under --unhandled-rejections=strict).
-    // Capture the timer id and clear it on the success path.
-    let timeoutId: NodeJS.Timeout | null = null;
-    try {
-      const timeout = new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(
-          () => reject(new Error('Release timeout')),
-          2000,
-        );
-      });
-      await Promise.race([Promise.all(promises), timeout]);
-    } catch (error) {
-      console.debug(`Some buffered messages may not have been released (expected during shutdown): ${error}`);
-      // Continue shutdown anyway - messages will become available after VT expires
-    } finally {
-      if (timeoutId) clearTimeout(timeoutId);
+  /** Fire the close listeners once with the recorded outcome. */
+  private signalClose(): void {
+    if (this.closeSignalled) return;
+    this.closeSignalled = true;
+    const listeners = this.closeListeners;
+    this.closeListeners = [];
+    for (const listener of listeners) {
+      try {
+        listener(this.fatalErr);
+      } catch (err) {
+        console.error(`Consumer onClose listener threw for queue ${this.queueName}:`, err);
+      }
     }
   }
 
@@ -833,68 +516,70 @@ export class Consumer {
   messages(): AsyncIterableIterator<Message> {
     // Start the consumer if not already running
     this.start();
-    
+
     // Create a message iterator
     const messageIterator: AsyncIterableIterator<Message> = {
       // Implementation of Symbol.asyncIterator
       [Symbol.asyncIterator]: () => messageIterator,
-      
+
       // The next method for the iterator
       next: async (): Promise<IteratorResult<Message>> => {
         // If not running, return done
         if (!this.running) {
           return { done: true, value: undefined as any };
         }
-        
+
         // If buffer has messages, return the next one
         if (this.messageBuffer.length > 0) {
           const message = this.messageBuffer.shift()!;
-          
+
           // Only fetch more if buffer is below threshold AND last fetch was full
-          const shouldFetch = this.messageBuffer.length < this.fetchThreshold && this.lastFetchWasFull;
-            
+          const shouldFetch =
+            this.messageBuffer.length < this.fetchThreshold && this.lastFetchWasFull;
+
           if (shouldFetch) {
             this.triggerFetch();
           }
-          
+
           return {
             done: false,
-            value: message
+            value: message,
           };
         }
-        
+
         // No messages available, wait for more
         const [promise, resolve] = createDeferred<void>();
         this.iteratorSignal = [promise, resolve];
-        
+
         // Trigger a fetch if not already fetching
         this.triggerFetch();
-        
+
         // Wait for signal or shutdown
         await promise;
-        
+
         // Check if we've been stopped while waiting
         if (!this.running) {
           return { done: true, value: undefined as any };
         }
-        
+
         // If buffer now has messages, return the next one
         if (this.messageBuffer.length > 0) {
           const message = this.messageBuffer.shift()!;
-          
+
           // Only fetch more if buffer is below threshold AND last fetch was full
-          const shouldFetch = this.messageBuffer.length < this.fetchThreshold && this.lastFetchWasFull;
-            
+          const shouldFetch =
+            this.messageBuffer.length < this.fetchThreshold && this.lastFetchWasFull;
+
           if (shouldFetch) {
             this.triggerFetch();
           }
-          
+
           return {
             done: false,
-            value: message
+            value: message,
           };
         }
-        
+
         // This shouldn't happen, but just in case
         return messageIterator.next();
       },

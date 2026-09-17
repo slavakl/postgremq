@@ -3,6 +3,7 @@
  * Runs before all tests to configure the test environment
  */
 
+import {stopSharedTestDatabase} from './helpers';
 import { jest, beforeAll, afterAll } from '@jest/globals';
 
 // Increase test timeout for integration tests with Docker
@@ -25,7 +26,5 @@ beforeAll(async () => {
 
 // Global test teardown
 afterAll(async () => {
-  // Any global cleanup logic here
-  // Give time for async operations to complete
-  await new Promise(resolve => setTimeout(resolve, 500));
+  await stopSharedTestDatabase();
 });

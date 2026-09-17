@@ -130,50 +130,6 @@ def test_topic_and_queue_creation(cur: psycopg2.extensions.cursor) -> None:
         SELECT * FROM consume_message('TestQueue', 30)
     """)
 
-def test_queue_keep_alive_extension(cur: psycopg2.extensions.cursor) -> None:
-    """Test queue keep-alive extension functionality."""
-    # Setup
-    cur.execute("""
-        SELECT create_topic('TestTopic');
-        SELECT create_queue('TestQueue_Ex', 'TestTopic', 2, true, interval '300 seconds');
-        SELECT create_queue('TestQueue_NonEx', 'TestTopic', 2, false);
-    """)
-
-    # Get initial keep-alive and extend it (returns VOID; success = no raise)
-    cur.execute("""
-        SELECT keep_alive_until FROM queues WHERE name = 'TestQueue_Ex';
-        SELECT extend_queue_keep_alive('TestQueue_Ex', interval '15 minutes');
-    """)
-
-    # Verify keep-alive was extended
-    cur.execute("""
-        SELECT keep_alive_until 
-        FROM queues 
-        WHERE name = 'TestQueue_Ex'
-    """)
-    new_keep_alive = cur.fetchone()[0]
-    now = datetime.now(pytz.UTC)
-    assert new_keep_alive > now + timedelta(minutes=14)
-    assert new_keep_alive < now + timedelta(minutes=16)
-
-def test_extend_keep_alive_raises_pmq02_when_queue_missing(cur: psycopg2.extensions.cursor) -> None:
-    """extend_queue_keep_alive must raise PMQ02 (not silently return) when the
-    queue does not exist — distinct from the non-exclusive case below."""
-    with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT extend_queue_keep_alive('NoSuchQueue', interval '1 minute')")
-    assert exc_info.value.pgcode == 'PMQ02', \
-        f"expected PMQ02, got {exc_info.value.pgcode}: {exc_info.value}"
-
-def test_extend_keep_alive_raises_pmq03_when_non_exclusive(cur: psycopg2.extensions.cursor) -> None:
-    """extend_queue_keep_alive must raise PMQ03 for a non-exclusive queue —
-    a different condition than 'not found', no longer conflated into FALSE."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('NonExQ', 'TestTopic', 0, false)")
-    with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT extend_queue_keep_alive('NonExQ', interval '1 minute')")
-    assert exc_info.value.pgcode == 'PMQ03', \
-        f"expected PMQ03, got {exc_info.value.pgcode}: {exc_info.value}"
-
 def test_queue_messages_status_check_constraint(cur: psycopg2.extensions.cursor) -> None:
     """A typo'd status must be rejected by the CHECK constraint rather than
     silently stranding the row in a state no query matches."""
@@ -208,6 +164,24 @@ def test_consumer_token_is_uuid(cur: psycopg2.extensions.cursor) -> None:
     # Raises ValueError if not a valid UUID.
     uuid.UUID(token)
 
+def test_consume_missing_queue_raises_pmq02(cur: psycopg2.extensions.cursor) -> None:
+    """Consuming a queue that does not exist (deleted out-of-band, or never
+    created) raises PMQ02 so the client can tear the consumer down — rather than
+    silently returning zero rows forever. An existing but empty queue must still
+    return zero rows with no error (the common idle case)."""
+    # Missing queue → PMQ02.
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT * FROM consume_message('NoSuchQueue', 30, 1)")
+    assert exc_info.value.pgcode == 'PMQ02', \
+        f"expected PMQ02, got {exc_info.value.pgcode}: {exc_info.value}"
+    cur.connection.rollback()
+
+    # Existing but empty queue → zero rows, no error.
+    cur.execute("SELECT create_topic('EmptyTopic')")
+    cur.execute("SELECT create_queue('EmptyQueue', 'EmptyTopic', 0, false)")
+    cur.execute("SELECT * FROM consume_message('EmptyQueue', 30, 1)")
+    assert cur.fetchall() == []
+
 def test_consume_skips_redundant_keep_alive_write(cur: psycopg2.extensions.cursor) -> None:
     """Back-to-back consumes on an exclusive queue should NOT rewrite
     keep_alive_until every time — only once the deadline drifts past the
@@ -228,24 +202,25 @@ def test_consume_skips_redundant_keep_alive_write(cur: psycopg2.extensions.curso
 
     assert first == second, "second consume should not have rewritten keep_alive_until"
 
-def test_maintenance_grace_period_for_just_expired_queue(cur: psycopg2.extensions.cursor) -> None:
-    """pmq_maintenance_fast must not reap an exclusive queue whose keep-alive
-    only just lapsed (within the 5s grace) — protects a keep-alive that fired
-    a hair late. A queue well past the grace is still reaped."""
+def test_maintenance_reaps_expired_exclusive_queue_no_grace(cur: psycopg2.extensions.cursor) -> None:
+    """pmq_maintenance_fast reaps any exclusive queue past its keep_alive_until —
+    there is NO grace window (the reaper uses keep_alive_until > NOW()). A queue
+    whose deadline is still in the future survives. (Commit 3b1788d removed the
+    former 5s grace; clients must send keep-alive before expiry.)"""
     cur.execute("SELECT create_topic('TestTopic')")
     cur.execute("SELECT create_queue('JustExpired', 'TestTopic', 0, true, interval '60 seconds')")
-    cur.execute("SELECT create_queue('LongExpired', 'TestTopic', 0, true, interval '60 seconds')")
+    cur.execute("SELECT create_queue('StillAlive', 'TestTopic', 0, true, interval '60 seconds')")
 
-    # JustExpired: 2s past deadline (inside grace). LongExpired: 30s past (outside).
+    # JustExpired: 2s past deadline (no grace → reaped). StillAlive: 60s out.
     cur.execute("UPDATE queues SET keep_alive_until = NOW() - INTERVAL '2 seconds' WHERE name = 'JustExpired'")
-    cur.execute("UPDATE queues SET keep_alive_until = NOW() - INTERVAL '30 seconds' WHERE name = 'LongExpired'")
+    cur.execute("UPDATE queues SET keep_alive_until = NOW() + INTERVAL '60 seconds' WHERE name = 'StillAlive'")
 
     cur.execute("SELECT pmq_maintenance_fast()")
 
     cur.execute("SELECT count(*) FROM queues WHERE name = 'JustExpired'")
-    assert cur.fetchone()[0] == 1, "queue within the 5s grace must survive"
-    cur.execute("SELECT count(*) FROM queues WHERE name = 'LongExpired'")
-    assert cur.fetchone()[0] == 0, "queue well past the grace must be reaped"
+    assert cur.fetchone()[0] == 0, "a queue past keep_alive_until must be reaped (no grace)"
+    cur.execute("SELECT count(*) FROM queues WHERE name = 'StillAlive'")
+    assert cur.fetchone()[0] == 1, "a queue whose deadline is still in the future must survive"
 
 def test_create_queue_idempotent_and_strict(cur: psycopg2.extensions.cursor) -> None:
     """create_queue follows RabbitMQ-style 'match-or-error' semantics:
@@ -282,30 +257,20 @@ def test_create_queue_idempotent_and_strict(cur: psycopg2.extensions.cursor) -> 
         assert "already exists with different parameters" in str(exc_info.value)
         cur.connection.rollback()
 
-def test_create_queue_idempotent_refreshes_exclusive_keep_alive(cur: psycopg2.extensions.cursor) -> None:
-    """Re-creating an exclusive queue with matching params refreshes
-    keep_alive_until so an expired queue is revived (the caller is asserting
-    ownership now)."""
+def test_expired_queue_cannot_be_revived(cur):
     cur.execute("SELECT create_topic('TestTopic')")
     cur.execute("SELECT create_queue('Revive', 'TestTopic', 0, true, interval '60 seconds')")
-
-    # Force the queue's keep_alive_until into the past.
-    cur.execute("UPDATE queues SET keep_alive_until = NOW() - interval '1 hour' WHERE name = 'Revive'")
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'Revive'")
-    expired_at = cur.fetchone()[0]
-    now_pre = datetime.now(pytz.UTC)
-    assert expired_at < now_pre
-
-    # Idempotent re-create with same params → revives the queue.
+    cur.execute("UPDATE queues SET keep_alive_until = clock_timestamp() - interval '1 hour' WHERE name = 'Revive'")
+    for statement in ["SELECT create_queue('Revive', 'TestTopic', 0, true, interval '60 seconds')", "SELECT consume_message('Revive', 30, 1)"]:
+        with pytest.raises(psycopg2.Error) as error:
+            cur.execute(statement)
+        assert error.value.pgcode == 'PMQ02'
+    cur.execute("SELECT * FROM extend_queue_keep_alive_multi(ARRAY['Revive']::varchar[], ARRAY[60000]::bigint[])")
+    assert cur.fetchall() == []
+    cur.execute("SELECT delete_queue('Revive')")
     cur.execute("SELECT create_queue('Revive', 'TestTopic', 0, true, interval '60 seconds')")
-
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'Revive'")
-    after = cur.fetchone()[0]
-    now_post = datetime.now(pytz.UTC)
-    assert after > now_post, f"keep_alive_until must be in the future after revive: {after}"
-    # Should land at ~now+60s; allow a comfortable window for clock granularity.
-    assert after > now_post + timedelta(seconds=55)
-    assert after < now_post + timedelta(seconds=65)
+    cur.execute("SELECT keep_alive_until > clock_timestamp() FROM queues WHERE name='Revive'")
+    assert cur.fetchone()[0]
 
 def test_create_queue_idempotent_does_not_touch_nonexclusive(cur: psycopg2.extensions.cursor) -> None:
     """The keep_alive_until refresh in the idempotent path is gated on
@@ -406,7 +371,7 @@ def test_non_exclusive_queue_keep_alive_ignored(cur: psycopg2.extensions.cursor)
     cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'NonExQueue'")
     assert cur.fetchone()[0] is None
 
-def test_consume_refreshes_keep_alive_for_exclusive(cur: psycopg2.extensions.cursor) -> None:
+def test_consume_does_not_own_queue_lease(cur: psycopg2.extensions.cursor) -> None:
     """consume_message advances keep_alive_until for exclusive queues once the
     deadline has drifted into the second half of the interval, so an actively-
     polling consumer cannot have its queue GC'd. (It deliberately SKIPS the
@@ -426,11 +391,7 @@ def test_consume_refreshes_keep_alive_for_exclusive(cur: psycopg2.extensions.cur
 
     cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExActive'")
     after = cur.fetchone()[0]
-    assert after > before, f"keep_alive_until should advance on consume when due: before={before} after={after}"
-    # Refreshed to ~now+60s (the interval), not now+30 (vt).
-    now = datetime.now(pytz.UTC)
-    assert after > now + timedelta(seconds=55)
-    assert after < now + timedelta(seconds=65)
+    assert after == before, "only keep-alive owns queue lifetime; polling must not lock the queue row"
 
 def test_consume_does_not_touch_keep_alive_for_non_exclusive(cur: psycopg2.extensions.cursor) -> None:
     """Non-exclusive queues have keep_alive_until = NULL; consume must leave it alone."""
@@ -454,7 +415,9 @@ def test_consume_does_not_revive_expired_exclusive_queue(cur: psycopg2.extension
 
     cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExExpired'")
     expired_at = cur.fetchone()[0]
-    cur.execute("SELECT consume_message('ExExpired', 30, 1)")
+    with pytest.raises(psycopg2.Error) as error:
+        cur.execute("SELECT consume_message('ExExpired', 30, 1)")
+    assert error.value.pgcode == 'PMQ02'
 
     cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExExpired'")
     after = cur.fetchone()[0]
@@ -841,111 +804,228 @@ def test_set_vt(cur: psycopg2.extensions.cursor) -> None:
             SELECT set_vt(%s, %s, %s, 60)
         """, (queue_name, message_id + 1, consumer_token))
 
-def test_set_vt_batch(cur: psycopg2.extensions.cursor) -> None:
-    """Test batch extension of message visibility timeouts."""
-    # Setup
-    cur.execute("SELECT create_topic('BatchTopic')")
-    cur.execute("SELECT create_queue('BatchQueue', 'BatchTopic', 3, true)")
-    
-    # Publish messages
-    for _ in range(3):
-        cur.execute(
-            "SELECT publish_message('BatchTopic', '{\"test\": \"batch\"}'::jsonb)"
-        )
-    
-    # Consume messages
-    cur.execute("""
-        SELECT message_id, consumer_token
-        FROM consume_message('BatchQueue', 300, 3)
-    """)
-    messages = cur.fetchall()
-    
-    msg_ids = [m['message_id'] for m in messages]
-    tokens = [m['consumer_token'] for m in messages]
-    
-    # Test valid extension
-    cur.execute("""
-        SELECT message_id 
-        FROM set_vt_batch('BatchQueue', %s, %s, 60)
-    """, (msg_ids, tokens))
-    extended_ids = [r[0] for r in cur.fetchall()]
-    assert len(extended_ids) == len(msg_ids)
-    
-    # Test with wrong tokens
-    wrong_tokens = ['wrong-token' for _ in tokens]
-    cur.execute("""
-        SELECT COUNT(*) 
-        FROM set_vt_batch('BatchQueue', %s, %s, 60)
-    """, (msg_ids, wrong_tokens))
+def _consume_one(cur, queue, vt=30):
+    """Consume a single message from a queue, returning (message_id, token)."""
+    cur.execute(
+        "SELECT message_id, consumer_token FROM consume_message(%s, %s, 1)",
+        (queue, vt),
+    )
+    row = cur.fetchone()
+    return row['message_id'], row['consumer_token']
+
+
+def test_set_vt_batch_multi_extends_across_queues(cur):
+    """One set_vt_batch_multi call extends in-flight messages spanning several
+    queues in a single round-trip, correlating results by (queue, message_id)."""
+    cur.execute("SELECT create_topic('MTopic')")
+    cur.execute("SELECT create_queue('MQ1', 'MTopic', 3, false)")
+    cur.execute("SELECT create_queue('MQ2', 'MTopic', 3, false)")
+    # One publish fans out to BOTH queues — same message_id lands in MQ1 and MQ2.
+    cur.execute("SELECT publish_message('MTopic', '{\"k\": 1}'::jsonb)")
+
+    m1, t1 = _consume_one(cur, 'MQ1', vt=30)
+    m2, t2 = _consume_one(cur, 'MQ2', vt=30)
+    assert m1 == m2  # same message_id in both queues
+
+    cur.execute(
+        """
+        SELECT queue_name, message_id, vt
+        FROM set_vt_batch_multi(%s, %s, %s, %s)
+        """,
+        (['MQ1', 'MQ2'], [m1, m2], [t1, t2], [600, 600]),
+    )
+    rows = {(r['queue_name'], r['message_id']) for r in cur.fetchall()}
+    assert rows == {('MQ1', m1), ('MQ2', m2)}
+
+    # Both rows pushed out to ~600s.
+    cur.execute(
+        "SELECT queue_name, vt FROM queue_messages WHERE message_id = %s ORDER BY queue_name",
+        (m1,),
+    )
+    now = datetime.now(pytz.UTC)
+    for r in cur.fetchall():
+        assert r['vt'] > now + timedelta(seconds=590)
+
+
+def test_set_vt_batch_multi_composite_key_no_cross_queue_bleed(cur):
+    """The (queue, message_id) key must be respected: extending one queue's copy
+    of a shared message_id must NOT touch the other queue's copy."""
+    cur.execute("SELECT create_topic('BleedTopic')")
+    cur.execute("SELECT create_queue('BQ1', 'BleedTopic', 3, false)")
+    cur.execute("SELECT create_queue('BQ2', 'BleedTopic', 3, false)")
+    cur.execute("SELECT publish_message('BleedTopic', '{}'::jsonb)")
+
+    m1, t1 = _consume_one(cur, 'BQ1', vt=30)
+    m2, t2 = _consume_one(cur, 'BQ2', vt=30)
+    assert m1 == m2
+
+    # Record BQ2's current vt, then extend ONLY BQ1's copy.
+    cur.execute(
+        "SELECT vt FROM queue_messages WHERE queue_name = 'BQ2' AND message_id = %s",
+        (m2,),
+    )
+    bq2_vt_before = cur.fetchone()['vt']
+
+    cur.execute(
+        "SELECT queue_name, message_id FROM set_vt_batch_multi(%s, %s, %s, %s)",
+        (['BQ1'], [m1], [t1], [600]),
+    )
+    rows = [(r['queue_name'], r['message_id']) for r in cur.fetchall()]
+    assert rows == [('BQ1', m1)]  # only BQ1 returned
+
+    # BQ1 extended, BQ2 untouched.
+    cur.execute(
+        "SELECT queue_name, vt FROM queue_messages WHERE message_id = %s ORDER BY queue_name",
+        (m1,),
+    )
+    by_q = {r['queue_name']: r['vt'] for r in cur.fetchall()}
+    now = datetime.now(pytz.UTC)
+    assert by_q['BQ1'] > now + timedelta(seconds=590)
+    assert by_q['BQ2'] == bq2_vt_before
+
+
+def test_set_vt_batch_multi_mixed_vt(cur):
+    """Per-row VTs: each message gets its own new visibility timeout."""
+    cur.execute("SELECT create_topic('MixTopic')")
+    cur.execute("SELECT create_queue('MixQ', 'MixTopic', 3, false)")
+    for _ in range(2):
+        cur.execute("SELECT publish_message('MixTopic', '{}'::jsonb)")
+
+    cur.execute(
+        "SELECT message_id, consumer_token FROM consume_message('MixQ', 30, 2)"
+    )
+    rows = cur.fetchall()
+    (a_id, a_tok), (b_id, b_tok) = (
+        (rows[0]['message_id'], rows[0]['consumer_token']),
+        (rows[1]['message_id'], rows[1]['consumer_token']),
+    )
+
+    cur.execute(
+        "SELECT message_id, vt FROM set_vt_batch_multi(%s, %s, %s, %s)",
+        (['MixQ', 'MixQ'], [a_id, b_id], [a_tok, b_tok], [120, 600]),
+    )
+    got = {r['message_id']: r['vt'] for r in cur.fetchall()}
+    now = datetime.now(pytz.UTC)
+    # a ~120s, b ~600s — distinct windows.
+    assert now + timedelta(seconds=110) < got[a_id] < now + timedelta(seconds=130)
+    assert got[b_id] > now + timedelta(seconds=590)
+
+
+def test_set_vt_batch_multi_partial_lease_loss(cur):
+    """A wrong token (lease lost) is silently omitted; valid rows still extend —
+    across queues, in the same call."""
+    cur.execute("SELECT create_topic('PartTopic')")
+    cur.execute("SELECT create_queue('PQ1', 'PartTopic', 3, false)")
+    cur.execute("SELECT create_queue('PQ2', 'PartTopic', 3, false)")
+    cur.execute("SELECT publish_message('PartTopic', '{}'::jsonb)")
+
+    m1, t1 = _consume_one(cur, 'PQ1', vt=30)
+    m2, _t2 = _consume_one(cur, 'PQ2', vt=30)
+
+    cur.execute(
+        "SELECT queue_name, message_id FROM set_vt_batch_multi(%s, %s, %s, %s)",
+        (['PQ1', 'PQ2'], [m1, m2], [t1, 'wrong-token'], [600, 600]),
+    )
+    rows = [(r['queue_name'], r['message_id']) for r in cur.fetchall()]
+    assert rows == [('PQ1', m1)]  # only the valid-token row
+
+
+def test_set_vt_batch_multi_validation(cur):
+    """Length mismatch and negative VT raise PMQ03; empty arrays are a no-op."""
+    cur.execute("SELECT create_topic('VTopic')")
+    cur.execute("SELECT create_queue('VQ', 'VTopic', 3, false)")
+
+    # Empty arrays -> zero rows, no error.
+    cur.execute(
+        "SELECT COUNT(*) FROM set_vt_batch_multi(%s, %s, %s, %s)",
+        ([], [], [], []),
+    )
     assert cur.fetchone()[0] == 0
 
-def test_set_vt_batch_comprehensive(cur: psycopg2.extensions.cursor) -> None:
-    """Test batch extension of message visibility timeouts with more edge cases."""
-    # Setup
-    cur.execute("SELECT create_topic('BatchCompTopic')")
-    cur.execute("SELECT create_queue('BatchCompQueue', 'BatchCompTopic', 3, true)")
-    
-    # Publish messages
-    for i in range(5):
+    # Mismatched lengths -> PMQ03.
+    with pytest.raises(psycopg2.Error) as exc_info:
         cur.execute(
-            "SELECT publish_message('BatchCompTopic', %s::jsonb)",
-            (json.dumps({"test": f"batch-{i}"}),)
+            "SELECT * FROM set_vt_batch_multi("
+            "ARRAY['VQ']::varchar[], ARRAY[1,2]::bigint[], "
+            "ARRAY['a']::varchar[], ARRAY[60]::int[])"
         )
-    
-    # Consume messages
-    cur.execute("""
-        SELECT message_id, consumer_token
-        FROM consume_message('BatchCompQueue', 300, 5)
-    """)
-    messages = cur.fetchall()
-    
-    msg_ids = [m['message_id'] for m in messages]
-    tokens = [m['consumer_token'] for m in messages]
-    
-    # Test 1: Empty arrays
-    cur.execute("""
-        SELECT COUNT(*) 
-        FROM set_vt_batch('BatchCompQueue', %s, %s, 60)
-    """, ([], []))
-    assert cur.fetchone()[0] == 0
-    
-    # Test 2: Subset of messages
-    subset_ids = msg_ids[0:2]
-    subset_tokens = tokens[0:2]
-    cur.execute("""
-        SELECT COUNT(*) 
-        FROM set_vt_batch('BatchCompQueue', %s, %s, 60)
-    """, (subset_ids, subset_tokens))
-    assert cur.fetchone()[0] == 2
-    
-    # Test 3: Mismatched array lengths now raise PMQ03 (validation error).
-    truncated_tokens = tokens[:-1]
-    with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("""
-            SELECT COUNT(*)
-            FROM set_vt_batch('BatchCompQueue', %s, %s, 60)
-        """, (msg_ids, truncated_tokens))
-    assert exc_info.value.pgcode == 'PMQ03', f"expected PMQ03, got {exc_info.value.pgcode}"
-    cur.connection.rollback()
-
-    # Test 4: Non-existent queue — does not raise (no rows matched is fine).
-    cur.execute("""
-        SELECT COUNT(*)
-        FROM set_vt_batch('NonExistentQueue', %s, %s, 60)
-    """, (msg_ids, tokens))
-
-    # Test 5: Negative VT now raises PMQ03 (validation error).
-    with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("""
-            SELECT COUNT(*)
-            FROM set_vt_batch('BatchCompQueue', %s, %s, -60)
-        """, (msg_ids, tokens))
     assert exc_info.value.pgcode == 'PMQ03'
     cur.connection.rollback()
-    
-    # Clean up
-    cur.execute("DELETE FROM queues WHERE name = 'BatchCompQueue'")
-    cur.execute("DELETE FROM topics WHERE name = 'BatchCompTopic'")
+
+    # Negative VT -> PMQ03.
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute(
+            "SELECT * FROM set_vt_batch_multi("
+            "ARRAY['VQ']::varchar[], ARRAY[1]::bigint[], "
+            "ARRAY['a']::varchar[], ARRAY[-1]::int[])"
+        )
+    assert exc_info.value.pgcode == 'PMQ03'
+    cur.connection.rollback()
+
+
+def _keep_alive_until(cur, queue):
+    cur.execute("SELECT keep_alive_until FROM queues WHERE name = %s", (queue,))
+    return cur.fetchone()['keep_alive_until']
+
+
+def test_extend_keep_alive_multi_extends_many_queues(cur):
+    """One call advances keep_alive_until for several exclusive queues, using a
+    per-queue interval, and returns each extended queue name."""
+    cur.execute("SELECT create_topic('KaTopic')")
+    cur.execute("SELECT create_queue('KaQ1', 'KaTopic', 0, true, interval '60 seconds')")
+    cur.execute("SELECT create_queue('KaQ2', 'KaTopic', 0, true, interval '60 seconds')")
+
+    cur.execute(
+        "SELECT queue_name FROM extend_queue_keep_alive_multi(%s, %s)",
+        (['KaQ1', 'KaQ2'], [600_000, 900_000]),  # milliseconds
+    )
+    extended = {r['queue_name'] for r in cur.fetchall()}
+    assert extended == {'KaQ1', 'KaQ2'}
+
+    now = datetime.now(pytz.UTC)
+    # KaQ1 ~600s, KaQ2 ~900s — per-row intervals applied.
+    ka1 = _keep_alive_until(cur, 'KaQ1')
+    ka2 = _keep_alive_until(cur, 'KaQ2')
+    assert now + timedelta(seconds=590) < ka1 < now + timedelta(seconds=610)
+    assert now + timedelta(seconds=890) < ka2 < now + timedelta(seconds=910)
+
+
+def test_extend_keep_alive_multi_omits_missing_and_nonexclusive(cur):
+    """Missing or non-exclusive queues are silently omitted (permanent failure);
+    valid exclusive queues still extend in the same call."""
+    cur.execute("SELECT create_topic('KaOmitTopic')")
+    cur.execute("SELECT create_queue('KaExcl', 'KaOmitTopic', 0, true, interval '60 seconds')")
+    cur.execute("SELECT create_queue('KaNonExcl', 'KaOmitTopic', 0, false)")
+
+    cur.execute(
+        "SELECT queue_name FROM extend_queue_keep_alive_multi(%s, %s)",
+        (
+            ['KaExcl', 'KaNonExcl', 'KaGhost'],
+            [600_000] * 3,  # milliseconds
+        ),
+    )
+    extended = {r['queue_name'] for r in cur.fetchall()}
+    assert extended == {'KaExcl'}  # non-exclusive and missing both omitted
+
+
+def test_extend_keep_alive_multi_validation(cur):
+    """Length mismatch raises PMQ03; empty arrays are a no-op."""
+    # Empty arrays -> zero rows.
+    cur.execute(
+        "SELECT COUNT(*) FROM extend_queue_keep_alive_multi(%s, %s)",
+        ([], []),
+    )
+    assert cur.fetchone()[0] == 0
+
+    # Mismatched lengths -> PMQ03.
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute(
+            "SELECT * FROM extend_queue_keep_alive_multi("
+            "ARRAY['A','B']::varchar[], ARRAY[60000]::bigint[])"
+        )
+    assert exc_info.value.pgcode == 'PMQ03'
+    cur.connection.rollback()
+
 
 def test_requeue_dlq_messages_resets_delivery_attempts(cur):
     # Create topic and queue
@@ -1373,10 +1453,12 @@ def test_sqlstate_codes_pmq03_validation(cur: psycopg2.extensions.cursor) -> Non
     assert exc_info.value.pgcode == 'PMQ03'
     cur.connection.rollback()
 
-    # set_vt_batch: mismatched array lengths
+    # set_vt_batch_multi: mismatched array lengths
     with pytest.raises(psycopg2.Error) as exc_info:
         cur.execute("""
-            SELECT * FROM set_vt_batch('VQueue', ARRAY[1,2]::int[], ARRAY['a']::varchar[], 60)
+            SELECT * FROM set_vt_batch_multi(
+                ARRAY['VQueue']::varchar[], ARRAY[1,2]::bigint[],
+                ARRAY['a']::varchar[], ARRAY[60]::int[])
         """)
     assert exc_info.value.pgcode == 'PMQ03'
     cur.connection.rollback()
@@ -2319,3 +2401,118 @@ def test_get_message(cur: psycopg2.extensions.cursor) -> None:
     cur.execute("SELECT delete_queue(%s)", (queue,))
     cur.execute("SELECT clean_up_topic(%s)", (topic,))
     cur.execute("SELECT delete_topic(%s)", (topic,))
+
+
+def test_heartbeat_contention_is_local_and_clock_is_fresh(cur, conn, db_config, test_db):
+    cur.execute("SELECT create_topic('t'); SELECT create_queue('q','t')")
+    for i in range(2): cur.execute("SELECT publish_message('t', %s::jsonb)", [json.dumps(i)])
+    cur.execute("SELECT * FROM consume_message('q', 10, 2)")
+    deliveries = cur.fetchall()
+    blocker = psycopg2.connect(**{**db_config, 'dbname':test_db})
+    try:
+        with blocker.cursor() as locked:
+            locked.execute("SELECT 1 FROM queue_messages WHERE message_id=%s FOR UPDATE", [deliveries[0]['message_id']])
+        with pytest.raises(psycopg2.Error) as busy:
+            cur.execute("SELECT set_vt('q',%s,%s,10)",[deliveries[0]['message_id'],deliveries[0]['consumer_token']])
+        assert busy.value.pgcode == '55P03'
+        cur.execute("SET statement_timeout='500ms'")
+        cur.execute("SELECT * FROM set_vt_batch_multi(%s::varchar[], %s::bigint[], %s::varchar[], %s::int[])",
+                    [['q','q'], [m['message_id'] for m in deliveries], [m['consumer_token'] for m in deliveries], [10,10]])
+        outcomes = {r['message_id']:r['outcome'] for r in cur.fetchall()}
+        assert outcomes == {deliveries[0]['message_id']:'busy', deliveries[1]['message_id']:'extended'}
+    finally:
+        blocker.rollback(); blocker.close()
+        cur.execute("SET statement_timeout=0")
+    # An old transaction must not extend a lease that expired after BEGIN.
+    cur.execute("BEGIN")
+    cur.execute("SELECT now()")
+    cur.execute("UPDATE queue_messages SET vt=clock_timestamp()-interval '1 ms'")
+    cur.execute("SELECT * FROM set_vt_batch_multi(%s::varchar[], %s::bigint[], %s::varchar[], %s::int[])",
+                [['q'], [deliveries[0]['message_id']], [deliveries[0]['consumer_token']], [10]])
+    assert cur.fetchall() == []
+    cur.execute("ROLLBACK")
+
+
+def test_payload_gc_preserves_lagging_queues_and_dlq(cur):
+    cur.execute("SELECT create_topic('t'); SELECT create_queue('fast','t'); SELECT create_queue('slow','t',1)")
+    cur.execute("SELECT publish_message('t','{}')")
+    id = cur.fetchone()[0]
+    cur.execute("SELECT * FROM consume_message('fast',30,1)")
+    token = cur.fetchone()['consumer_token']
+    cur.execute("SELECT ack_message('fast',%s,%s)",[id,token])
+    cur.execute("SELECT cleanup_completed_messages(0)")
+    assert cur.fetchone()[0] == 1
+    cur.execute("SELECT count(*) FROM messages")
+    assert cur.fetchone()[0] == 1
+    cur.execute("SELECT * FROM consume_message('slow',30,1)")
+    token = cur.fetchone()['consumer_token']
+    cur.execute("SELECT nack_message('slow',%s,%s)",[id,token])
+    cur.execute("SELECT cleanup_unreferenced_messages(0)")
+    assert cur.fetchone()[0] == 0
+    cur.execute("SELECT requeue_dlq_messages('slow')")
+    cur.execute("SELECT cleanup_unreferenced_messages(0)")
+    assert cur.fetchone()[0] == 0
+    cur.execute("SELECT clean_up_queue('slow')")
+    cur.execute("SELECT cleanup_unreferenced_messages(0)")
+    assert cur.fetchone()[0] == 1
+
+
+def test_payload_gc_is_bounded_and_collects_unrouted_messages(cur):
+    cur.execute("SELECT create_topic('t')")
+    for i in range(5): cur.execute("SELECT publish_message('t', '{}')")
+    cur.execute("SELECT cleanup_unreferenced_messages(0,2)")
+    assert cur.fetchone()[0] == 2
+    cur.execute("SELECT count(*) FROM messages")
+    assert cur.fetchone()[0] == 3
+
+
+def test_old_queue_generation_cannot_renew_or_consume_replacement(cur):
+    cur.execute("SELECT create_topic('t'); SELECT create_queue('q','t',0,true)")
+    old = cur.fetchone()[0]
+    cur.execute("SELECT delete_queue('q'); SELECT create_queue('q','t',0,true)")
+    new = cur.fetchone()[0]
+    assert old != new
+    cur.execute("SELECT * FROM extend_queue_keep_alive_multi(ARRAY['q']::varchar[], ARRAY[60000]::bigint[], ARRAY[%s]::uuid[])",[old])
+    assert cur.fetchall() == []
+    cur.execute("SELECT publish_message('t','{}')")
+    with pytest.raises(psycopg2.Error) as error:
+        cur.execute("SELECT * FROM consume_message('q',30,1,%s)",[old])
+    assert error.value.pgcode == 'PMQ02'
+    cur.execute("SELECT * FROM consume_message('q',30,1,%s)",[new])
+    assert len(cur.fetchall()) == 1
+
+
+def test_gc_preserves_a_concurrently_inserted_reference(cur, db_config, test_db):
+    cur.execute("SELECT create_topic('t'); SELECT publish_message('t','{}')")
+    id = cur.fetchone()[0]
+    cur.execute("SELECT create_queue('q','t')")
+    writer = psycopg2.connect(**{**db_config, 'dbname': test_db})
+    try:
+        with writer.cursor() as other:
+            other.execute("INSERT INTO queue_messages(queue_name,message_id) VALUES ('q',%s)", [id])
+        # The new reference is uncommitted, but its FK holds a key-share lock
+        # on the payload. GC must skip that payload rather than cascade-delete it.
+        cur.execute("SET statement_timeout='500ms'")
+        cur.execute("SELECT cleanup_unreferenced_messages(0)")
+        assert cur.fetchone()[0] == 0
+        writer.commit()
+        cur.execute("SELECT count(*) FROM queue_messages WHERE message_id=%s", [id])
+        assert cur.fetchone()[0] == 1
+    finally:
+        writer.close()
+        cur.execute("SET statement_timeout=0")
+
+
+def test_keepalive_contention_does_not_block_other_queues(cur, db_config, test_db):
+    cur.execute("SELECT create_topic('t'); SELECT create_queue('a','t',0,true); SELECT create_queue('b','t',0,true)")
+    blocker = psycopg2.connect(**{**db_config, 'dbname': test_db})
+    try:
+        with blocker.cursor() as locked:
+            locked.execute("SELECT 1 FROM queues WHERE name='a' FOR UPDATE")
+        cur.execute("SET statement_timeout='500ms'")
+        cur.execute("SELECT * FROM extend_queue_keep_alive_multi(ARRAY['a','b']::varchar[],ARRAY[60000,60000]::bigint[])")
+        outcomes = {r['queue_name']:r['outcome'] for r in cur.fetchall()}
+        assert outcomes == {'a':'busy','b':'extended'}
+    finally:
+        blocker.rollback(); blocker.close()
+        cur.execute("SET statement_timeout=0")

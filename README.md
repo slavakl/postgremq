@@ -107,7 +107,7 @@ func main() {
     log.Printf("Published message: %d", messageID)
 
     // Consume messages
-    consumer, _ := conn.Consume(ctx, "order-processor")
+    consumer, _ := conn.Consume("order-processor")
     defer consumer.Stop()
 
     for msg := range consumer.Messages() {
@@ -163,7 +163,7 @@ main().catch(console.error);
 4. **Processing**: Messages are invisible to other consumers during processing
 5. **Acknowledgment**: Messages can be:
    - **Acked**: Marked as successfully processed (removed from queue)
-   - **Nacked**: Returned to queue with incremented delivery attempt (optional delay)
+   - **Nacked**: Returned to queue, preserving the attempt counted at claim (optional delay)
    - **Released**: Returned to queue without incrementing delivery attempt
 6. **Dead Letter Queue**: Messages exceeding max delivery attempts are moved to DLQ
 
@@ -178,7 +178,7 @@ topics
 dead_letter_queue (failed messages)
 ```
 
-All tables use `ON DELETE CASCADE` from topics down for easy cleanup.
+Queue deliveries cascade with their queue or payload. DLQ references restrict destructive deletion; use the [retention maintenance functions](mq/README.md) for safe payload collection.
 
 ## Core Concepts
 
@@ -188,7 +188,7 @@ Instead of traditional message locks, PostgreMQ uses **visibility timeouts** (VT
 
 - Default VT is configurable per consumer
 - Automatic extension prevents timeout during long processing
-- Manual extension available via `SetVT()` / `extend()`
+- Manual extension available via `SetVT()` / `setVt()`
 
 ### Queue Types
 
@@ -197,7 +197,7 @@ Instead of traditional message locks, PostgreMQ uses **visibility timeouts** (VT
 
 ### Event Notification
 
-PostgreMQ uses PostgreSQL's `LISTEN/NOTIFY` on channel `queue:{queue_name}` to provide real-time notifications when new messages arrive, avoiding constant polling.
+PostgreMQ emits empty notifications on `pmq:t:<topic>` for publications and `pmq:q:<queue>` for nack/release/requeue. Clients share a LISTEN session and use polling as fallback.
 
 ## Client Libraries
 

@@ -32,6 +32,7 @@ export {
   QueueNotFoundError,
   ValidationError,
   ConnectionClosedError,
+  QueueFatalError,
   ErrCodeLeaseLost,
   ErrCodeQueueNotFound,
   ErrCodeValidation,

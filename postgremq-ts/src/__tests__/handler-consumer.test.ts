@@ -225,11 +225,11 @@ describe('HandlerConsumer', () => {
     let handlerFinished = false;
     let started = false;
 
-    const hc = connection.consumeHandler('hc-queue', async () => {
+    const hc = connection.consumeHandler('hc-queue', async (msg) => {
       started = true;
       await sleep(300);
       handlerFinished = true;
-      // auto-ack on return
+      await msg.ack(); // explicit success remains valid during cancellation
     });
 
     await waitFor(() => started, 10000);

@@ -1,3 +1,4 @@
+import { untilDeadline } from './utils';
 /**
  * PostgreMQ TypeScript Client
  * Handler-based consumer
@@ -7,6 +8,7 @@ import { Connection } from './connection';
 import { Consumer } from './consumer';
 import { Message } from './message';
 import { MessageHandler } from './types';
+import { QueueFatalError } from './errors';
 
 // Re-export so callers can `import { MessageHandler } from 'postgremq'`.
 // The settlement rules (auto-ack on return, auto-nack on throw, no-op if the
@@ -52,6 +54,8 @@ export class HandlerConsumer {
     this.connection = connection;
     this.consumer = consumer;
     this.handler = handler;
+    if (!Number.isSafeInteger(maxInFlight) || maxInFlight < 0)
+      throw new Error('maxInFlight must be a non-negative finite integer');
     this.maxInFlight = maxInFlight;
     this.slotsAvailable = maxInFlight;
   }
@@ -147,7 +151,8 @@ export class HandlerConsumer {
     // Handler returned without settling — auto-ack.
     if (!msg.isSettled) {
       try {
-        await msg.ack();
+        if (msg.signal.aborted) await msg.nack();
+        else await msg.ack();
       } catch (ackErr) {
         console.error(`Failed to auto-ack message ${msg.id}: ${ackErr}`);
       }
@@ -167,7 +172,10 @@ export class HandlerConsumer {
   async stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
-    this.stopPromise = this.doStop();
+    this.stopPromise = untilDeadline(
+      this.doStop(),
+      Date.now() + this.connection.getShutdownTimeoutMs()
+    ).finally(() => this.connection.unregisterConsumer(this));
     return this.stopPromise;
   }
 
@@ -192,5 +200,39 @@ export class HandlerConsumer {
     await consumerStopped;
 
     this.connection.unregisterConsumer(this);
+  }
+
+  /**
+   * getQueueName reports the queue this handler consumer is bound to (delegates
+   * to the underlying consumer). Used by the connection's queueFatal routing.
+   * @internal
+   */
+  getQueueGeneration(): string | undefined {
+    return this.consumer.getQueueGeneration();
+  }
+
+  getQueueName(): string {
+    return this.consumer.getQueueName();
+  }
+
+  /**
+   * fatal tears the handler consumer down because its queue is gone — delegates
+   * to the underlying consumer (the dispatch loop exits when its iterator ends
+   * and in-flight handlers are cancelled via their AbortSignal). @internal
+   */
+  fatal(err: QueueFatalError): void {
+    this.consumer.fatal(err);
+    void this.stop();
+  }
+
+  /**
+   * onClose registers a listener for when this consumer closes (with a
+   * QueueFatalError if the queue is gone, or no argument on a normal stop) —
+   * for a handler consumer this is the primary way to learn the queue is gone,
+   * since there is no message iterator to end. Delegates to the underlying
+   * consumer.
+   */
+  onClose(listener: (err?: Error) => void): void {
+    this.consumer.onClose(listener);
   }
 }

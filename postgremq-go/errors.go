@@ -10,7 +10,7 @@ import (
 // SQLSTATE codes raised by the PostgreMQ SQL functions. Clients should
 // match on the code via mapPgError, never on the human-readable text.
 const (
-	// ErrCodeLeaseLost is raised by ack/nack/release/set_vt/set_vt_batch when
+	// ErrCodeLeaseLost is raised by ack/nack/release/set_vt when
 	// the consumer's lease is no longer valid: vt expired, token mismatch, or
 	// the message is no longer in the 'processing' state.
 	ErrCodeLeaseLost = "PMQ01"
@@ -39,12 +39,43 @@ const (
 //   - ErrValidation: the request was rejected before any state change. Covers
 //     input validation (bad arguments) AND state preconditions (e.g. delete
 //     a topic that still has messages, create a duplicate exclusive queue).
+//   - ErrQueueGone: a queue a consumer depends on is gone — it was deleted, or
+//     (for an exclusive queue) its keep-alive permanently failed (omitted from
+//     extend_queue_keep_alive_multi's result = gone/non-exclusive). It is the
+//     single sentinel for a fatal, unrecoverable queue condition; consumers on
+//     the queue are torn down and the reason is delivered as a *QueueFatalError
+//     (which matches errors.Is(err, ErrQueueGone)) via Consumer.NotifyClose and
+//     the connection-level WithQueueFatalHandler.
 var (
 	ErrConnectionClosed = errors.New("postgremq: connection is stopped")
 	ErrLeaseLost        = errors.New("postgremq: lease lost")
 	ErrQueueNotFound    = errors.New("postgremq: queue not found")
 	ErrValidation       = errors.New("postgremq: validation error")
+	ErrQueueGone        = errors.New("postgremq: queue is gone")
 )
+
+// QueueFatalError is the reason a consumer was torn down: the queue it depends
+// on is gone. It always matches errors.Is(err, ErrQueueGone) regardless of the
+// underlying cause (a keep-alive permanent failure, or a consume that returned
+// PMQ02/ErrQueueNotFound because the queue was deleted out-of-band).
+type QueueFatalError struct {
+	// Queue is the queue that is gone.
+	Queue string
+	// Err is the underlying cause (e.g. ErrQueueGone or an ErrQueueNotFound chain).
+	Err error
+}
+
+func (e *QueueFatalError) Error() string {
+	return fmt.Sprintf("postgremq: queue %q is gone: %v", e.Queue, e.Err)
+}
+
+// Unwrap exposes the underlying cause so errors.Is/As reach it (e.g.
+// ErrQueueNotFound when the queue was deleted out-of-band).
+func (e *QueueFatalError) Unwrap() error { return e.Err }
+
+// Is makes every QueueFatalError match ErrQueueGone, so applications have one
+// sentinel to check no matter which detector fired.
+func (e *QueueFatalError) Is(target error) bool { return target == ErrQueueGone }
 
 // mapPgError inspects err and, if it carries a PostgreMQ SQLSTATE, wraps it
 // with the matching sentinel error so callers can use errors.Is. Errors that

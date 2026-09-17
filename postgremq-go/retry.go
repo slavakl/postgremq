@@ -16,7 +16,7 @@ import (
 //   - Connection failures (PostgreSQL error class 08)
 //   - Admin shutdown / crash shutdown / cannot-connect-now (57P01/57P02/57P03)
 //
-// Retry uses exponential backoff with jitter to avoid thundering herd problems.
+// Retry uses exponential backoff. Publish retries only aborted transactions.
 type RetryConfig struct {
 	// Disabled turns off retry logic entirely. When true, operations fail immediately on error.
 	Disabled bool
@@ -73,7 +73,7 @@ func IsRetryableError(err error) bool {
 		return false
 	}
 	switch pgErr.Code {
-	case "40001", "40P01":
+	case "40001", "40P01", "55P03":
 		return true
 	case "57P01", "57P02", "57P03":
 		return true
@@ -84,8 +84,21 @@ func IsRetryableError(err error) bool {
 // withRetry executes the given operation with retries
 // It checks whether the connection is stopped (via isClosed) both before and during retries.
 func (c *Connection) withRetry(ctx context.Context, operation func(context.Context) error) error {
+	return c.withRetryPolicy(ctx, operation, IsRetryableError)
+}
+func isAbortedTransaction(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01")
+}
+func (c *Connection) withRetryPolicy(ctx context.Context, operation func(context.Context) error, retryable func(error) bool) error {
 	if c.isClosed() {
 		return ErrConnectionClosed
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if c.ioCtx != nil {
+		stop := context.AfterFunc(c.ioCtx, cancel)
+		defer stop()
 	}
 
 	if c.retryConfig.Disabled {
@@ -106,7 +119,7 @@ func (c *Connection) withRetry(ctx context.Context, operation func(context.Conte
 			return nil
 		}
 
-		if !IsRetryableError(err) {
+		if !retryable(err) {
 			return err // Non-retryable error, return immediately
 		}
 

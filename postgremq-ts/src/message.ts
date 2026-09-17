@@ -1,3 +1,4 @@
+import { messageId } from './utils';
 /**
  * PostgreMQ TypeScript Client
  * Message class implementation
@@ -14,34 +15,35 @@ import { LeaseLostError, QueueNotFoundError, ValidationError } from './errors';
 export class Message {
   /** Message ID */
   public readonly id: number;
-  
+
   /** Queue name */
   public readonly queueName: string;
-  
+
   /** Message payload */
   public readonly payload: any;
-  
+
   /** Consumer token for this message */
   public readonly consumerToken: string;
-  
+
   /** Number of delivery attempts */
   public readonly deliveryAttempts: number;
-  
+
   /** Published timestamp */
   public readonly publishedAt: Date;
-  
+
   /** Visibility timeout expiration */
   public vt: Date;
-  
+
   /** Internal flag to track if message has been processed */
   private processed: boolean = false;
+  private terminalStarted = false;
 
   /** Internal flag to track if onComplete has been called */
   private completeCalled: boolean = false;
 
   /** AbortController used by the Consumer to signal that this message
    *  can no longer be acked successfully — the lease was lost server-side
-   *  (auto-extension found the row missing from set_vt_batch's result, or
+   *  (auto-extension found the row missing from set_vt_batch_multi's result, or
    *  set_vt raised PMQ01). Handlers can check `message.signal.aborted` /
    *  listen for 'abort' to short-circuit work that would otherwise be
    *  wasted (and may commit non-idempotent side-effects). Mirrors the Go
@@ -50,7 +52,7 @@ export class Message {
 
   /** Callback to invoke when message is completed */
   private onComplete: (messageId: number) => void;
-  
+
   /** Database operations */
   private dbOperations: {
     ack: (
@@ -65,11 +67,7 @@ export class Message {
       consumerToken: string,
       delayUntil?: Date
     ) => Promise<void>;
-    release: (
-      queueName: string,
-      messageId: number,
-      consumerToken: string
-    ) => Promise<void>;
+    release: (queueName: string, messageId: number, consumerToken: string) => Promise<void>;
     setVt: (
       queueName: string,
       messageId: number,
@@ -112,11 +110,7 @@ export class Message {
         consumerToken: string,
         delayUntil?: Date
       ) => Promise<void>;
-      release: (
-        queueName: string,
-        messageId: number,
-        consumerToken: string
-      ) => Promise<void>;
+      release: (queueName: string, messageId: number, consumerToken: string) => Promise<void>;
       setVt: (
         queueName: string,
         messageId: number,
@@ -125,7 +119,7 @@ export class Message {
       ) => Promise<Date>;
     }
   ) {
-    this.id = id;
+    this.id = messageId(id);
     this.queueName = queueName;
     this.payload = payload;
     this.consumerToken = consumerToken;
@@ -165,7 +159,7 @@ export class Message {
    * settling. Mirrors the "completed" tracking in the Go HandlerConsumer.
    */
   get isSettled(): boolean {
-    return this.completeCalled;
+    return this.terminalStarted;
   }
 
   /**
@@ -182,19 +176,16 @@ export class Message {
   /**
    * Acknowledge the message as successfully processed.
    * This removes the message from the queue.
-   * 
+   *
    * @returns Promise that resolves when acknowledgment is complete
    * @throws Error if message has already been processed or if acknowledgment fails
    */
   async ack(): Promise<void> {
     this.checkAlreadyProcessed();
+    this.terminalStarted = true;
 
     try {
-      await this.dbOperations.ack(
-        this.queueName,
-        this.id,
-        this.consumerToken
-      );
+      await this.dbOperations.ack(this.queueName, this.id, this.consumerToken);
       // Only mark as processed if the operation succeeded
       this.processed = true;
     } catch (error) {
@@ -208,21 +199,17 @@ export class Message {
 
   /**
    * Acknowledge the message within an existing transaction.
-   * 
+   *
    * @param tx - The transaction object
    * @returns Promise that resolves when acknowledgment is complete
    * @throws Error if message has already been processed or if acknowledgment fails
    */
   async ackWithTransaction(tx: Transaction): Promise<void> {
     this.checkAlreadyProcessed();
+    this.terminalStarted = true;
 
     try {
-      await this.dbOperations.ack(
-        this.queueName,
-        this.id,
-        this.consumerToken,
-        tx
-      );
+      await this.dbOperations.ack(this.queueName, this.id, this.consumerToken, tx);
       // Only mark as processed if the operation succeeded
       this.processed = true;
     } catch (error) {
@@ -236,25 +223,21 @@ export class Message {
   /**
    * Negatively acknowledge the message, returning it to the queue
    * for reprocessing after an optional delay.
-   * 
+   *
    * @param options - Options for negative acknowledgment
    * @returns Promise that resolves when negative acknowledgment is complete
    * @throws Error if message has already been processed or if nack fails
    */
   async nack(options?: MessageOptions): Promise<void> {
     this.checkAlreadyProcessed();
+    this.terminalStarted = true;
 
     try {
       const delayUntil = options?.delaySeconds
         ? new Date(Date.now() + options.delaySeconds * 1000)
         : undefined;
 
-      await this.dbOperations.nack(
-        this.queueName,
-        this.id,
-        this.consumerToken,
-        delayUntil
-      );
+      await this.dbOperations.nack(this.queueName, this.id, this.consumerToken, delayUntil);
       // Only mark as processed if the operation succeeded
       this.processed = true;
     } catch (error) {
@@ -275,13 +258,10 @@ export class Message {
    */
   async release(): Promise<void> {
     this.checkAlreadyProcessed();
+    this.terminalStarted = true;
 
     try {
-      await this.dbOperations.release(
-        this.queueName,
-        this.id,
-        this.consumerToken
-      );
+      await this.dbOperations.release(this.queueName, this.id, this.consumerToken);
       // Mark as processed to prevent multiple releases
       this.processed = true;
     } catch (error) {
@@ -294,14 +274,14 @@ export class Message {
 
   /**
    * Extend the visibility timeout for this message.
-   * 
+   *
    * @param newVt - New visibility timeout in seconds
    * @returns Promise that resolves to the new expiration date
    * @throws Error if message has already been processed or if extension fails
    */
   async setVt(newVt: number): Promise<Date> {
     this.checkAlreadyProcessed();
-    
+
     try {
       const newExpiration = await this.dbOperations.setVt(
         this.queueName,
@@ -312,6 +292,7 @@ export class Message {
       this.vt = newExpiration;
       return newExpiration;
     } catch (error) {
+      if (error instanceof LeaseLostError) this._cancel();
       throw this.wrapError('Failed to extend visibility timeout', error);
     }
   }
@@ -321,7 +302,7 @@ export class Message {
    * @throws Error if message has already been processed
    */
   private checkAlreadyProcessed(): void {
-    if (this.processed) {
+    if (this.terminalStarted) {
       throw new Error(`Message ${this.id} has already been processed`);
     }
   }
@@ -360,4 +341,4 @@ export class Message {
     wrappedError.stack = error.stack;
     return wrappedError;
   }
-} 
+}

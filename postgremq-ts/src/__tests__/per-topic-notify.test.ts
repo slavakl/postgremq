@@ -146,7 +146,7 @@ describe('Per-topic NOTIFY', () => {
 
       // Wait for reconnect (handleNotifyClientError schedules reconnect after
       // 1000ms). Allow a generous margin.
-      await waitFor(() => channelState(connection, 'pmq:t:ReconnectTopic')?.listening === true, 3000, 50);
+      await waitFor(() => (connection as any).notifyClient !== notifyClient && channelState(connection, 'pmq:t:ReconnectTopic')?.listening === true && channelState(connection, 'pmq:q:ReconnectQueue')?.listening === true, 3000, 50);
 
       expect(channelState(connection, 'pmq:t:ReconnectTopic')!.listening).toBe(true);
       expect(channelState(connection, 'pmq:q:ReconnectQueue')!.listening).toBe(true);

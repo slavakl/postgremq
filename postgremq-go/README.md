@@ -120,7 +120,7 @@ if err != nil {
 }
 
 // Consume messages
-consumer, err := conn.Consume(ctx, "order-processing")
+consumer, err := conn.Consume("order-processing")
 if err != nil {
     log.Fatalf("Failed to create consumer: %v", err)
 }
@@ -149,7 +149,7 @@ if err != nil {
 }
 
 // Create PostgreMQ connection using the pool
-conn, err := postgremq_go.DialFromPool(ctx, pgxPool)
+conn, err := postgremq_go.DialFromPool(pgxPool)
 if err != nil {
     log.Fatalf("Failed to connect to PostgreMQ: %v", err)
 }
@@ -212,3 +212,7 @@ if err := tx.Commit(ctx); err != nil {
 ```
 
 Note: Only `PublishWithTx` and `AckWithTx` are supported in transactions for common use cases. For other acknowledgment patterns like `Nack` or `Release`, use the standard non-transactional methods.
+
+## Lifecycle and delivery guarantees
+
+See [the shared lifecycle contract](../docs/delivery-lifecycle.md) and [SQL maintenance instructions](../mq/README.md). Schedule retention cleanup before production use. Delivery is at least once; use application idempotency keys for side effects and ambiguous publication outcomes.

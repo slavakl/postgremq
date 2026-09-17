@@ -62,6 +62,27 @@ export class ValidationError extends Error {
 }
 
 /**
+ * QueueFatalError is the reason a consumer was torn down: the queue it depends
+ * on is gone — deleted out-of-band (a consume returned PMQ02), or an exclusive
+ * queue whose keep-alive permanently failed. It is delivered to
+ * Consumer.onClose / HandlerConsumer.onClose and to the connection-level
+ * `onQueueFatal` handler / 'queueFatal' event. Mirrors the Go client's
+ * QueueFatalError + ErrQueueGone. Check `err instanceof QueueFatalError`.
+ */
+export class QueueFatalError extends Error {
+  /** The queue that is gone. */
+  readonly queue: string;
+  /** The underlying cause (e.g. a QueueNotFoundError when deleted out-of-band). */
+  readonly cause?: Error;
+  constructor(queue: string, cause?: Error) {
+    super(`postgremq: queue "${queue}" is gone${cause ? `: ${cause.message}` : ''}`);
+    this.name = 'QueueFatalError';
+    this.queue = queue;
+    this.cause = cause;
+  }
+}
+
+/**
  * ConnectionClosedError is thrown by `connect()` when the connection has
  * already been closed. close() is terminal: a connection cannot be
  * resurrected — callers must construct a new Connection. Mirrors the Go

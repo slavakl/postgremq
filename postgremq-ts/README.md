@@ -204,8 +204,8 @@ await consumer.stop();
 
 For a push-based style with bounded concurrency, use `consumeHandler`. Each
 message is dispatched to your handler; if the handler returns without calling
-`ack`/`nack`/`release` the message is auto-acked, and if it throws the message
-is auto-nacked (redelivered). `maxInFlight` caps how many handlers run at once
+`ack`/`nack`/`release` the message is auto-acked only while its signal remains live.
+A throw or cancelled return is auto-nacked. Explicit acknowledgement still reports success during shutdown. `maxInFlight` caps how many handlers run at once
 (0 = unlimited).
 
 ```typescript
@@ -217,7 +217,7 @@ const handlerConsumer = client.consumeHandler(
     if (message.signal.aborted) return;
 
     await processMessage(message.payload);
-    // Returning here auto-acks. Throw to auto-nack, or call
+    // A live return auto-acks; a cancelled return auto-nacks. Or call
     // message.ack()/nack()/release() explicitly to settle it yourself.
   },
   {
@@ -227,7 +227,7 @@ const handlerConsumer = client.consumeHandler(
 );
 
 // stop() stops fetching, signals in-flight handlers, and waits for them to
-// finish before resolving.
+// finish within shutdownTimeoutMs. After the deadline, unfinished leases expire.
 await handlerConsumer.stop();
 ```
 
@@ -273,7 +273,7 @@ await client.purgeAllMessages();
 Exclusive queues (non-durable) are automatically deleted when their keep-alive timeout expires:
 
 ```typescript
-// Create an exclusive queue that expires after 60 seconds of inactivity
+// Create an exclusive queue that expires when its 60-second lease expires
 await client.createQueue('temp-queue', 'orders', true, {
   keepAliveInterval: 60
 });
@@ -298,3 +298,8 @@ try {
 ## License
 
 MIT
+
+
+## Lifecycle and delivery guarantees
+
+See [the shared lifecycle contract](../docs/delivery-lifecycle.md) and [SQL maintenance instructions](../mq/README.md). Schedule retention cleanup before production use. Delivery is at least once; use application idempotency keys for side effects and ambiguous publication outcomes.
