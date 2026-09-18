@@ -176,6 +176,7 @@ func (s *extScheduler) apply(res extResult) time.Time {
 			s.h.push(e)
 		} else {
 			delete(s.live, e.key())
+			s.conn.metrics.recordRenewalLost(e.queue)
 			if e.cancel != nil {
 				e.cancel()
 			}

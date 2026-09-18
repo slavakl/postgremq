@@ -1,0 +1,29 @@
+name: Observability Tests
+on:
+  push:
+    branches: [main]
+    paths: ['observability/**', 'mq/**', 'postgremq-go/**', 'postgremq-ts/**', '.github/workflows/observability-tests.yml']
+  pull_request:
+    branches: [main]
+    paths: ['observability/**', 'mq/**', 'postgremq-go/**', 'postgremq-ts/**', '.github/workflows/observability-tests.yml']
+jobs:
+  collector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: postgremq-ts/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r mq/tests/requirements.txt
+      - run: npm ci
+        working-directory: postgremq-ts
+      - run: pytest observability/test_collector.py -v

@@ -1489,3 +1489,47 @@ BEGIN
     RETURN deleted;
 END;
 $$ LANGUAGE plpgsql;
+
+
+-- Queue-state telemetry. One snapshot/cutoff for all queues, including empty
+-- queues. Read-only and payload-free; no counters on the publication hot path.
+-- Completed retention is intentionally excluded from this operational scan.
+CREATE OR REPLACE FUNCTION postgremq.queue_metrics()
+RETURNS TABLE (
+    queue_name text, topic_name text, active bigint,
+    ready bigint, delayed bigint, processing bigint, exhausted bigint,
+    dead_letter bigint, oldest_ready_age_seconds double precision
+)
+LANGUAGE sql STABLE AS $$
+    WITH cutoff AS MATERIALIZED (SELECT statement_timestamp() AS ts),
+    live AS (
+        SELECT qm.queue_name,
+            count(*) FILTER (WHERE qm.vt <= c.ts AND
+                (q.max_delivery_attempts = 0 OR qm.delivery_attempts < q.max_delivery_attempts)) AS ready,
+            count(*) FILTER (WHERE qm.status = 'pending' AND qm.vt > c.ts) AS delayed,
+            count(*) FILTER (WHERE qm.status = 'processing' AND qm.vt > c.ts) AS processing,
+            count(*) FILTER (WHERE qm.vt <= c.ts AND q.max_delivery_attempts > 0
+                AND qm.delivery_attempts >= q.max_delivery_attempts) AS exhausted,
+            min(qm.vt) FILTER (WHERE qm.vt <= c.ts AND
+                (q.max_delivery_attempts = 0 OR qm.delivery_attempts < q.max_delivery_attempts)) AS ready_since
+        FROM postgremq.queue_messages qm
+        JOIN postgremq.queues q ON q.name = qm.queue_name
+        CROSS JOIN cutoff c
+        WHERE qm.status IN ('pending', 'processing')
+        GROUP BY qm.queue_name
+    ), dead AS (
+        SELECT d.queue_name, count(*) AS n
+        FROM postgremq.dead_letter_queue d GROUP BY d.queue_name
+    )
+    SELECT q.name::text, q.topic_name::text,
+        CASE WHEN NOT q.exclusive OR q.keep_alive_until > c.ts THEN 1::bigint ELSE 0::bigint END,
+        CASE WHEN NOT q.exclusive OR q.keep_alive_until > c.ts THEN coalesce(l.ready, 0) ELSE 0 END,
+        coalesce(l.delayed, 0), coalesce(l.processing, 0), coalesce(l.exhausted, 0), coalesce(d.n, 0),
+        CASE WHEN NOT q.exclusive OR q.keep_alive_until > c.ts
+            THEN coalesce(extract(epoch FROM c.ts - l.ready_since)::double precision, 0)
+            ELSE 0::double precision END
+    FROM postgremq.queues q
+    CROSS JOIN cutoff c
+    LEFT JOIN live l ON l.queue_name = q.name
+    LEFT JOIN dead d ON d.queue_name = q.name;
+$$;

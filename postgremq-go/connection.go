@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/metric"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -29,6 +31,8 @@ type Stoppable interface {
 //   - Each Consumer created from a Connection runs internal goroutines for
 //     fetching messages and (optionally) auto‑extending visibility timeouts.
 type Connection struct {
+	meterProvider       metric.MeterProvider
+	metrics             *clientMetrics
 	pool                Pool
 	ownPool             bool // true if we created the pool and should close it
 	ctx                 context.Context
@@ -119,6 +123,15 @@ func newConnection(_ context.Context, pool Pool, ownPool bool, opts ...Connectio
 			pool.Close()
 		}
 		return nil, err
+	}
+	var metricsErr error
+	conn.metrics, metricsErr = newClientMetrics(conn.meterProvider)
+	if metricsErr != nil {
+		cancel()
+		if ownPool {
+			pool.Close()
+		}
+		return nil, fmt.Errorf("initialize metrics: %w", metricsErr)
 	}
 	conn.ioCtx, conn.ioCancel = context.WithCancel(context.Background())
 	conn.eventListener = newEventListener(ctx, pool, conn.logger)
@@ -624,7 +637,9 @@ type MultiLock struct {
 // identity (including Token), never message_id alone.
 //
 // The operation uses the configured retry policy: extension is idempotent (G8).
-func (c *Connection) SetVTBatchMulti(ctx context.Context, exts []MultiExtension) ([]MultiLock, error) {
+func (c *Connection) SetVTBatchMulti(ctx context.Context, exts []MultiExtension) (result []MultiLock, resultErr error) {
+	finishMetric := c.metrics.startOperation(ctx, "extend_batch", "", false)
+	defer func() { finishMetric(resultErr) }()
 	if len(exts) == 0 {
 		return nil, nil
 	}
@@ -673,7 +688,9 @@ func (c *Connection) SetVTBatchMulti(ctx context.Context, exts []MultiExtension)
 
 // // Database methods
 // executePublish handles the actual execution of publish SQL with the given transaction
-func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, payload json.RawMessage, retry bool, opts ...PublishOption) (int64, error) {
+func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, payload json.RawMessage, retry bool, opts ...PublishOption) (id int64, resultErr error) {
+	finishMetric := c.metrics.startOperation(ctx, "publish", topic, !retry)
+	defer func() { finishMetric(resultErr) }()
 	if err := c.checkClosed(); err != nil {
 		return 0, err
 	}
@@ -684,6 +701,7 @@ func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, pa
 	}
 
 	publish := func(ctx context.Context) (messageID int64, err error) {
+		defer func() { c.metrics.recordSent(ctx, topic, !retry, err) }()
 		if options.deliverAfter != nil {
 			err = tx.QueryRow(ctx, "SELECT postgremq.publish_message($1, $2, $3)",
 				topic, payload, *options.deliverAfter).Scan(&messageID)
@@ -710,7 +728,10 @@ func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, pa
 	return messageID, nil
 }
 
-func (c *Connection) consumeMessages(ctx context.Context, queue string, limit int, vt int, generations ...string) ([]*Message, error) {
+func (c *Connection) consumeMessages(ctx context.Context, queue string, limit int, vt int, generations ...string) (result []*Message, resultErr error) {
+	finishMetric := c.metrics.startOperation(ctx, "consume", queue, false)
+	defer func() { finishMetric(resultErr) }()
+	defer func() { c.metrics.recordConsumed(ctx, queue, result, resultErr) }()
 	if c.isClosed() {
 		return nil, ErrConnectionClosed
 	}
@@ -770,7 +791,9 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 	return messages, mapPgError(rows.Err())
 }
 
-func (c *Connection) ackMessage(ctx context.Context, queue string, messageID int64, consumerToken string) error {
+func (c *Connection) ackMessage(ctx context.Context, queue string, messageID int64, consumerToken string) (resultErr error) {
+	finishMetric := c.metrics.startOperation(ctx, "ack", queue, false)
+	defer func() { finishMetric(resultErr) }()
 	return c.withRetry(ctx, func(ctx context.Context) error {
 		_, err := c.pool.Exec(ctx,
 			"SELECT postgremq.ack_message($1, $2, $3)",
@@ -783,7 +806,9 @@ func (c *Connection) ackMessage(ctx context.Context, queue string, messageID int
 }
 
 // ackMessageWithTx acknowledges a message within an existing transaction
-func (c *Connection) ackMessageWithTx(ctx context.Context, tx Tx, queue string, messageID int64, consumerToken string) error {
+func (c *Connection) ackMessageWithTx(ctx context.Context, tx Tx, queue string, messageID int64, consumerToken string) (resultErr error) {
+	finishMetric := c.metrics.startOperation(ctx, "ack", queue, true)
+	defer func() { finishMetric(resultErr) }()
 	if c.isClosed() {
 		return ErrConnectionClosed
 	}
@@ -797,7 +822,9 @@ func (c *Connection) ackMessageWithTx(ctx context.Context, tx Tx, queue string, 
 	return nil
 }
 
-func (c *Connection) releaseMessage(ctx context.Context, queue string, messageID int64, consumerToken string) error {
+func (c *Connection) releaseMessage(ctx context.Context, queue string, messageID int64, consumerToken string) (resultErr error) {
+	finishMetric := c.metrics.startOperation(ctx, "release", queue, false)
+	defer func() { finishMetric(resultErr) }()
 	return c.withRetry(ctx, func(ctx context.Context) error {
 		_, err := c.pool.Exec(ctx,
 			"SELECT postgremq.release_message($1, $2, $3)",
@@ -809,7 +836,9 @@ func (c *Connection) releaseMessage(ctx context.Context, queue string, messageID
 	})
 }
 
-func (c *Connection) nackMessage(ctx context.Context, queue string, messageID int64, consumerToken string, delayUntil *time.Time) error {
+func (c *Connection) nackMessage(ctx context.Context, queue string, messageID int64, consumerToken string, delayUntil *time.Time) (resultErr error) {
+	finishMetric := c.metrics.startOperation(ctx, "nack", queue, false)
+	defer func() { finishMetric(resultErr) }()
 	return c.withRetry(ctx, func(ctx context.Context) error {
 		var err error
 		if delayUntil != nil && !delayUntil.IsZero() {

@@ -12,7 +12,8 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
-    "test:integration": "jest --testPathPattern=integration"
+    "test:integration": "jest --testPathPattern=integration",
+    "example:metrics": "ts-node examples/metrics.ts"
   },
   "keywords": [
     "postgres",
@@ -32,6 +33,9 @@
   },
   "devDependencies": {
     "@jest/globals": "^29.7.0",
+    "@opentelemetry/exporter-metrics-otlp-http": "^0.222.0",
+    "@opentelemetry/resources": "^2.11.0",
+    "@opentelemetry/sdk-metrics": "^2.11.0",
     "@types/jest": "^29.5.11",
     "@types/node": "^18.x",
     "@types/pg": "^8.10.11",
@@ -42,6 +46,7 @@
     "typescript": "^5.3.3"
   },
   "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
     "pg": "^8.11.3"
   },
   "engines": {

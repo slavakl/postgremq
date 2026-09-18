@@ -218,3 +218,12 @@ Note: Only `PublishWithTx` and `AckWithTx` are supported in transactions for com
 ## Lifecycle and delivery guarantees
 
 See [the shared lifecycle contract](../docs/delivery-lifecycle.md) and [SQL maintenance instructions](../mq/README.md). Schedule retention cleanup before production use. Delivery is at least once; use application idempotency keys for side effects and ambiguous publication outcomes.
+
+
+## Observability
+
+Queue-state metrics are available through `postgremq.queue_metrics()`. Both clients
+support opt-in OpenTelemetry metrics for operations, handler execution, received
+deliveries and renewal loss. See the [observability guide](../docs/observability.md) for the
+tested Collector configuration, metric definitions, and runnable Go/TypeScript
+examples.

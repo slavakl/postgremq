@@ -227,7 +227,9 @@ func (m *Message) Release(ctx context.Context) error {
 //	if err != nil {
 //	    log.Printf("Failed to extend VT: %v", err)
 //	}
-func (m *Message) SetVT(ctx context.Context, vt int) (time.Time, error) {
+func (m *Message) SetVT(ctx context.Context, vt int) (result time.Time, resultErr error) {
+	finishMetric := m.conn.metrics.startOperation(ctx, "extend", m.queue, false)
+	defer func() { finishMetric(resultErr) }()
 	if m.conn.isClosed() {
 		return time.Time{}, ErrConnectionClosed
 	}

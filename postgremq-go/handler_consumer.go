@@ -120,7 +120,15 @@ func (hc *HandlerConsumer) runHandler(msg *Message) {
 		hc.handlerWg.Done()
 	}()
 
+	finishMetric := hc.conn.metrics.startHandler(msg.StoppedCtx, msg.queue)
 	panicked := hc.callHandler(msg)
+	code := ""
+	if panicked {
+		code = "handler_error"
+	} else if msg.StoppedCtx.Err() != nil {
+		code = "cancelled"
+	}
+	finishMetric(code)
 	if msg.settlementStarted.Load() {
 		return
 	}

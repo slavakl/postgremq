@@ -132,9 +132,11 @@ export class HandlerConsumer {
    * and stop() can always await the returned promise safely.
    */
   private async runHandler(msg: Message): Promise<void> {
+    const finishMetric = this.connection.telemetry.startHandler(msg.queueName);
     try {
       await this.handler(msg);
     } catch (err) {
+      finishMetric('handler_error');
       // Handler threw — auto-nack so the message is retried (parity with the
       // Go client nacking on panic). Skip if the handler already settled it.
       console.error(`Handler error for message ${msg.id}: ${err}`);
@@ -147,6 +149,8 @@ export class HandlerConsumer {
       }
       return;
     }
+
+    finishMetric(msg.signal.aborted ? 'cancelled' : '');
 
     // Handler returned without settling — auto-ack.
     if (!msg.isSettled) {

@@ -2550,3 +2550,64 @@ def test_schema_isolation_with_application_and_temporary_objects(conn):
                 assert cur.fetchone()[0] == 0
         finally:
             cur.execute('RESET search_path; DROP SCHEMA app CASCADE')
+
+
+def test_queue_metrics_state_and_read_only_snapshot(cur, conn):
+    """Metrics use consumption eligibility, not just stored status; no payload read."""
+    cur.execute("""
+        SELECT postgremq.create_topic('metrics');
+        SELECT postgremq.create_queue('q', 'metrics', 3, false);
+        SELECT postgremq.create_queue('expired', 'metrics', 3, true, interval '1 hour');
+        SELECT postgremq.publish_message('metrics', '{}'::jsonb) FROM generate_series(1, 8);
+        SELECT postgremq.create_queue('empty', 'metrics', 3, false);
+        UPDATE postgremq.queues SET keep_alive_until = statement_timestamp() - interval '1 second'
+            WHERE name = 'expired';
+        -- Ready pending, expired processing, delayed, processing, exhausted,
+        -- completed, dead letter, and a final-attempt live lease.
+        UPDATE postgremq.queue_messages SET
+            status = CASE WHEN message_id IN (2,4,5,8) THEN 'processing'
+                          WHEN message_id = 6 THEN 'completed' ELSE 'pending' END,
+            vt = statement_timestamp() + CASE WHEN message_id IN (3,4,8)
+                THEN interval '1 hour' ELSE interval '-30 seconds' END,
+            delivery_attempts = CASE WHEN message_id IN (5,8) THEN 3 ELSE 1 END;
+        INSERT INTO postgremq.dead_letter_queue(queue_name, message_id, retry_count)
+            VALUES ('q', 7, 3);
+        DELETE FROM postgremq.queue_messages WHERE queue_name = 'q' AND message_id = 7;
+        BEGIN READ ONLY;
+        SET LOCAL search_path = pg_catalog;
+        SELECT * FROM postgremq.queue_metrics() ORDER BY queue_name;
+    """)
+    rows = {r['queue_name']: dict(r) for r in cur.fetchall()}
+    cur.execute('ROLLBACK')
+    assert rows['q']['ready'] == 2
+    assert rows['q']['delayed'] == 1
+    assert rows['q']['processing'] == 2
+    assert rows['q']['exhausted'] == 1
+    assert rows['q']['dead_letter'] == 1
+    assert 30 <= rows['q']['oldest_ready_age_seconds'] < 35
+    assert rows['expired']['active'] == 0
+    assert rows['expired']['ready'] == 0
+    assert rows['expired']['oldest_ready_age_seconds'] == 0
+    for name in ('ready', 'delayed', 'processing', 'exhausted', 'dead_letter', 'oldest_ready_age_seconds'):
+        assert rows['empty'][name] == 0
+    assert rows['empty']['active'] == 1
+
+
+def test_queue_metrics_transaction_visibility(cur, conn, db_config, test_db):
+    cur.execute("SELECT postgremq.create_topic('metrics'); SELECT postgremq.create_queue('q', 'metrics', 0, false)")
+    writer = psycopg2.connect(**{**db_config, 'dbname': test_db})
+    try:
+        with writer.cursor() as w:
+            w.execute("SELECT postgremq.publish_message('metrics', '{}'::jsonb)")
+        cur.execute('SELECT ready FROM postgremq.queue_metrics()')
+        assert cur.fetchone()[0] == 0
+        writer.rollback()
+        cur.execute('SELECT ready FROM postgremq.queue_metrics()')
+        assert cur.fetchone()[0] == 0
+        with writer.cursor() as w:
+            w.execute("SELECT postgremq.publish_message('metrics', '{}'::jsonb)")
+        writer.commit()
+        cur.execute('SELECT ready FROM postgremq.queue_metrics()')
+        assert cur.fetchone()[0] == 1
+    finally:
+        writer.close()

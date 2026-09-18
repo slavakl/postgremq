@@ -340,3 +340,11 @@ Building on the PostgreSQL message queue concept, PostgreMQ offers:
 - Supports different messaging patterns (persistent vs ephemeral)
 
 ---
+
+## Observability
+
+Queue-state metrics are available through `postgremq.queue_metrics()`. Both clients
+support opt-in OpenTelemetry metrics for operations, handler execution, received
+deliveries and renewal loss. See the [observability guide](docs/observability.md) for the
+tested Collector configuration, metric definitions, and runnable Go/TypeScript
+examples.

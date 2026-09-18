@@ -4,6 +4,7 @@
  */
 
 import { Pool, PoolClient, PoolConfig } from 'pg';
+import { ClientMetrics } from './metrics';
 import {
   ConnectionOptions,
   Consumer,
@@ -114,6 +115,8 @@ function extKey(queue: string, id: number, token: string): string {
  * queue operations.
  */
 export class Connection implements IConnection {
+  /** @internal Shared instrumentation for the connection and its handlers. */
+  readonly telemetry: ClientMetrics;
   /** PostgreSQL connection pool */
   private pool: Pool;
 
@@ -223,6 +226,7 @@ export class Connection implements IConnection {
    * @param options - Connection options
    */
   constructor(options: ConnectionOptions = {}) {
+    this.telemetry = new ClientMetrics(options.meterProvider);
     // Set up the connection pool
     if (options.pool) {
       // Use existing pool
@@ -575,7 +579,7 @@ export class Connection implements IConnection {
     retryable: (error: any) => boolean = shouldRetry
   ): Promise<T> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     return withRetry(() => this.runDatabase(operation), retryPolicy, retryable);
@@ -643,7 +647,8 @@ export class Connection implements IConnection {
     queryable: Transaction,
     topic: string,
     payload: any,
-    options: PublishOptions
+    options: PublishOptions,
+    transaction: boolean
   ): Promise<number> {
     let query: string;
     let params: any[];
@@ -656,10 +661,12 @@ export class Connection implements IConnection {
       params = [topic, JSON.stringify(payload)];
     }
 
-    const result = await queryable.query(query, params);
-    // BIGINT columns arrive as strings from node-pg by default; convert at
-    // the read boundary to keep the rest of the client on `number`.
-    return checkedMessageId(result.rows[0].publish_message);
+    return this.telemetry.send(topic, transaction, async () => {
+      const result = await queryable.query(query, params);
+      // BIGINT columns arrive as strings from node-pg by default; convert at
+      // the read boundary to keep the rest of the client on `number`.
+      return checkedMessageId(result.rows[0].publish_message);
+    });
   }
 
   /**
@@ -670,21 +677,23 @@ export class Connection implements IConnection {
    * @returns Promise resolving to the message ID
    */
   async publish(topic: string, payload: any, options: PublishOptions = {}): Promise<number> {
-    if (!this.connected || this.isShuttingDown) {
-      throw new Error('Client is not connected');
-    }
+    return this.telemetry.operation('publish', topic, false, async () => {
+      if (!this.connected || this.isShuttingDown) {
+        throw new ConnectionClosedError('Client is not connected');
+      }
 
-    try {
-      // executeWithRetry hands us a pooled client, which satisfies the
-      // Transaction (query-bearing) shape publishOn expects.
-      return await this.executeWithRetry(
-        (client) => this.publishOn(client, topic, payload, options),
-        this.retryPolicy,
-        (error) => ['40001', '40P01'].includes(error?.code ?? error?.sqlState)
-      );
-    } catch (err) {
-      throw mapDbError(err);
-    }
+      try {
+        // executeWithRetry hands us a pooled client, which satisfies the
+        // Transaction (query-bearing) shape publishOn expects.
+        return await this.executeWithRetry(
+          (client) => this.publishOn(client, topic, payload, options, false),
+          this.retryPolicy,
+          (error) => ['40001', '40P01'].includes(error?.code ?? error?.sqlState)
+        );
+      } catch (err) {
+        throw mapDbError(err);
+      }
+    });
   }
 
   /**
@@ -731,15 +740,17 @@ export class Connection implements IConnection {
     payload: any,
     options: PublishOptions = {}
   ): Promise<number> {
-    if (!this.connected || this.isShuttingDown) {
-      throw new Error('Client is not connected');
-    }
+    return this.telemetry.operation('publish', topic, true, async () => {
+      if (!this.connected || this.isShuttingDown) {
+        throw new ConnectionClosedError('Client is not connected');
+      }
 
-    try {
-      return await this.publishOn(tx, topic, payload, options);
-    } catch (err) {
-      throw mapDbError(err);
-    }
+      try {
+        return await this.publishOn(tx, topic, payload, options, true);
+      } catch (err) {
+        throw mapDbError(err);
+      }
+    });
   }
 
   /**
@@ -750,7 +761,7 @@ export class Connection implements IConnection {
    */
   consume(queue: string, options: Partial<ConsumerOptions> = {}): ConsumerImpl {
     if (!this.connected || this.isShuttingDown) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     const consumer = new ConsumerImpl(queue, this, options);
@@ -790,7 +801,7 @@ export class Connection implements IConnection {
     options: Partial<HandlerConsumerOptions> = {}
   ): HandlerConsumer {
     if (!this.connected || this.isShuttingDown) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     const { maxInFlight = 0, ...consumerOptions } = options;
@@ -812,7 +823,7 @@ export class Connection implements IConnection {
    */
   async createTopic(topic: string): Promise<void> {
     if (!this.connected || this.isShuttingDown) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     try {
@@ -839,7 +850,7 @@ export class Connection implements IConnection {
     options: QueueOptions = {}
   ): Promise<void> {
     if (!this.connected || this.isShuttingDown) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     try {
@@ -896,7 +907,7 @@ export class Connection implements IConnection {
    */
   async deleteTopic(topic: string): Promise<void> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     try {
@@ -915,7 +926,7 @@ export class Connection implements IConnection {
    */
   async deleteQueue(queue: string): Promise<void> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     await this.executeWithRetry(async (client) => {
@@ -937,7 +948,7 @@ export class Connection implements IConnection {
    */
   async listTopics(): Promise<string[]> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     return this.executeWithRetry(async (client) => {
@@ -952,7 +963,7 @@ export class Connection implements IConnection {
    */
   async listQueues(): Promise<QueueInfo[]> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     return this.executeWithRetry(async (client) => {
@@ -975,7 +986,7 @@ export class Connection implements IConnection {
    */
   async getQueueStatistics(queue?: string): Promise<QueueStatistics> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     return this.executeWithRetry(async (client) => {
@@ -1015,7 +1026,7 @@ export class Connection implements IConnection {
    */
   async maintenanceFast(): Promise<{ retiredToDlq: number; inactiveQueuesDropped: number }> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     return this.executeWithRetry(async (client) => {
@@ -1036,7 +1047,7 @@ export class Connection implements IConnection {
    */
   async listDLQMessages(): Promise<DLQMessage[]> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     return this.executeWithRetry(async (client) => {
@@ -1058,7 +1069,7 @@ export class Connection implements IConnection {
    */
   async requeueDLQMessages(queue: string): Promise<void> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     await this.executeWithRetry(async (client) => {
@@ -1072,7 +1083,7 @@ export class Connection implements IConnection {
    */
   async purgeDLQ(): Promise<void> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     await this.executeWithRetry(async (client) => {
@@ -1086,7 +1097,7 @@ export class Connection implements IConnection {
    */
   async purgeAllMessages(): Promise<void> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     await this.executeWithRetry(async (client) => {
@@ -1103,7 +1114,7 @@ export class Connection implements IConnection {
   async deleteQueueMessage(queue: string, messageID: number): Promise<void> {
     checkedMessageId(messageID);
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     await this.executeWithRetry(async (client) => {
@@ -1118,7 +1129,7 @@ export class Connection implements IConnection {
    */
   async listMessages(queue: string): Promise<QueueMessage[]> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     return this.executeWithRetry(async (client) => {
@@ -1143,7 +1154,7 @@ export class Connection implements IConnection {
   async getMessage(messageID: number): Promise<PublishedMessage | null> {
     checkedMessageId(messageID);
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     return this.executeWithRetry(async (client) => {
@@ -1192,48 +1203,52 @@ export class Connection implements IConnection {
     limit: number = 1,
     generation?: string
   ): Promise<any[]> {
-    if (
-      !Number.isSafeInteger(visibilityTimeout) ||
-      visibilityTimeout < 0 ||
-      visibilityTimeout > 2147483647 ||
-      !Number.isSafeInteger(limit) ||
-      limit <= 0 ||
-      limit > 2147483647
-    )
-      throw new ValidationError('invalid visibility timeout or batch size');
-    if (!this.connected || this.isShuttingDown) {
-      throw new Error('Client is not connected or shutting down');
-    }
+    return this.telemetry.operation('consume', queueName, false, async () => {
+      if (
+        !Number.isSafeInteger(visibilityTimeout) ||
+        visibilityTimeout < 0 ||
+        visibilityTimeout > 2147483647 ||
+        !Number.isSafeInteger(limit) ||
+        limit <= 0 ||
+        limit > 2147483647
+      )
+        throw new ValidationError('invalid visibility timeout or batch size');
+      if (!this.connected || this.isShuttingDown) {
+        throw new ConnectionClosedError('Client is not connected or shutting down');
+      }
 
-    // Deliberately a DIRECT, un-retried call — not via executeWithRetry.
-    // consume_message is not idempotent: it flips matched rows to 'processing',
-    // increments delivery_attempts, mints a new consumer_token, and pushes vt
-    // forward. If the statement commits server-side but the response is lost on
-    // the wire (e.g. an 08-class drop while reading the result), a retry would
-    // skip the just-claimed rows and claim a SECOND disjoint batch — orphaning
-    // the first batch in 'processing' with delivery_attempts already burned.
-    // Recovery is the next fetch tick + vt expiry, not a retry. Mirrors Go's
-    // consumeMessages, which is also deliberately un-retried. Publication
-    // retries only confirmed transaction aborts; settlement uses token fencing.
-    try {
-      return await this.runDatabase(
-        async (client) => {
-          const result = await client.query(
-            'SELECT * FROM postgremq.consume_message($1, $2, $3, $4)',
-            [queueName, visibilityTimeout, limit, generation ?? null]
-          );
-          // message_id is BIGINT; convert at the read boundary so callers see a
-          // number (matches Message.id and the rest of the public surface).
-          return result.rows.map((row) => ({
-            ...row,
-            message_id: checkedMessageId(row.message_id),
-          }));
-        },
-        Math.max(1000, visibilityTimeout * 500)
-      );
-    } catch (err) {
-      throw mapDbError(err);
-    }
+      // Deliberately a DIRECT, un-retried call — not via executeWithRetry.
+      // consume_message is not idempotent: it flips matched rows to 'processing',
+      // increments delivery_attempts, mints a new consumer_token, and pushes vt
+      // forward. If the statement commits server-side but the response is lost on
+      // the wire (e.g. an 08-class drop while reading the result), a retry would
+      // skip the just-claimed rows and claim a SECOND disjoint batch — orphaning
+      // the first batch in 'processing' with delivery_attempts already burned.
+      // Recovery is the next fetch tick + vt expiry, not a retry. Mirrors Go's
+      // consumeMessages, which is also deliberately un-retried. Publication
+      // retries only confirmed transaction aborts; settlement uses token fencing.
+      try {
+        const messages = await this.runDatabase(
+          async (client) => {
+            const result = await client.query(
+              'SELECT * FROM postgremq.consume_message($1, $2, $3, $4)',
+              [queueName, visibilityTimeout, limit, generation ?? null]
+            );
+            // message_id is BIGINT; convert at the read boundary so callers see a
+            // number (matches Message.id and the rest of the public surface).
+            return result.rows.map((row) => ({
+              ...row,
+              message_id: checkedMessageId(row.message_id),
+            }));
+          },
+          Math.max(1000, visibilityTimeout * 500)
+        );
+        this.telemetry.recordConsumed(queueName, messages);
+        return messages;
+      } catch (err) {
+        throw mapDbError(err);
+      }
+    });
   }
 
   /**
@@ -1251,35 +1266,37 @@ export class Connection implements IConnection {
     consumerToken: string,
     tx?: Transaction
   ): Promise<void> {
-    checkedMessageId(messageId);
-    if (!this.connected) {
-      throw new Error('Client is not connected');
-    }
+    return this.telemetry.operation('ack', queueName, !!tx, async () => {
+      checkedMessageId(messageId);
+      if (!this.connected) {
+        throw new ConnectionClosedError('Client is not connected');
+      }
 
-    if (tx) {
+      if (tx) {
+        try {
+          await tx.query('SELECT postgremq.ack_message($1, $2, $3)', [
+            queueName,
+            messageId,
+            consumerToken,
+          ]);
+        } catch (err) {
+          throw mapDbError(err);
+        }
+        return;
+      }
+
       try {
-        await tx.query('SELECT postgremq.ack_message($1, $2, $3)', [
-          queueName,
-          messageId,
-          consumerToken,
-        ]);
+        await this.executeWithRetry(async (client) => {
+          await client.query('SELECT postgremq.ack_message($1, $2, $3)', [
+            queueName,
+            messageId,
+            consumerToken,
+          ]);
+        });
       } catch (err) {
         throw mapDbError(err);
       }
-      return;
-    }
-
-    try {
-      await this.executeWithRetry(async (client) => {
-        await client.query('SELECT postgremq.ack_message($1, $2, $3)', [
-          queueName,
-          messageId,
-          consumerToken,
-        ]);
-      });
-    } catch (err) {
-      throw mapDbError(err);
-    }
+    });
   }
 
   /**
@@ -1297,31 +1314,33 @@ export class Connection implements IConnection {
     consumerToken: string,
     delayUntil?: Date
   ): Promise<void> {
-    checkedMessageId(messageId);
-    if (!this.connected) {
-      throw new Error('Client is not connected');
-    }
+    return this.telemetry.operation('nack', queueName, false, async () => {
+      checkedMessageId(messageId);
+      if (!this.connected) {
+        throw new ConnectionClosedError('Client is not connected');
+      }
 
-    try {
-      await this.executeWithRetry(async (client) => {
-        if (delayUntil) {
-          await client.query('SELECT postgremq.nack_message($1, $2, $3, $4)', [
-            queueName,
-            messageId,
-            consumerToken,
-            delayUntil,
-          ]);
-        } else {
-          await client.query('SELECT postgremq.nack_message($1, $2, $3)', [
-            queueName,
-            messageId,
-            consumerToken,
-          ]);
-        }
-      });
-    } catch (err) {
-      throw mapDbError(err);
-    }
+      try {
+        await this.executeWithRetry(async (client) => {
+          if (delayUntil) {
+            await client.query('SELECT postgremq.nack_message($1, $2, $3, $4)', [
+              queueName,
+              messageId,
+              consumerToken,
+              delayUntil,
+            ]);
+          } else {
+            await client.query('SELECT postgremq.nack_message($1, $2, $3)', [
+              queueName,
+              messageId,
+              consumerToken,
+            ]);
+          }
+        });
+      } catch (err) {
+        throw mapDbError(err);
+      }
+    });
   }
 
   /**
@@ -1333,22 +1352,24 @@ export class Connection implements IConnection {
    * @returns Promise that resolves when the message is released
    */
   async releaseMessage(queueName: string, messageId: number, consumerToken: string): Promise<void> {
-    checkedMessageId(messageId);
-    if (!this.connected) {
-      throw new Error('Client is not connected');
-    }
+    return this.telemetry.operation('release', queueName, false, async () => {
+      checkedMessageId(messageId);
+      if (!this.connected) {
+        throw new ConnectionClosedError('Client is not connected');
+      }
 
-    try {
-      await this.executeWithRetry(async (client) => {
-        await client.query('SELECT postgremq.release_message($1, $2, $3)', [
-          queueName,
-          messageId,
-          consumerToken,
-        ]);
-      });
-    } catch (err) {
-      throw mapDbError(err);
-    }
+      try {
+        await this.executeWithRetry(async (client) => {
+          await client.query('SELECT postgremq.release_message($1, $2, $3)', [
+            queueName,
+            messageId,
+            consumerToken,
+          ]);
+        });
+      } catch (err) {
+        throw mapDbError(err);
+      }
+    });
   }
 
   /**
@@ -1366,24 +1387,26 @@ export class Connection implements IConnection {
     consumerToken: string,
     visibilityTimeout: number
   ): Promise<Date> {
-    checkedMessageId(messageId);
-    if (!this.connected) {
-      throw new Error('Client is not connected');
-    }
+    return this.telemetry.operation('extend', queueName, false, async () => {
+      checkedMessageId(messageId);
+      if (!this.connected) {
+        throw new ConnectionClosedError('Client is not connected');
+      }
 
-    try {
-      return await this.executeWithRetry(async (client) => {
-        const result = await client.query('SELECT postgremq.set_vt($1, $2, $3, $4) AS new_vt', [
-          queueName,
-          messageId,
-          consumerToken,
-          visibilityTimeout,
-        ]);
-        return new Date(result.rows[0].new_vt);
-      });
-    } catch (err) {
-      throw mapDbError(err);
-    }
+      try {
+        return await this.executeWithRetry(async (client) => {
+          const result = await client.query('SELECT postgremq.set_vt($1, $2, $3, $4) AS new_vt', [
+            queueName,
+            messageId,
+            consumerToken,
+            visibilityTimeout,
+          ]);
+          return new Date(result.rows[0].new_vt);
+        });
+      } catch (err) {
+        throw mapDbError(err);
+      }
+    });
   }
 
   /**
@@ -1394,7 +1417,7 @@ export class Connection implements IConnection {
    */
   async getNextVisibleTime(queueName: string): Promise<Date | null> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     return this.executeWithRetry(async (client) => {
@@ -1414,7 +1437,7 @@ export class Connection implements IConnection {
    */
   async cleanUpQueue(queue: string): Promise<void> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     await this.executeWithRetry(async (client) => {
@@ -1429,7 +1452,7 @@ export class Connection implements IConnection {
    */
   async cleanUpTopic(topic: string): Promise<void> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     await this.executeWithRetry(async (client) => {
@@ -1443,7 +1466,7 @@ export class Connection implements IConnection {
    */
   async deleteInactiveQueues(): Promise<void> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     await this.executeWithRetry(async (client) => {
@@ -1458,7 +1481,7 @@ export class Connection implements IConnection {
    */
   async cleanupCompletedMessages(olderThanHours?: number): Promise<number> {
     if (!this.connected) {
-      throw new Error('Client is not connected');
+      throw new ConnectionClosedError('Client is not connected');
     }
 
     return this.executeWithRetry(async (client) => {
@@ -1675,25 +1698,27 @@ export class Connection implements IConnection {
     intervalsMs: number[],
     generations?: string[]
   ): Promise<Array<{ queue: string; until: Date | null; busy: boolean }>> {
-    if (!this.connected) {
-      throw new Error('Client is not connected');
-    }
-    if (names.length === 0) return [];
-    try {
-      return await this.executeWithRetry(async (client) => {
-        const result = await client.query(
-          'SELECT queue_name, keep_alive_until, outcome FROM postgremq.extend_queue_keep_alive_multi($1, $2, $3)',
-          [names, intervalsMs, generations ?? null]
-        );
-        return result.rows.map((row: any) => ({
-          queue: row.queue_name as string,
-          until: row.keep_alive_until ? new Date(row.keep_alive_until) : null,
-          busy: row.outcome === 'busy',
-        }));
-      });
-    } catch (err) {
-      throw mapDbError(err);
-    }
+    return this.telemetry.operation('keep_alive', '', false, async () => {
+      if (!this.connected) {
+        throw new ConnectionClosedError('Client is not connected');
+      }
+      if (names.length === 0) return [];
+      try {
+        return await this.executeWithRetry(async (client) => {
+          const result = await client.query(
+            'SELECT queue_name, keep_alive_until, outcome FROM postgremq.extend_queue_keep_alive_multi($1, $2, $3)',
+            [names, intervalsMs, generations ?? null]
+          );
+          return result.rows.map((row: any) => ({
+            queue: row.queue_name as string,
+            until: row.keep_alive_until ? new Date(row.keep_alive_until) : null,
+            busy: row.outcome === 'busy',
+          }));
+        });
+      } catch (err) {
+        throw mapDbError(err);
+      }
+    });
   }
 
   // ===================================================================
@@ -1807,6 +1832,7 @@ export class Connection implements IConnection {
           if (this.extenderEntries.get(extKey(e.queue, e.id, e.token)) !== e) continue;
           if (e.expiresAt.getTime() <= Date.now()) {
             this.extenderEntries.delete(extKey(e.queue, e.id, e.token));
+            this.telemetry.recordRenewalLost(e.queue);
             e.cancel();
           } else e.nextExtensionTime = new Date(Math.min(Date.now() + 1000, e.expiresAt.getTime()));
         }
@@ -1841,7 +1867,8 @@ export class Connection implements IConnection {
         } else {
           // Omitted = lease lost: advise the handler and drop the entry.
           if (current === e) this.extenderEntries.delete(k);
-          e.cancel();
+          this.telemetry.recordRenewalLost(e.queue);
+            e.cancel();
         }
       }
     } finally {
@@ -1863,27 +1890,29 @@ export class Connection implements IConnection {
     vts: number[],
     budgetMs = 1000
   ): Promise<Array<{ queue: string; id: number; vt: Date; token: string; busy: boolean }>> {
-    if (!this.connected) {
-      throw new Error('Client is not connected');
-    }
-    ids.forEach(checkedMessageId);
-    if (queues.length === 0) return [];
-    try {
-      return await this.runDatabase(async (client) => {
-        const result = await client.query(
-          'SELECT queue_name, message_id, vt, consumer_token, outcome FROM postgremq.set_vt_batch_multi($1, $2, $3, $4)',
-          [queues, ids, tokens, vts]
-        );
-        return result.rows.map((row: any) => ({
-          queue: row.queue_name as string,
-          id: checkedMessageId(row.message_id),
-          vt: new Date(row.vt),
-          token: row.consumer_token,
-          busy: row.outcome === 'busy',
-        }));
-      }, budgetMs);
-    } catch (err) {
-      throw mapDbError(err);
-    }
+    return this.telemetry.operation('extend_batch', '', false, async () => {
+      if (!this.connected) {
+        throw new ConnectionClosedError('Client is not connected');
+      }
+      ids.forEach(checkedMessageId);
+      if (queues.length === 0) return [];
+      try {
+        return await this.runDatabase(async (client) => {
+          const result = await client.query(
+            'SELECT queue_name, message_id, vt, consumer_token, outcome FROM postgremq.set_vt_batch_multi($1, $2, $3, $4)',
+            [queues, ids, tokens, vts]
+          );
+          return result.rows.map((row: any) => ({
+            queue: row.queue_name as string,
+            id: checkedMessageId(row.message_id),
+            vt: new Date(row.vt),
+            token: row.consumer_token,
+            busy: row.outcome === 'busy',
+          }));
+        }, budgetMs);
+      } catch (err) {
+        throw mapDbError(err);
+      }
+    });
   }
 }

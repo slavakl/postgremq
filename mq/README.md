@@ -85,3 +85,12 @@ python3 -m pytest tests/tests.py -q
 ```
 
 Docker is required. Tests cover fan-out, ownership, delayed delivery, DLQ, queue expiry/recreation, row-lock contention, fresh lease clocks and bounded payload collection.
+
+
+## Observability
+
+Queue-state metrics are available through `postgremq.queue_metrics()`. Both clients
+support opt-in OpenTelemetry metrics for operations, handler execution, received
+deliveries and renewal loss. See the [observability guide](../docs/observability.md) for the
+tested Collector configuration, metric definitions, and runnable Go/TypeScript
+examples.

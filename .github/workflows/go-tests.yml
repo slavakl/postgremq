@@ -6,12 +6,14 @@ on:
     paths:
       - 'postgremq-go/**'
       - 'mq/sql/**'
+      - 'observability/**'
       - '.github/workflows/go-tests.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'postgremq-go/**'
       - 'mq/sql/**'
+      - 'observability/**'
       - '.github/workflows/go-tests.yml'
 
 jobs:

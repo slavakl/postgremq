@@ -3,6 +3,7 @@
  * Types and interfaces
  */
 
+import type { MeterProvider } from '@opentelemetry/api';
 import { Pool, PoolConfig } from 'pg';
 // Type-only import (erased at compile) so MessageHandler refers to the same
 // concrete Message class users import from the package — avoids the
@@ -60,6 +61,10 @@ export type MessageHandler = (msg: MessageClass) => void | Promise<void>;
  * Connection options for PostgreMQ client
  */
 export interface ConnectionOptions {
+  /** Opt-in metrics. The application owns SDK/exporters and provider shutdown.
+   * Omitted means no-op, even when a global provider exists. To use the global
+   * provider, explicitly pass metrics.getMeterProvider() from the OTel API. */
+  meterProvider?: MeterProvider;
   /** PostgreSQL connection string (overrides config if provided) */
   connectionString?: string;
   /** Connection pool configuration (creates new pool) */

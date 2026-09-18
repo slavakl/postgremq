@@ -6,12 +6,14 @@ on:
     paths:
       - 'postgremq-ts/**'
       - 'mq/sql/**'
+      - 'observability/**'
       - '.github/workflows/typescript-tests.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'postgremq-ts/**'
       - 'mq/sql/**'
+      - 'observability/**'
       - '.github/workflows/typescript-tests.yml'
 
 jobs:

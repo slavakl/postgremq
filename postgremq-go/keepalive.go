@@ -143,7 +143,9 @@ type kaLease struct {
 	busy  bool
 }
 
-func (c *Connection) extendKeepAliveLeases(ctx context.Context, names []string, intervalsMs []int64, generations []string) (map[string]kaLease, error) {
+func (c *Connection) extendKeepAliveLeases(ctx context.Context, names []string, intervalsMs []int64, generations []string) (result map[string]kaLease, resultErr error) {
+	finishMetric := c.metrics.startOperation(ctx, "keep_alive", "", false)
+	defer func() { finishMetric(resultErr) }()
 	leases := make(map[string]kaLease)
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		clear(leases)
