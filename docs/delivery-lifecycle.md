@@ -39,7 +39,7 @@ One Go actor loop owns each schedule and uses a single ordered command channel. 
 
 Automatic publication retry is limited to aborted transactions (`40001`, `40P01`). A disconnect after commit has an unknown outcome and is returned to the caller. An application retry may publish twice; no broker can make arbitrary external effects exactly once.
 
-Installations must schedule `pmq_maintenance_fast()` and bounded `cleanup_completed_messages(retention_hours, batch_size)` calls. Orphan payload collection preserves references from every queue and the DLQ. See [SQL operations and schedules](../mq/README.md).
+Installations must schedule `postgremq.pmq_maintenance_fast()` and bounded `postgremq.cleanup_completed_messages(retention_hours, batch_size)` calls. Orphan payload collection preserves references from every queue and the DLQ. See [SQL operations and schedules](../mq/README.md).
 
 ## Acceptance checks
 

@@ -24,14 +24,14 @@ test('stopping a handler cannot release active work or auto-ack its cancelled re
     const stop = hc.stop();
     await sleep(2300);
     const during = await iso.pool.query(
-      'SELECT status,delivery_attempts,vt>clock_timestamp() AS live FROM queue_messages WHERE message_id=$1',
+      'SELECT status,delivery_attempts,vt>clock_timestamp() AS live FROM postgremq.queue_messages WHERE message_id=$1',
       [id]
     );
     expect(during.rows[0]).toEqual({ status: 'processing', delivery_attempts: 1, live: true });
     finish[1]();
     await stop;
     const after = await iso.pool.query(
-      'SELECT status,delivery_attempts FROM queue_messages WHERE message_id=$1',
+      'SELECT status,delivery_attempts FROM postgremq.queue_messages WHERE message_id=$1',
       [id]
     );
     expect(after.rows[0]).toEqual({ status: 'pending', delivery_attempts: 1 });
@@ -56,7 +56,7 @@ test('an old delivery finishing leaves a redelivery on the same connection track
     });
     const iterator = consumer.messages();
     const old = (await iterator.next()).value;
-    await iso.pool.query("UPDATE queue_messages SET vt=clock_timestamp()-interval '1 second'");
+    await iso.pool.query("UPDATE postgremq.queue_messages SET vt=clock_timestamp()-interval '1 second'");
     const fresh = (await iterator.next()).value;
     expect(fresh.id).toBe(old.id);
     expect(fresh.consumerToken).not.toBe(old.consumerToken);

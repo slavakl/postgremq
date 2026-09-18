@@ -47,7 +47,7 @@ type Pool interface {
 	// Returns Rows for iteration and an error if the query fails.
 	//
 	// Example:
-	//   rows, err := pool.Query(ctx, "SELECT * FROM topics")
+	//   rows, err := pool.Query(ctx, "SELECT * FROM postgremq.topics")
 	//   if err != nil { return err }
 	//   defer rows.Close()
 	//   for rows.Next() { ... }

@@ -232,7 +232,7 @@ func (c *Connection) CreateTopic(ctx context.Context, topic string) error {
 		return err
 	}
 	return c.withRetry(ctx, func(ctx context.Context) error {
-		_, err := c.pool.Exec(ctx, "SELECT create_topic($1)", topic)
+		_, err := c.pool.Exec(ctx, "SELECT postgremq.create_topic($1)", topic)
 		if err != nil {
 			return mapPgError(fmt.Errorf("failed to create topic: %w", err))
 		}
@@ -268,7 +268,7 @@ func (c *Connection) CreateQueue(ctx context.Context, name, topic string, exclus
 	var generation string
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		err := c.pool.QueryRow(ctx,
-			"SELECT create_queue($1, $2, $3, $4, $5 * interval '1 ms')",
+			"SELECT postgremq.create_queue($1, $2, $3, $4, $5 * interval '1 ms')",
 			name,                                                       // p_queue_name
 			topic,                                                      // p_topic_name
 			options.maxDeliveryAttempts,                                // p_max_attempts
@@ -647,7 +647,7 @@ func (c *Connection) SetVTBatchMulti(ctx context.Context, exts []MultiExtension)
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		locks = locks[:0]
 		rows, err := c.pool.Query(ctx,
-			"SELECT queue_name, message_id, vt, consumer_token, outcome FROM set_vt_batch_multi($1, $2, $3, $4)",
+			"SELECT queue_name, message_id, vt, consumer_token, outcome FROM postgremq.set_vt_batch_multi($1, $2, $3, $4)",
 			queues, ids, tokens, vts)
 		if err != nil {
 			return mapPgError(fmt.Errorf("failed to set message visibility timeout (multi): %w", err))
@@ -685,10 +685,10 @@ func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, pa
 
 	publish := func(ctx context.Context) (messageID int64, err error) {
 		if options.deliverAfter != nil {
-			err = tx.QueryRow(ctx, "SELECT publish_message($1, $2, $3)",
+			err = tx.QueryRow(ctx, "SELECT postgremq.publish_message($1, $2, $3)",
 				topic, payload, *options.deliverAfter).Scan(&messageID)
 		} else {
-			err = tx.QueryRow(ctx, "SELECT publish_message($1, $2)",
+			err = tx.QueryRow(ctx, "SELECT postgremq.publish_message($1, $2)",
 				topic, payload).Scan(&messageID)
 		}
 		return messageID, err
@@ -730,7 +730,7 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 		generation = &generations[0]
 	}
 	rows, err := c.pool.Query(ctx,
-		"SELECT message_id, payload, consumer_token, delivery_attempts, vt, published_at FROM consume_message($1, $2, $3, $4)",
+		"SELECT message_id, payload, consumer_token, delivery_attempts, vt, published_at FROM postgremq.consume_message($1, $2, $3, $4)",
 		queue, vt, limit, generation)
 	if err != nil {
 		return nil, mapPgError(fmt.Errorf("failed to consume messages: %w", err))
@@ -773,7 +773,7 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 func (c *Connection) ackMessage(ctx context.Context, queue string, messageID int64, consumerToken string) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
 		_, err := c.pool.Exec(ctx,
-			"SELECT ack_message($1, $2, $3)",
+			"SELECT postgremq.ack_message($1, $2, $3)",
 			queue, messageID, consumerToken)
 		if err != nil {
 			return mapPgError(fmt.Errorf("failed to ack message: %w", err))
@@ -789,7 +789,7 @@ func (c *Connection) ackMessageWithTx(ctx context.Context, tx Tx, queue string, 
 	}
 
 	_, err := tx.Exec(ctx,
-		"SELECT ack_message($1, $2, $3)",
+		"SELECT postgremq.ack_message($1, $2, $3)",
 		queue, messageID, consumerToken)
 	if err != nil {
 		return mapPgError(fmt.Errorf("failed to ack message within transaction: %w", err))
@@ -800,7 +800,7 @@ func (c *Connection) ackMessageWithTx(ctx context.Context, tx Tx, queue string, 
 func (c *Connection) releaseMessage(ctx context.Context, queue string, messageID int64, consumerToken string) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
 		_, err := c.pool.Exec(ctx,
-			"SELECT release_message($1, $2, $3)",
+			"SELECT postgremq.release_message($1, $2, $3)",
 			queue, messageID, consumerToken)
 		if err != nil {
 			return mapPgError(fmt.Errorf("failed to release message: %w", err))
@@ -814,11 +814,11 @@ func (c *Connection) nackMessage(ctx context.Context, queue string, messageID in
 		var err error
 		if delayUntil != nil && !delayUntil.IsZero() {
 			_, err = c.pool.Exec(ctx,
-				"SELECT nack_message($1, $2, $3, $4)",
+				"SELECT postgremq.nack_message($1, $2, $3, $4)",
 				queue, messageID, consumerToken, *delayUntil)
 		} else {
 			_, err = c.pool.Exec(ctx,
-				"SELECT nack_message($1, $2, $3)",
+				"SELECT postgremq.nack_message($1, $2, $3)",
 				queue, messageID, consumerToken)
 		}
 		if err != nil {
@@ -923,7 +923,7 @@ func (c *Connection) MaintenanceFast(ctx context.Context) (MaintenanceCounters, 
 	var counters MaintenanceCounters
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		return c.pool.QueryRow(ctx,
-			"SELECT retired_to_dlq, inactive_queues_dropped FROM pmq_maintenance_fast()").
+			"SELECT retired_to_dlq, inactive_queues_dropped FROM postgremq.pmq_maintenance_fast()").
 			Scan(&counters.RetiredToDLQ, &counters.InactiveQueuesDropped)
 	})
 	return counters, err
@@ -941,7 +941,7 @@ func (c *Connection) MaintenanceFast(ctx context.Context) (MaintenanceCounters, 
 func (c *Connection) ListTopics(ctx context.Context) ([]string, error) {
 	var topics []string
 	err := c.withRetry(ctx, func(ctx context.Context) error {
-		rows, err := c.pool.Query(ctx, "SELECT topic FROM list_topics()")
+		rows, err := c.pool.Query(ctx, "SELECT topic FROM postgremq.list_topics()")
 		if err != nil {
 			return err
 		}
@@ -974,7 +974,7 @@ func (c *Connection) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	var queues []QueueInfo
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		rows, err := c.pool.Query(ctx,
-			"SELECT queue_name, topic_name, max_delivery_attempts, exclusive, keep_alive_until FROM list_queues()")
+			"SELECT queue_name, topic_name, max_delivery_attempts, exclusive, keep_alive_until FROM postgremq.list_queues()")
 		if err != nil {
 			return err
 		}
@@ -1017,7 +1017,7 @@ func (c *Connection) GetQueueStatistics(ctx context.Context, queueName *string) 
 	var stats QueueStatistics
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		return c.pool.QueryRow(ctx,
-			"SELECT pending_count, processing_count, completed_count, total_count FROM get_queue_statistics($1)",
+			"SELECT pending_count, processing_count, completed_count, total_count FROM postgremq.get_queue_statistics($1)",
 			queueName).Scan(&stats.PendingCount, &stats.ProcessingCount, &stats.CompletedCount, &stats.TotalCount)
 	})
 	return &stats, err
@@ -1036,7 +1036,7 @@ func (c *Connection) ListDLQMessages(ctx context.Context) ([]DLQMessage, error) 
 	var messages []DLQMessage
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		rows, err := c.pool.Query(ctx,
-			"SELECT queue_name, message_id, retry_count, published_at FROM list_dlq_messages()")
+			"SELECT queue_name, message_id, retry_count, published_at FROM postgremq.list_dlq_messages()")
 		if err != nil {
 			return err
 		}
@@ -1057,7 +1057,7 @@ func (c *Connection) ListDLQMessages(ctx context.Context) ([]DLQMessage, error) 
 
 // RequeueDLQMessages moves messages from the DLQ back to their original queue.
 //
-// Messages are moved from dead_letter_queue back to queue_messages with:
+// Messages are moved from postgremq.dead_letter_queue back to queue_messages with:
 //   - status set to 'pending'
 //   - delivery_attempts reset to 0
 //   - vt set to NOW() (immediately visible)
@@ -1074,7 +1074,7 @@ func (c *Connection) ListDLQMessages(ctx context.Context) ([]DLQMessage, error) 
 // retry processing them.
 func (c *Connection) RequeueDLQMessages(ctx context.Context, queueName string) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
-		_, err := c.pool.Exec(ctx, "SELECT requeue_dlq_messages($1)", queueName)
+		_, err := c.pool.Exec(ctx, "SELECT postgremq.requeue_dlq_messages($1)", queueName)
 		return err
 	})
 }
@@ -1094,7 +1094,7 @@ func (c *Connection) RequeueDLQMessages(ctx context.Context, queueName string) e
 // Use with caution - this operation cannot be undone.
 func (c *Connection) PurgeDLQ(ctx context.Context) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
-		_, err := c.pool.Exec(ctx, "SELECT purge_dlq()")
+		_, err := c.pool.Exec(ctx, "SELECT postgremq.purge_dlq()")
 		return err
 	})
 }
@@ -1102,9 +1102,9 @@ func (c *Connection) PurgeDLQ(ctx context.Context) error {
 // PurgeAllMessages removes all messages from the entire system.
 //
 // This is a destructive operation that deletes:
-//   - All entries from dead_letter_queue
-//   - All entries from queue_messages
-//   - All entries from messages
+//   - All entries from postgremq.dead_letter_queue
+//   - All entries from postgremq.queue_messages
+//   - All entries from postgremq.messages
 //
 // Parameters:
 //   - ctx: Context for cancellation and timeout control.
@@ -1117,7 +1117,7 @@ func (c *Connection) PurgeDLQ(ctx context.Context) error {
 // used in testing or emergency cleanup scenarios.
 func (c *Connection) PurgeAllMessages(ctx context.Context) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
-		_, err := c.pool.Exec(ctx, "SELECT purge_all_messages()")
+		_, err := c.pool.Exec(ctx, "SELECT postgremq.purge_all_messages()")
 		return err
 	})
 }
@@ -1142,7 +1142,7 @@ func (c *Connection) PurgeAllMessages(ctx context.Context) error {
 // The operation uses the configured retry policy for transient errors.
 func (c *Connection) DeleteTopic(ctx context.Context, topic string) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
-		_, err := c.pool.Exec(ctx, "SELECT delete_topic($1)", topic)
+		_, err := c.pool.Exec(ctx, "SELECT postgremq.delete_topic($1)", topic)
 		return mapPgError(err)
 	})
 }
@@ -1163,7 +1163,7 @@ func (c *Connection) DeleteTopic(ctx context.Context, topic string) error {
 // The operation uses the configured retry policy for transient errors.
 func (c *Connection) DeleteQueue(ctx context.Context, queue string) error {
 	err := c.withRetry(ctx, func(ctx context.Context) error {
-		_, err := c.pool.Exec(ctx, "SELECT delete_queue($1)", queue)
+		_, err := c.pool.Exec(ctx, "SELECT postgremq.delete_queue($1)", queue)
 		return err
 	})
 	if err == nil {
@@ -1192,7 +1192,7 @@ func (c *Connection) DeleteQueue(ctx context.Context, queue string) error {
 // The operation uses the configured retry policy for transient errors.
 func (c *Connection) DeleteQueueMessage(ctx context.Context, queue string, messageID int64) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
-		_, err := c.pool.Exec(ctx, "SELECT delete_queue_message($1, $2)", queue, messageID)
+		_, err := c.pool.Exec(ctx, "SELECT postgremq.delete_queue_message($1, $2)", queue, messageID)
 		return err
 	})
 }
@@ -1211,7 +1211,7 @@ func (c *Connection) DeleteQueueMessage(ctx context.Context, queue string, messa
 // The operation uses the configured retry policy for transient errors.
 func (c *Connection) CleanUpQueue(ctx context.Context, queue string) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
-		_, err := c.pool.Exec(ctx, "SELECT clean_up_queue($1)", queue)
+		_, err := c.pool.Exec(ctx, "SELECT postgremq.clean_up_queue($1)", queue)
 		return err
 	})
 }
@@ -1236,7 +1236,7 @@ func (c *Connection) CleanUpQueue(ctx context.Context, queue string) error {
 // This operation is typically required before calling DeleteTopic.
 func (c *Connection) CleanUpTopic(ctx context.Context, topic string) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
-		_, err := c.pool.Exec(ctx, "SELECT clean_up_topic($1)", topic)
+		_, err := c.pool.Exec(ctx, "SELECT postgremq.clean_up_topic($1)", topic)
 		return err
 	})
 }
@@ -1248,7 +1248,7 @@ func (c *Connection) CleanUpTopic(ctx context.Context, topic string) error {
 // no longer being used.
 func (c *Connection) DeleteInactiveQueues(ctx context.Context) error {
 	return c.withRetry(ctx, func(ctx context.Context) error {
-		_, err := c.pool.Exec(ctx, "SELECT delete_inactive_queues()")
+		_, err := c.pool.Exec(ctx, "SELECT postgremq.delete_inactive_queues()")
 		return err
 	})
 }
@@ -1280,9 +1280,9 @@ func (c *Connection) CleanupCompletedMessages(ctx context.Context, olderThanHour
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		var row pgx.Row
 		if olderThanHours != nil {
-			row = c.pool.QueryRow(ctx, "SELECT cleanup_completed_messages($1)", *olderThanHours)
+			row = c.pool.QueryRow(ctx, "SELECT postgremq.cleanup_completed_messages($1)", *olderThanHours)
 		} else {
-			row = c.pool.QueryRow(ctx, "SELECT cleanup_completed_messages()")
+			row = c.pool.QueryRow(ctx, "SELECT postgremq.cleanup_completed_messages()")
 		}
 		return row.Scan(&deleted)
 	})
@@ -1343,7 +1343,7 @@ func (c *Connection) ListMessages(ctx context.Context, queueName string) ([]Queu
 	var messages []QueueMessage
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		rows, err := c.pool.Query(ctx,
-			"SELECT message_id, status, published_at, delivery_attempts, vt, processed_at FROM list_messages($1)",
+			"SELECT message_id, status, published_at, delivery_attempts, vt, processed_at FROM postgremq.list_messages($1)",
 			queueName)
 		if err != nil {
 			return err
@@ -1389,7 +1389,7 @@ func (c *Connection) GetMessage(ctx context.Context, messageID int64) (*Publishe
 	var msg PublishedMessage
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		return c.pool.QueryRow(ctx,
-			"SELECT message_id, topic_name, payload, published_at FROM get_message($1)",
+			"SELECT message_id, topic_name, payload, published_at FROM postgremq.get_message($1)",
 			messageID).Scan(&msg.MessageID, &msg.TopicName, &msg.Payload, &msg.PublishedAt)
 	})
 	if err != nil {
@@ -1410,7 +1410,7 @@ func (c *Connection) getNextVisibleTime(ctx context.Context, queue string) (time
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		var t sql.NullTime
 		err := c.pool.QueryRow(ctx,
-			"SELECT get_next_visible_time($1)",
+			"SELECT postgremq.get_next_visible_time($1)",
 			queue).Scan(&t)
 		if err != nil {
 			return fmt.Errorf("failed to get next visible time: %w", err)
@@ -1445,7 +1445,7 @@ func (c *Connection) resolveQueueGeneration(queue string) (string, error) {
 	ctx, cancel := context.WithTimeout(c.ioCtx, time.Second)
 	defer cancel()
 	var generation string
-	err := c.pool.QueryRow(ctx, "SELECT generation::text FROM queues WHERE name=$1", queue).Scan(&generation)
+	err := c.pool.QueryRow(ctx, "SELECT generation::text FROM postgremq.queues WHERE name=$1", queue).Scan(&generation)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrQueueNotFound
 	}

@@ -711,7 +711,7 @@ describe('Error Scenarios', () => {
       // consume_message can't re-pick and we're testing the drop-on-
       // lease-lost path cleanly.
       await isoPool!.query(
-        `UPDATE queue_messages SET consumer_token = 'stolen-by-other-consumer'
+        `UPDATE postgremq.queue_messages SET consumer_token = 'stolen-by-other-consumer'
          WHERE queue_name = 'autoext-leaselost-queue' AND message_id = $1`,
         [msg.id]
       );
@@ -780,7 +780,7 @@ describe('Error Scenarios', () => {
       // cycle fires. set_vt_batch will return only rows 2 and 3 (row 1's
       // consumer_token no longer matches our snapshot).
       await isoPool!.query(
-        `UPDATE queue_messages SET consumer_token = 'stolen-by-other'
+        `UPDATE postgremq.queue_messages SET consumer_token = 'stolen-by-other'
          WHERE queue_name = 'autoext-partial-queue' AND message_id = $1`,
         [received[0].id]
       );

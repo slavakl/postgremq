@@ -115,7 +115,7 @@ func TestErrLeaseLost_NackAfterStolen(t *testing.T) {
 
 	// "Steal" via raw SQL: re-consume the message with a fresh token. This
 	// changes consumer_token in the row.
-	_, err = pool.Exec(ctx, "SELECT * FROM consume_message($1, 30, 1)", "StolenQueue")
+	_, err = pool.Exec(ctx, "SELECT * FROM postgremq.consume_message($1, 30, 1)", "StolenQueue")
 	require.NoError(t, err)
 
 	// Original consumer's token no longer matches.
@@ -343,7 +343,7 @@ func TestErrValidation_SetVTBatchMismatchedArrays(t *testing.T) {
 	// the mismatch by issuing the SQL directly through the pool to bypass the
 	// client-side normalization that would always pass equal-length arrays.
 	_, err = pool.Exec(ctx,
-		`SELECT * FROM set_vt_batch_multi(ARRAY[$1]::varchar[], ARRAY[1,2]::bigint[], ARRAY['a']::varchar[], ARRAY[60]::int[])`,
+		`SELECT * FROM postgremq.set_vt_batch_multi(ARRAY[$1]::varchar[], ARRAY[1,2]::bigint[], ARRAY['a']::varchar[], ARRAY[60]::int[])`,
 		"BatchValQueue")
 	require.Error(t, err)
 	// The raw-SQL path doesn't go through mapPgError. We verify the SQLSTATE

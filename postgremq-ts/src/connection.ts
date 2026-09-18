@@ -649,10 +649,10 @@ export class Connection implements IConnection {
     let params: any[];
 
     if (options.deliverAfter) {
-      query = 'SELECT publish_message($1, $2, $3) as publish_message';
+      query = 'SELECT postgremq.publish_message($1, $2, $3) as publish_message';
       params = [topic, JSON.stringify(payload), options.deliverAfter];
     } else {
-      query = 'SELECT publish_message($1, $2) as publish_message';
+      query = 'SELECT postgremq.publish_message($1, $2) as publish_message';
       params = [topic, JSON.stringify(payload)];
     }
 
@@ -817,7 +817,7 @@ export class Connection implements IConnection {
 
     try {
       await this.executeWithRetry(async (client) => {
-        await client.query('SELECT create_topic($1)', [topic]);
+        await client.query('SELECT postgremq.create_topic($1)', [topic]);
       });
     } catch (err) {
       throw mapDbError(err);
@@ -861,7 +861,7 @@ export class Connection implements IConnection {
         // function can stay typed as INTERVAL without us needing a per-driver
         // serializer for it.
         const created = await client.query(
-          "SELECT create_queue($1, $2, $3, $4, $5 * interval '1 sec')",
+          "SELECT postgremq.create_queue($1, $2, $3, $4, $5 * interval '1 sec')",
           [name, topic, maxDeliveryAttempts, exclusive, keepAliveSeconds]
         );
 
@@ -901,7 +901,7 @@ export class Connection implements IConnection {
 
     try {
       await this.executeWithRetry(async (client) => {
-        await client.query('SELECT delete_topic($1)', [topic]);
+        await client.query('SELECT postgremq.delete_topic($1)', [topic]);
       });
     } catch (err) {
       throw mapDbError(err);
@@ -919,7 +919,7 @@ export class Connection implements IConnection {
     }
 
     await this.executeWithRetry(async (client) => {
-      await client.query('SELECT delete_queue($1)', [queue]);
+      await client.query('SELECT postgremq.delete_queue($1)', [queue]);
     });
 
     // Invalidate the cached topic mapping. If the queue is recreated under
@@ -941,7 +941,7 @@ export class Connection implements IConnection {
     }
 
     return this.executeWithRetry(async (client) => {
-      const result = await client.query('SELECT * FROM list_topics()');
+      const result = await client.query('SELECT * FROM postgremq.list_topics()');
       return result.rows.map((row) => row.topic);
     });
   }
@@ -956,7 +956,7 @@ export class Connection implements IConnection {
     }
 
     return this.executeWithRetry(async (client) => {
-      const result = await client.query('SELECT * FROM list_queues()');
+      const result = await client.query('SELECT * FROM postgremq.list_queues()');
 
       return result.rows.map((row) => ({
         queueName: row.queue_name,
@@ -979,7 +979,9 @@ export class Connection implements IConnection {
     }
 
     return this.executeWithRetry(async (client) => {
-      const result = await client.query('SELECT * FROM get_queue_statistics($1)', [queue || null]);
+      const result = await client.query('SELECT * FROM postgremq.get_queue_statistics($1)', [
+        queue || null,
+      ]);
 
       if (result.rows.length === 0) {
         return {
@@ -1018,7 +1020,7 @@ export class Connection implements IConnection {
 
     return this.executeWithRetry(async (client) => {
       const result = await client.query(
-        'SELECT retired_to_dlq, inactive_queues_dropped FROM pmq_maintenance_fast()'
+        'SELECT retired_to_dlq, inactive_queues_dropped FROM postgremq.pmq_maintenance_fast()'
       );
       const row = result.rows[0];
       return {
@@ -1038,7 +1040,7 @@ export class Connection implements IConnection {
     }
 
     return this.executeWithRetry(async (client) => {
-      const result = await client.query('SELECT * FROM list_dlq_messages()');
+      const result = await client.query('SELECT * FROM postgremq.list_dlq_messages()');
 
       return result.rows.map((row) => ({
         queueName: row.queue_name,
@@ -1060,7 +1062,7 @@ export class Connection implements IConnection {
     }
 
     await this.executeWithRetry(async (client) => {
-      await client.query('SELECT requeue_dlq_messages($1)', [queue]);
+      await client.query('SELECT postgremq.requeue_dlq_messages($1)', [queue]);
     });
   }
 
@@ -1074,7 +1076,7 @@ export class Connection implements IConnection {
     }
 
     await this.executeWithRetry(async (client) => {
-      await client.query('SELECT purge_dlq()');
+      await client.query('SELECT postgremq.purge_dlq()');
     });
   }
 
@@ -1088,7 +1090,7 @@ export class Connection implements IConnection {
     }
 
     await this.executeWithRetry(async (client) => {
-      await client.query('SELECT purge_all_messages()');
+      await client.query('SELECT postgremq.purge_all_messages()');
     });
   }
 
@@ -1105,7 +1107,7 @@ export class Connection implements IConnection {
     }
 
     await this.executeWithRetry(async (client) => {
-      await client.query('SELECT delete_queue_message($1, $2)', [queue, messageID]);
+      await client.query('SELECT postgremq.delete_queue_message($1, $2)', [queue, messageID]);
     });
   }
 
@@ -1120,7 +1122,7 @@ export class Connection implements IConnection {
     }
 
     return this.executeWithRetry(async (client) => {
-      const result = await client.query('SELECT * FROM list_messages($1)', [queue]);
+      const result = await client.query('SELECT * FROM postgremq.list_messages($1)', [queue]);
 
       return result.rows.map((row) => ({
         messageId: checkedMessageId(row.message_id),
@@ -1145,7 +1147,7 @@ export class Connection implements IConnection {
     }
 
     return this.executeWithRetry(async (client) => {
-      const result = await client.query('SELECT * FROM get_message($1)', [messageID]);
+      const result = await client.query('SELECT * FROM postgremq.get_message($1)', [messageID]);
 
       if (result.rows.length === 0) {
         return null;
@@ -1173,7 +1175,9 @@ export class Connection implements IConnection {
     const cached = this.queueGenerations.get(queue);
     if (cached) return cached;
     const generation = await this.runDatabase(async (client) => {
-      const result = await client.query('SELECT generation FROM queues WHERE name=$1', [queue]);
+      const result = await client.query('SELECT generation FROM postgremq.queues WHERE name=$1', [
+        queue,
+      ]);
       if (!result.rows.length)
         throw mapDbError({ code: 'PMQ02', message: `Queue "${queue}" does not exist` });
       return result.rows[0].generation as string;
@@ -1214,12 +1218,10 @@ export class Connection implements IConnection {
     try {
       return await this.runDatabase(
         async (client) => {
-          const result = await client.query('SELECT * FROM consume_message($1, $2, $3, $4)', [
-            queueName,
-            visibilityTimeout,
-            limit,
-            generation ?? null,
-          ]);
+          const result = await client.query(
+            'SELECT * FROM postgremq.consume_message($1, $2, $3, $4)',
+            [queueName, visibilityTimeout, limit, generation ?? null]
+          );
           // message_id is BIGINT; convert at the read boundary so callers see a
           // number (matches Message.id and the rest of the public surface).
           return result.rows.map((row) => ({
@@ -1256,7 +1258,11 @@ export class Connection implements IConnection {
 
     if (tx) {
       try {
-        await tx.query('SELECT ack_message($1, $2, $3)', [queueName, messageId, consumerToken]);
+        await tx.query('SELECT postgremq.ack_message($1, $2, $3)', [
+          queueName,
+          messageId,
+          consumerToken,
+        ]);
       } catch (err) {
         throw mapDbError(err);
       }
@@ -1265,7 +1271,11 @@ export class Connection implements IConnection {
 
     try {
       await this.executeWithRetry(async (client) => {
-        await client.query('SELECT ack_message($1, $2, $3)', [queueName, messageId, consumerToken]);
+        await client.query('SELECT postgremq.ack_message($1, $2, $3)', [
+          queueName,
+          messageId,
+          consumerToken,
+        ]);
       });
     } catch (err) {
       throw mapDbError(err);
@@ -1295,14 +1305,14 @@ export class Connection implements IConnection {
     try {
       await this.executeWithRetry(async (client) => {
         if (delayUntil) {
-          await client.query('SELECT nack_message($1, $2, $3, $4)', [
+          await client.query('SELECT postgremq.nack_message($1, $2, $3, $4)', [
             queueName,
             messageId,
             consumerToken,
             delayUntil,
           ]);
         } else {
-          await client.query('SELECT nack_message($1, $2, $3)', [
+          await client.query('SELECT postgremq.nack_message($1, $2, $3)', [
             queueName,
             messageId,
             consumerToken,
@@ -1330,7 +1340,7 @@ export class Connection implements IConnection {
 
     try {
       await this.executeWithRetry(async (client) => {
-        await client.query('SELECT release_message($1, $2, $3)', [
+        await client.query('SELECT postgremq.release_message($1, $2, $3)', [
           queueName,
           messageId,
           consumerToken,
@@ -1363,7 +1373,7 @@ export class Connection implements IConnection {
 
     try {
       return await this.executeWithRetry(async (client) => {
-        const result = await client.query('SELECT set_vt($1, $2, $3, $4) AS new_vt', [
+        const result = await client.query('SELECT postgremq.set_vt($1, $2, $3, $4) AS new_vt', [
           queueName,
           messageId,
           consumerToken,
@@ -1388,7 +1398,7 @@ export class Connection implements IConnection {
     }
 
     return this.executeWithRetry(async (client) => {
-      const result = await client.query('SELECT get_next_visible_time($1) AS next_time', [
+      const result = await client.query('SELECT postgremq.get_next_visible_time($1) AS next_time', [
         queueName,
       ]);
 
@@ -1408,7 +1418,7 @@ export class Connection implements IConnection {
     }
 
     await this.executeWithRetry(async (client) => {
-      await client.query('SELECT clean_up_queue($1)', [queue]);
+      await client.query('SELECT postgremq.clean_up_queue($1)', [queue]);
     });
   }
 
@@ -1423,7 +1433,7 @@ export class Connection implements IConnection {
     }
 
     await this.executeWithRetry(async (client) => {
-      await client.query('SELECT clean_up_topic($1)', [topic]);
+      await client.query('SELECT postgremq.clean_up_topic($1)', [topic]);
     });
   }
 
@@ -1437,7 +1447,7 @@ export class Connection implements IConnection {
     }
 
     await this.executeWithRetry(async (client) => {
-      await client.query('SELECT delete_inactive_queues()');
+      await client.query('SELECT postgremq.delete_inactive_queues()');
     });
   }
 
@@ -1454,8 +1464,10 @@ export class Connection implements IConnection {
     return this.executeWithRetry(async (client) => {
       const result =
         olderThanHours !== undefined
-          ? await client.query('SELECT cleanup_completed_messages($1) AS deleted', [olderThanHours])
-          : await client.query('SELECT cleanup_completed_messages() AS deleted');
+          ? await client.query('SELECT postgremq.cleanup_completed_messages($1) AS deleted', [
+              olderThanHours,
+            ])
+          : await client.query('SELECT postgremq.cleanup_completed_messages() AS deleted');
 
       return Number(result.rows[0].deleted);
     });
@@ -1564,7 +1576,7 @@ export class Connection implements IConnection {
         leases = await this.runDatabase(
           async (client) => {
             const result = await client.query(
-              'SELECT queue_name, keep_alive_until, outcome FROM extend_queue_keep_alive_multi($1, $2, $3)',
+              'SELECT queue_name, keep_alive_until, outcome FROM postgremq.extend_queue_keep_alive_multi($1, $2, $3)',
               [
                 due.map(([n]) => n),
                 due.map(([, e]) => Math.floor(e.intervalSec * 1000)),
@@ -1670,7 +1682,7 @@ export class Connection implements IConnection {
     try {
       return await this.executeWithRetry(async (client) => {
         const result = await client.query(
-          'SELECT queue_name, keep_alive_until, outcome FROM extend_queue_keep_alive_multi($1, $2, $3)',
+          'SELECT queue_name, keep_alive_until, outcome FROM postgremq.extend_queue_keep_alive_multi($1, $2, $3)',
           [names, intervalsMs, generations ?? null]
         );
         return result.rows.map((row: any) => ({
@@ -1859,7 +1871,7 @@ export class Connection implements IConnection {
     try {
       return await this.runDatabase(async (client) => {
         const result = await client.query(
-          'SELECT queue_name, message_id, vt, consumer_token, outcome FROM set_vt_batch_multi($1, $2, $3, $4)',
+          'SELECT queue_name, message_id, vt, consumer_token, outcome FROM postgremq.set_vt_batch_multi($1, $2, $3, $4)',
           [queues, ids, tokens, vts]
         );
         return result.rows.map((row: any) => ({

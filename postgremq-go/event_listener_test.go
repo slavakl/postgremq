@@ -65,7 +65,7 @@ func TestPerTopicNotify_CacheHit(t *testing.T) {
 
 	// Drop the queue at the SQL level so a DB lookup would fail. The cache
 	// entry from CreateQueue lets Consume succeed regardless.
-	_, err = pool.Exec(ctx, "DELETE FROM queues WHERE name = $1", queue)
+	_, err = pool.Exec(ctx, "DELETE FROM postgremq.queues WHERE name = $1", queue)
 	require.NoError(t, err)
 
 	consumer, err := conn.Consume(queue, postgremq.WithVT(30))
@@ -84,9 +84,9 @@ func TestPerTopicNotify_OutOfBandQueueNeedsWithTopic(t *testing.T) {
 
 	const topic = "TopicOutOfBand"
 	const queue = "QueueOutOfBand"
-	_, err := pool.Exec(ctx, "SELECT create_topic($1)", topic)
+	_, err := pool.Exec(ctx, "SELECT postgremq.create_topic($1)", topic)
 	require.NoError(t, err)
-	_, err = pool.Exec(ctx, "SELECT create_queue($1, $2, 0, false, interval '30 seconds')", queue, topic)
+	_, err = pool.Exec(ctx, "SELECT postgremq.create_queue($1, $2, 0, false, interval '30 seconds')", queue, topic)
 	require.NoError(t, err)
 
 	conn, err := postgremq.DialFromPool(pool)
@@ -115,7 +115,7 @@ func TestPerTopicNotify_WithTopicOption(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 
-	_, err = pool.Exec(ctx, "SELECT create_topic('ExplicitTopic'); SELECT create_queue('ExternalQueue','ExplicitTopic')")
+	_, err = pool.Exec(ctx, "SELECT postgremq.create_topic('ExplicitTopic'); SELECT postgremq.create_queue('ExternalQueue','ExplicitTopic')")
 	require.NoError(t, err)
 	consumer, err := conn.Consume("ExternalQueue",
 		postgremq.WithVT(30),
@@ -310,7 +310,7 @@ func TestEventListener_NackTriggersPerQueueNotify(t *testing.T) {
 	var consumedID int64
 	var token string
 	err = pool.QueryRow(ctx, `
-		SELECT message_id, consumer_token FROM consume_message($1, 30)
+		SELECT message_id, consumer_token FROM postgremq.consume_message($1, 30)
 	`, "NackQueue").Scan(&consumedID, &token)
 	require.NoError(t, err)
 	require.Equal(t, int64(msgID), consumedID)
@@ -324,7 +324,7 @@ func TestEventListener_NackTriggersPerQueueNotify(t *testing.T) {
 	waitForListen(t, pool, handle, "pmq:q:NackQueue")
 	drainHandle(handle)
 
-	_, err = pool.Exec(ctx, `SELECT nack_message($1, $2, $3, NOW())`, "NackQueue", msgID, token)
+	_, err = pool.Exec(ctx, `SELECT postgremq.nack_message($1, $2, $3, NOW())`, "NackQueue", msgID, token)
 	require.NoError(t, err)
 
 	select {
@@ -353,7 +353,7 @@ func TestEventListener_ReleaseTriggersPerQueueNotify(t *testing.T) {
 	require.NoError(t, err)
 
 	var token string
-	err = pool.QueryRow(ctx, `SELECT consumer_token FROM consume_message($1, 30)`, "RelQueue").Scan(&token)
+	err = pool.QueryRow(ctx, `SELECT consumer_token FROM postgremq.consume_message($1, 30)`, "RelQueue").Scan(&token)
 	require.NoError(t, err)
 
 	el := conn.EventListener()
@@ -365,7 +365,7 @@ func TestEventListener_ReleaseTriggersPerQueueNotify(t *testing.T) {
 	waitForListen(t, pool, handle, "pmq:q:RelQueue")
 	drainHandle(handle)
 
-	_, err = pool.Exec(ctx, `SELECT release_message($1, $2, $3)`, "RelQueue", msgID, token)
+	_, err = pool.Exec(ctx, `SELECT postgremq.release_message($1, $2, $3)`, "RelQueue", msgID, token)
 	require.NoError(t, err)
 
 	select {

@@ -522,7 +522,7 @@ func TestMessageID_BeyondInt32(t *testing.T) {
 	defer pool.Close()
 
 	const seedTo int64 = 2_200_000_000 // > math.MaxInt32 (2_147_483_647)
-	_, err := pool.Exec(ctx, "SELECT setval('messages_id_seq', $1)", seedTo)
+	_, err := pool.Exec(ctx, "SELECT setval('postgremq.messages_id_seq', $1)", seedTo)
 	require.NoError(t, err, "setval messages_id_seq")
 
 	conn, err := postgremq.DialFromPool(pool)

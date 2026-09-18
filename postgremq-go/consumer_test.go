@@ -290,7 +290,7 @@ func TestConsumerExtensionCancelsHandlerOnLeaseLost(t *testing.T) {
 	// set_vt_batch_multi will omit msg1 from its result (token mismatch in the
 	// WHERE clause) — that's the lease-lost signal we want to test.
 	_, err = pool.Exec(ctx,
-		`UPDATE queue_messages SET consumer_token = 'stolen-by-other'
+		`UPDATE postgremq.queue_messages SET consumer_token = 'stolen-by-other'
 		 WHERE queue_name = $1 AND message_id = $2`,
 		queueName, msg1.ID)
 	require.NoError(t, err)

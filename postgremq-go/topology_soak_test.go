@@ -63,7 +63,7 @@ func TestProductionTopologySoak(t *testing.T) {
 			case <-maintenanceCtx.Done():
 				return
 			case <-ticker.C:
-				if _, err := pool.Exec(maintenanceCtx, "SELECT pmq_maintenance_fast(); SELECT cleanup_completed_messages(0,1000)"); err != nil && maintenanceCtx.Err() == nil {
+				if _, err := pool.Exec(maintenanceCtx, "SELECT postgremq.pmq_maintenance_fast(); SELECT postgremq.cleanup_completed_messages(0,1000)"); err != nil && maintenanceCtx.Err() == nil {
 					select {
 					case maintenanceErrors <- err:
 					default:
@@ -94,7 +94,7 @@ func TestProductionTopologySoak(t *testing.T) {
 	mu.Unlock()
 	require.Eventually(t, func() bool {
 		var remaining int
-		err := pool.QueryRow(ctx, "SELECT count(*) FROM messages").Scan(&remaining)
+		err := pool.QueryRow(ctx, "SELECT count(*) FROM postgremq.messages").Scan(&remaining)
 		return err == nil && remaining == 0
 	}, 5*time.Second, 20*time.Millisecond)
 	stopMaintenance()

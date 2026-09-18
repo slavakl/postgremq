@@ -110,10 +110,9 @@ export class TestDatabase {
    */
   private async cleanupExistingSchema(): Promise<void> {
     try {
-      // Drop public schema and recreate it to ensure clean state
+      // Only remove queue objects; application schemas belong to the caller.
       await this.pool!.query(`
-        DROP SCHEMA IF EXISTS public CASCADE;
-        CREATE SCHEMA public;
+        DROP SCHEMA IF EXISTS postgremq CASCADE;
       `);
 
       console.log('Existing schema cleaned up');
@@ -184,9 +183,9 @@ export class TestDatabase {
     if (!this.pool) return;
 
     try {
-      await this.pool.query('SELECT purge_all_messages()');
-      await this.pool.query('DELETE FROM queues');
-      await this.pool.query('DELETE FROM topics');
+      await this.pool.query('SELECT postgremq.purge_all_messages()');
+      await this.pool.query('DELETE FROM postgremq.queues');
+      await this.pool.query('DELETE FROM postgremq.topics');
     } catch (error) {
       console.warn('Error during cleanup:', error);
     }

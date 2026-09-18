@@ -56,7 +56,7 @@ postgremq migrate --dsn "$DATABASE_URL"
 
 ### `migrate`
 
-Apply pending database migrations to bring the schema up to date.
+Apply pending database migrations in the fixed `postgremq` schema. Application schemas and the connection's `search_path` are unchanged.
 
 ```bash
 postgremq migrate --dsn <connection-string> [--target <version>]
@@ -98,7 +98,7 @@ Latest version:  1
 
 ### `status`
 
-Display the current migration status of the database.
+Display the current migration status of the database. This command is read-only and does not create the schema or version table.
 
 ```bash
 postgremq status --dsn <connection-string>
@@ -150,12 +150,12 @@ A "dirty" state indicates a previous migration failed partway through. Manual in
 
 ## Migration Tracking
 
-PostgreMQ uses a dedicated migrations table named `postgremq_migrations` to track applied migrations. This table is created automatically when you run your first migration.
+PostgreMQ uses a dedicated migrations table named `postgremq.postgremq_migrations` to track applied migrations. This table is created automatically when you run your first migration.
 
 **Schema:**
 
 ```sql
-CREATE TABLE postgremq_migrations (
+CREATE TABLE postgremq.postgremq_migrations (
     version BIGINT PRIMARY KEY,
     dirty BOOLEAN NOT NULL DEFAULT FALSE
 );

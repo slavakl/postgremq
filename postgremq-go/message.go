@@ -235,7 +235,7 @@ func (m *Message) SetVT(ctx context.Context, vt int) (time.Time, error) {
 	var newVT time.Time
 	err := m.conn.withRetry(ctx, func(ctx context.Context) error {
 		return m.conn.pool.QueryRow(ctx,
-			"SELECT set_vt($1, $2, $3, $4)",
+			"SELECT postgremq.set_vt($1, $2, $3, $4)",
 			m.queue, m.ID, m.consumerToken, vt).Scan(&newVT)
 	})
 	if err != nil {

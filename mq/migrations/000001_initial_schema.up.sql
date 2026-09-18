@@ -1,3 +1,6 @@
+-- PostgreMQ uses a fixed schema, independent of the caller's search_path.
+CREATE SCHEMA IF NOT EXISTS postgremq;
+
 /*
  * PostgreSQL Message Queue System Implementation
  *
@@ -22,17 +25,17 @@
  *   - Exclusive (temporary): expire unless a client keeps them alive by
  *     periodically extending `keep_alive_until`.
  * - Keep‑Alive: Clients of exclusive queues should periodically call
- *   `extend_queue_keep_alive_multi()` (both clients implement automatic
+ *   `postgremq.extend_queue_keep_alive_multi()` (both clients implement automatic
  *   connection-level keep‑alive) otherwise the queue is eligible for deletion
- *   by `delete_inactive_queues()`.
+ *   by `postgremq.delete_inactive_queues()`.
  * - Delivery Attempts: Each time a message is consumed its
  *   `delivery_attempts` is incremented. When a queue has
  *   `max_delivery_attempts > 0` and a message reaches the limit, the
- *   final-attempt nack retires the message inline; `pmq_maintenance_fast()`
+ *   final-attempt nack retires the message inline; `postgremq.pmq_maintenance_fast()`
  *   covers leftover crashed-final-attempt rows.
  * - DLQ (Dead Letter Queue): Failed messages are copied to
- *   `dead_letter_queue`. Use `list_dlq_messages()`, `requeue_dlq_messages()`
- *   and `purge_dlq()` to manage.
+ *   `dead_letter_queue`. Use `postgremq.list_dlq_messages()`, `postgremq.requeue_dlq_messages()`
+ *   and `postgremq.purge_dlq()` to manage.
  *
  * Event Notifications
  * -------------------
@@ -48,8 +51,8 @@
  *
  * Table Relationships and Cascade Behavior:
  * - topics: The root table containing topic names
- * - queues: References topics.name with ON DELETE CASCADE
- * - messages: References topics.name with ON DELETE CASCADE
+ * - queues: References postgremq.topics.name with ON DELETE CASCADE
+ * - messages: References postgremq.topics.name with ON DELETE CASCADE
  * - queue_messages: References both queues.name and messages.id with ON DELETE CASCADE
  * - dead_letter_queue: References both queues.name and messages.id with ON DELETE CASCADE
  *
@@ -59,7 +62,7 @@
  * 3. When a queue is deleted, all its message entries are automatically removed
  *
  * Functions (high level):
- *   - publish_message: Insert into messages and trigger distribution to queues.
+ *   - publish_message: Insert into postgremq.messages and trigger distribution to queues.
  *   - consume_message: Retrieve and mark messages as processing; sets vt.
  *   - ack_message: Mark as completed; clears consumer token; sets processed_at.
  *   - nack_message: Return to pending with optional delay; clears token; NOTIFY.
@@ -77,15 +80,15 @@
 
 
 -- Topics table.
-CREATE TABLE topics (
+CREATE TABLE postgremq.topics (
   name VARCHAR(255) PRIMARY KEY
 );
 
 -- Queues table.
-CREATE TABLE queues (
+CREATE TABLE postgremq.queues (
   generation UUID NOT NULL DEFAULT gen_random_uuid(),
   name VARCHAR(255) PRIMARY KEY,
-  topic_name VARCHAR(255) NOT NULL REFERENCES topics(name) ON DELETE CASCADE,
+  topic_name VARCHAR(255) NOT NULL REFERENCES postgremq.topics(name) ON DELETE CASCADE,
   max_delivery_attempts INT NOT NULL DEFAULT 0,
   exclusive BOOLEAN NOT NULL DEFAULT false,  -- Changed from durable
   keep_alive_interval INTERVAL NOT NULL DEFAULT '5 minutes',
@@ -95,9 +98,9 @@ CREATE TABLE queues (
 -- Messages table: payload stored as JSONB.
 -- id is BIGSERIAL: int32 SERIAL would wrap in months at sustained high publish
 -- rates and silently corrupt message identity.
-CREATE TABLE messages (
+CREATE TABLE postgremq.messages (
   id BIGSERIAL PRIMARY KEY,
-  topic_name VARCHAR(255) NOT NULL REFERENCES topics(name) ON DELETE CASCADE,
+  topic_name VARCHAR(255) NOT NULL REFERENCES postgremq.topics(name) ON DELETE CASCADE,
   payload JSONB NOT NULL,
   published_at TIMESTAMPTZ DEFAULT clock_timestamp(),
   deliver_after TIMESTAMPTZ DEFAULT clock_timestamp()  -- New column with default clock_timestamp()
@@ -105,9 +108,9 @@ CREATE TABLE messages (
 
 -- Queue Messages table.
 -- Composite primary key: (queue_name, message_id).
-CREATE TABLE queue_messages (
-  queue_name VARCHAR(255) REFERENCES queues(name) ON DELETE CASCADE,
-  message_id BIGINT REFERENCES messages(id) ON DELETE CASCADE,
+CREATE TABLE postgremq.queue_messages (
+  queue_name VARCHAR(255) REFERENCES postgremq.queues(name) ON DELETE CASCADE,
+  message_id BIGINT REFERENCES postgremq.messages(id) ON DELETE CASCADE,
   status VARCHAR(16) DEFAULT 'pending',  -- Allowed: 'pending', 'processing', 'completed'
   published_at TIMESTAMPTZ DEFAULT clock_timestamp(),
   vt TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),  -- Renamed from locked_until
@@ -129,11 +132,11 @@ CREATE TABLE queue_messages (
 -- operator may want to keep across queue/topic cleanups. Cascading
 -- deletes (the previous behavior) silently wiped DLQ history when
 -- clean_up_topic or delete_queue ran. Operators now have to make an
--- explicit choice — purge_dlq() or requeue_dlq_messages() — before
+-- explicit choice — postgremq.purge_dlq() or postgremq.requeue_dlq_messages() — before
 -- removing the underlying messages or queue.
-CREATE TABLE dead_letter_queue (
-  queue_name VARCHAR(255) REFERENCES queues(name) ON DELETE RESTRICT,
-  message_id BIGINT REFERENCES messages(id) ON DELETE RESTRICT,
+CREATE TABLE postgremq.dead_letter_queue (
+  queue_name VARCHAR(255) REFERENCES postgremq.queues(name) ON DELETE RESTRICT,
+  message_id BIGINT REFERENCES postgremq.messages(id) ON DELETE RESTRICT,
   retry_count INT,
   published_at TIMESTAMPTZ DEFAULT clock_timestamp(),
   PRIMARY KEY (queue_name, message_id)
@@ -146,12 +149,12 @@ CREATE TABLE dead_letter_queue (
 -- Index for consume_message query: filters by queue, status, and vt
 -- Partial index excludes completed messages to keep it small
 CREATE INDEX idx_queue_messages_consume
-ON queue_messages(queue_name, vt, published_at)
+ON postgremq.queue_messages(queue_name, vt, published_at)
 WHERE status IN ('pending', 'processing');
 
 -- Index for get_next_visible_time query
 CREATE INDEX idx_queue_messages_next_visible
-ON queue_messages(queue_name, vt)
+ON postgremq.queue_messages(queue_name, vt)
 WHERE status IN ('pending', 'processing');
 
 -- Index for distribute_message: every publish runs
@@ -159,14 +162,14 @@ WHERE status IN ('pending', 'processing');
 -- a publish-heavy workload seqscans the queues table on every message —
 -- linear in the queue count, the publish hot path's first scaling cliff.
 CREATE INDEX idx_queues_topic_name
-ON queues(topic_name);
+ON postgremq.queues(topic_name);
 
 -- Index for clean_up_topic and the messages → topics FK cascade.
--- DELETE FROM messages WHERE topic_name = X without this index seqscans
+-- DELETE FROM postgremq.messages WHERE topic_name = X without this index seqscans
 -- the entire messages table; the same is true for any cascade triggered
 -- by deleting a topic.
 CREATE INDEX idx_messages_topic_name
-ON messages(topic_name);
+ON postgremq.messages(topic_name);
 
 -- Index for cleanup_completed_messages. The cleanup query filters by
 -- status='completed' AND processed_at < cutoff. The two pre-existing
@@ -174,7 +177,7 @@ ON messages(topic_name);
 -- otherwise falls back to a heap seqscan over every queue_message —
 -- the kind of bulk DELETE that fails to keep up with a busy queue.
 CREATE INDEX idx_queue_messages_completed_processed_at
-ON queue_messages(processed_at)
+ON postgremq.queue_messages(processed_at)
 WHERE status = 'completed';
 
 -- Per-status partial indexes on queue_name for get_queue_statistics. The
@@ -185,11 +188,11 @@ WHERE status = 'completed';
 -- completed set (which can reach tens of millions of rows within the 24h
 -- completed-message retention window).
 CREATE INDEX idx_queue_messages_pending
-ON queue_messages(queue_name)
+ON postgremq.queue_messages(queue_name)
 WHERE status = 'pending';
 
 CREATE INDEX idx_queue_messages_processing
-ON queue_messages(queue_name)
+ON postgremq.queue_messages(queue_name)
 WHERE status = 'processing';
 
 /* Function: distribute_message
@@ -211,7 +214,7 @@ WHERE status = 'processing';
  * Returns:
  *   The unmodified NEW row for the `messages` table.
  */
-CREATE OR REPLACE FUNCTION distribute_message()
+CREATE OR REPLACE FUNCTION postgremq.distribute_message()
 RETURNS trigger AS $$
 BEGIN
    -- Distribute to an exclusive queue only while its keep-alive is still live
@@ -220,9 +223,9 @@ BEGIN
    -- is treated as dead everywhere at once. Clients are responsible for sending
    -- keep-alive well before expiry (with their own safety margin) so a queue is
    -- never considered expired while still in use.
-   INSERT INTO queue_messages(queue_name, message_id, vt)
+   INSERT INTO postgremq.queue_messages(queue_name, message_id, vt)
    SELECT q.name, NEW.id, NEW.deliver_after
-   FROM queues q
+   FROM postgremq.queues q
    WHERE q.topic_name = NEW.topic_name
      AND (NOT q.exclusive OR q.keep_alive_until > clock_timestamp());
 
@@ -238,7 +241,7 @@ $$ LANGUAGE plpgsql;
  *
  * Description:
  *   Automatically distributes newly published messages to all queues subscribed to the message's topic.
- *   This trigger fires after each message insert and calls distribute_message() to handle the fan-out.
+ *   This trigger fires after each message insert and calls postgremq.distribute_message() to handle the fan-out.
  *
  * Timing: AFTER INSERT
  * Granularity: FOR EACH ROW
@@ -247,18 +250,18 @@ $$ LANGUAGE plpgsql;
  * Behavior:
  *   For each newly inserted message, this trigger:
  *   1. Finds all active queues subscribed to the message's topic
- *   2. Creates queue_message entries for each queue via distribute_message()
+ *   2. Creates queue_message entries for each queue via postgremq.distribute_message()
  *   3. Emits a single NOTIFY event on `pmq:t:<topic>` to wake consumers
  *
  * Side Effects:
- *   - Multiple inserts into queue_messages (one per subscribed queue)
+ *   - Multiple inserts into postgremq.queue_messages (one per subscribed queue)
  *   - NOTIFY on the per-topic channel `pmq:t:<topic>` with the message id as plain text
  *   - Exclusive queues with expired keep_alive_until are excluded from distribution
  */
 CREATE TRIGGER after_message_insert
-AFTER INSERT ON messages
+AFTER INSERT ON postgremq.messages
 FOR EACH ROW
-EXECUTE FUNCTION distribute_message();
+EXECUTE FUNCTION postgremq.distribute_message();
 
 ---------------------------
 -- Runtime API Functions
@@ -275,7 +278,7 @@ EXECUTE FUNCTION distribute_message();
  * Returns:
  *   VARCHAR: The topic name (for convenience/chaining).
  */
-CREATE OR REPLACE FUNCTION create_topic(p_topic VARCHAR(255))
+CREATE OR REPLACE FUNCTION postgremq.create_topic(p_topic VARCHAR(255))
 RETURNS VARCHAR(255) AS $$
 BEGIN
   IF p_topic IS NULL OR p_topic !~ '^[A-Za-z0-9_:.\-]+$' THEN
@@ -292,7 +295,7 @@ BEGIN
     RAISE EXCEPTION 'Topic name "%" is too long: maximum 57 bytes (limit imposed by NOTIFY channel length: 63 bytes minus the "pmq:t:" prefix)', p_topic
       USING ERRCODE = 'PMQ03';
   END IF;
-  INSERT INTO topics(name) VALUES (p_topic)
+  INSERT INTO postgremq.topics(name) VALUES (p_topic)
   ON CONFLICT (name) DO NOTHING;
   RETURN p_topic;
 END;
@@ -332,7 +335,7 @@ $$ LANGUAGE plpgsql;
  *   - PMQ03 if the name fails validation, p_max_attempts is negative, or
  *     a queue with this name already exists with different parameters.
  */
-CREATE OR REPLACE FUNCTION create_queue(
+CREATE OR REPLACE FUNCTION postgremq.create_queue(
     p_queue_name VARCHAR(255),
     p_topic_name VARCHAR(255),
     p_max_attempts INTEGER DEFAULT 0,  -- 0 = unlimited retries
@@ -340,7 +343,7 @@ CREATE OR REPLACE FUNCTION create_queue(
     p_keep_alive_interval INTERVAL DEFAULT '5 minutes'
 ) RETURNS UUID AS $$
 DECLARE
-    v_existing queues%ROWTYPE;
+    v_existing postgremq.queues%ROWTYPE;
     v_generation UUID;
 BEGIN
     IF p_queue_name IS NULL OR p_queue_name !~ '^[A-Za-z0-9_:.\-]+$' THEN
@@ -369,11 +372,11 @@ BEGIN
     -- Surface a missing topic as PMQ02 (parity with publish_message). Without
     -- this check the INSERT below would still fail, but with a raw 23503 FK
     -- violation that doesn't map to ErrQueueNotFound on the client side.
-    IF NOT EXISTS (SELECT 1 FROM topics WHERE name = p_topic_name) THEN
+    IF NOT EXISTS (SELECT 1 FROM postgremq.topics WHERE name = p_topic_name) THEN
         RAISE EXCEPTION 'Topic "%" does not exist', p_topic_name
           USING ERRCODE = 'PMQ02';
     END IF;
-    INSERT INTO queues (
+    INSERT INTO postgremq.queues (
         name,
         topic_name,
         max_delivery_attempts,
@@ -400,7 +403,7 @@ BEGIN
     -- Conflict path: queue with this name already exists. Verify the caller's
     -- parameters match the existing row; otherwise raise so accidental config
     -- drift is caught loudly rather than silently ignored.
-    SELECT * INTO v_existing FROM queues WHERE name = p_queue_name FOR UPDATE;
+    SELECT * INTO v_existing FROM postgremq.queues WHERE name = p_queue_name FOR UPDATE;
     IF v_existing.exclusive AND v_existing.keep_alive_until <= clock_timestamp() THEN
         RAISE EXCEPTION 'Queue "%" expired; delete it before recreating it', p_queue_name USING ERRCODE = 'PMQ02';
     END IF;
@@ -420,7 +423,7 @@ BEGIN
 
     -- Redeclaration is idempotent only while this lease is live.
     IF p_exclusive THEN
-        UPDATE queues SET keep_alive_until = clock_timestamp() + keep_alive_interval
+        UPDATE postgremq.queues SET keep_alive_until = clock_timestamp() + keep_alive_interval
         WHERE name = p_queue_name;
     END IF;
     RETURN v_existing.generation;
@@ -432,7 +435,7 @@ $$ LANGUAGE plpgsql;
  * Description:
  *   Publishes a message into `messages` for the specified topic. The
  *   distribution to queues is performed by the `after_message_insert` trigger
- *   via `distribute_message()`. If `p_deliver_after` is specified, message will
+ *   via `postgremq.distribute_message()`. If `p_deliver_after` is specified, message will
  *   be invisible to consumers until that timestamp; otherwise it is visible
  *   immediately.
  *
@@ -445,10 +448,10 @@ $$ LANGUAGE plpgsql;
  *   BIGINT: The generated message id.
  *
  * Side Effects:
- *   - Triggers `distribute_message()` which inserts into `queue_messages` and
+ *   - Triggers `postgremq.distribute_message()` which inserts into `queue_messages` and
  *     emits NOTIFY on `postgremq_events`.
  */
-CREATE OR REPLACE FUNCTION publish_message(
+CREATE OR REPLACE FUNCTION postgremq.publish_message(
     p_topic VARCHAR(255),
     p_payload JSONB,
     p_deliver_after TIMESTAMPTZ DEFAULT clock_timestamp()
@@ -456,12 +459,12 @@ CREATE OR REPLACE FUNCTION publish_message(
 DECLARE
     v_message_id BIGINT;
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM topics WHERE name = p_topic) THEN
+    IF NOT EXISTS (SELECT 1 FROM postgremq.topics WHERE name = p_topic) THEN
         RAISE EXCEPTION 'Topic "%" does not exist', p_topic
           USING ERRCODE = 'PMQ02';
     END IF;
     
-    INSERT INTO messages(topic_name, payload, deliver_after)
+    INSERT INTO postgremq.messages(topic_name, payload, deliver_after)
     VALUES (p_topic, p_payload, p_deliver_after)
     RETURNING id INTO v_message_id;
     
@@ -489,7 +492,7 @@ $$ LANGUAGE plpgsql;
  *   - PMQ02 if the queue does not exist (deleted out-of-band). An existing but
  *     empty queue returns zero rows with no error.
  */
-CREATE OR REPLACE FUNCTION consume_message(
+CREATE OR REPLACE FUNCTION postgremq.consume_message(
     p_queue_name VARCHAR(255),
     p_vt INTEGER,
     p_limit INT DEFAULT 1,
@@ -517,7 +520,7 @@ BEGIN
     -- silently polling an empty result forever. An existing-but-empty queue still
     -- returns zero rows with no error (the common idle case); only an ABSENT
     -- queue row raises here.
-    PERFORM 1 FROM queues WHERE name = p_queue_name AND (p_generation IS NULL OR generation = p_generation)
+    PERFORM 1 FROM postgremq.queues WHERE name = p_queue_name AND (p_generation IS NULL OR generation = p_generation)
       AND (NOT exclusive OR keep_alive_until > clock_timestamp());
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Queue "%" does not exist', p_queue_name
@@ -529,7 +532,7 @@ BEGIN
     RETURN QUERY
     WITH target_queue AS (
         SELECT name, max_delivery_attempts
-        FROM queues
+        FROM postgremq.queues
         WHERE name = p_queue_name AND (p_generation IS NULL OR generation = p_generation)
             -- Strict clock_timestamp() cutoff, symmetric with distribute_message and the
             -- reaper: an expired exclusive queue serves nothing. No grace window.
@@ -541,7 +544,7 @@ BEGIN
                qm.status,
                qm.delivery_attempts,
                qm.published_at
-        FROM queue_messages qm
+        FROM postgremq.queue_messages qm
         CROSS JOIN target_queue tq
         WHERE qm.queue_name = tq.name
             AND (tq.max_delivery_attempts = 0 OR qm.delivery_attempts < tq.max_delivery_attempts)
@@ -560,7 +563,7 @@ BEGIN
         FOR UPDATE SKIP LOCKED
         LIMIT p_limit
     )
-    UPDATE queue_messages
+    UPDATE postgremq.queue_messages
     SET status = 'processing',
         vt = clock_timestamp() + make_interval(secs => p_vt),
         delivery_attempts = qm.delivery_attempts + 1,
@@ -572,7 +575,7 @@ BEGIN
         AND queue_messages.message_id = qm.message_id
     RETURNING queue_messages.queue_name,
               queue_messages.message_id,
-              (SELECT m.payload FROM messages m WHERE m.id = queue_messages.message_id) AS payload,
+              (SELECT m.payload FROM postgremq.messages m WHERE m.id = queue_messages.message_id) AS payload,
               queue_messages.consumer_token,
               queue_messages.delivery_attempts,
               queue_messages.vt,
@@ -595,10 +598,10 @@ $$ LANGUAGE plpgsql;
  *
  * Note: The actual implementation is assumed to exist elsewhere if not defined here.
  */
-CREATE OR REPLACE FUNCTION ack_message(p_queue_name VARCHAR(255), p_message_id BIGINT, p_consumer_token VARCHAR(64))
+CREATE OR REPLACE FUNCTION postgremq.ack_message(p_queue_name VARCHAR(255), p_message_id BIGINT, p_consumer_token VARCHAR(64))
 RETURNS VOID AS $$
 BEGIN
-  UPDATE queue_messages
+  UPDATE postgremq.queue_messages
   SET status = 'completed',
       processed_at = clock_timestamp(),
       consumer_token = NULL
@@ -628,7 +631,7 @@ $$ LANGUAGE plpgsql;
  *
  * Returns: VOID.
  */
-CREATE OR REPLACE FUNCTION nack_message(
+CREATE OR REPLACE FUNCTION postgremq.nack_message(
     p_queue_name VARCHAR(255),
     p_message_id BIGINT,
     p_consumer_token VARCHAR(64),
@@ -645,12 +648,12 @@ BEGIN
     -- queue_messages) between this read and the UPDATE/INSERT below,
     -- leaving a stale v_max_attempts and a NOTIFY on a dropped channel.
     SELECT max_delivery_attempts INTO v_max_attempts
-    FROM queues WHERE name = p_queue_name
+    FROM postgremq.queues WHERE name = p_queue_name
     FOR SHARE;
 
     -- Reset to pending. RETURNING gives us the (post-consume-increment)
     -- delivery_attempts so we can decide whether this was the final attempt.
-    UPDATE queue_messages
+    UPDATE postgremq.queue_messages
     SET status = 'pending',
         vt = p_delay_until,
         consumer_token = NULL
@@ -667,11 +670,11 @@ BEGIN
 
     IF v_max_attempts > 0 AND v_attempts >= v_max_attempts THEN
         -- Final attempt: retire to DLQ inline.
-        INSERT INTO dead_letter_queue(queue_name, message_id, retry_count)
+        INSERT INTO postgremq.dead_letter_queue(queue_name, message_id, retry_count)
         VALUES (p_queue_name, p_message_id, v_attempts)
         ON CONFLICT (queue_name, message_id) DO NOTHING;
 
-        DELETE FROM queue_messages
+        DELETE FROM postgremq.queue_messages
         WHERE queue_name = p_queue_name
           AND message_id = p_message_id;
         -- No NOTIFY here: there's nothing to consume on this queue any more.
@@ -700,14 +703,14 @@ $$ LANGUAGE plpgsql;
  *
  * Returns: VOID.
  */
-CREATE OR REPLACE FUNCTION release_message(
+CREATE OR REPLACE FUNCTION postgremq.release_message(
     p_queue_name VARCHAR(255),
     p_message_id BIGINT,
     p_consumer_token VARCHAR(64)
 )
     RETURNS VOID AS $$
 BEGIN
-    UPDATE queue_messages
+    UPDATE postgremq.queue_messages
     SET status = 'pending',
         vt = clock_timestamp(),  -- Renamed from locked_until
         consumer_token = NULL,
@@ -751,7 +754,7 @@ $$ LANGUAGE plpgsql;
  *   Callers should ensure reasonable values are used to prevent messages from
  *   being locked for excessive periods. Recommended maximum: 43200 seconds (12 hours).
  */
-CREATE OR REPLACE FUNCTION set_vt(
+CREATE OR REPLACE FUNCTION postgremq.set_vt(
     p_queue_name VARCHAR(255),
     p_message_id BIGINT,
     p_consumer_token VARCHAR(64),
@@ -764,7 +767,7 @@ BEGIN
         RAISE EXCEPTION 'p_vt must be >= 0' USING ERRCODE = 'PMQ03';
     END IF;
 
-    SELECT qm.vt INTO v_vt FROM queue_messages qm
+    SELECT qm.vt INTO v_vt FROM postgremq.queue_messages qm
     WHERE qm.queue_name = p_queue_name AND qm.message_id = p_message_id
       AND qm.consumer_token = p_consumer_token AND qm.status = 'processing'
     FOR UPDATE NOWAIT;
@@ -772,7 +775,7 @@ BEGIN
         RAISE EXCEPTION 'Extend lock failed: message not in processing state, expired, or token mismatch'
           USING ERRCODE = 'PMQ01';
     END IF;
-    UPDATE queue_messages qm SET vt = clock_timestamp() + make_interval(secs => p_vt)
+    UPDATE postgremq.queue_messages qm SET vt = clock_timestamp() + make_interval(secs => p_vt)
     WHERE qm.queue_name = p_queue_name AND qm.message_id = p_message_id
     RETURNING qm.vt INTO v_vt;
 
@@ -804,10 +807,10 @@ $$ LANGUAGE plpgsql;
  *
  * Returns:
  *   A single row with two counters for monitoring:
- *     retired_to_dlq          - rows moved into dead_letter_queue
+ *     retired_to_dlq          - rows moved into postgremq.dead_letter_queue
  *     inactive_queues_dropped - exclusive queues whose keep_alive_until expired
  */
-CREATE OR REPLACE FUNCTION pmq_maintenance_fast()
+CREATE OR REPLACE FUNCTION postgremq.pmq_maintenance_fast()
 RETURNS TABLE (
     retired_to_dlq          BIGINT,
     inactive_queues_dropped BIGINT
@@ -817,8 +820,8 @@ DECLARE
     v_dropped BIGINT;
 BEGIN
     WITH deleted_messages AS (
-        DELETE FROM queue_messages qm
-        USING queues q
+        DELETE FROM postgremq.queue_messages qm
+        USING postgremq.queues q
         WHERE qm.queue_name = q.name
           AND q.max_delivery_attempts > 0
           AND qm.delivery_attempts >= q.max_delivery_attempts
@@ -837,7 +840,7 @@ BEGIN
         -- status to 'pending' before deleting; maintenance only matches
         -- 'processing' rows), but the guard hardens against future code
         -- paths that might re-fire on the same (queue_name, message_id).
-        INSERT INTO dead_letter_queue(queue_name, message_id, retry_count)
+        INSERT INTO postgremq.dead_letter_queue(queue_name, message_id, retry_count)
         SELECT queue_name, message_id, delivery_attempts
         FROM deleted_messages
         ON CONFLICT (queue_name, message_id) DO NOTHING
@@ -847,11 +850,11 @@ BEGIN
 
     -- Skip queues that have DLQ entries. dead_letter_queue.queue_name
     -- has ON DELETE RESTRICT so deleting them would error and abort
-    -- the maintenance call. Operators can purge_dlq() or
-    -- requeue_dlq_messages() to release the queue, OR leave it as
+    -- the maintenance call. Operators can postgremq.purge_dlq() or
+    -- postgremq.requeue_dlq_messages() to release the queue, OR leave it as
     -- forensic data — the queue stays until the operator decides.
     WITH dropped AS (
-        DELETE FROM queues q
+        DELETE FROM postgremq.queues q
         WHERE q.exclusive = true
           -- Strict expiry: reap as soon as keep_alive_until has passed. No
           -- grace window — symmetric with distribute_message / consume_message,
@@ -859,7 +862,7 @@ BEGIN
           -- must send keep-alive before expiry (with their own margin).
           AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= clock_timestamp())
           AND NOT EXISTS (
-              SELECT 1 FROM dead_letter_queue dlq WHERE dlq.queue_name = q.name
+              SELECT 1 FROM postgremq.dead_letter_queue dlq WHERE dlq.queue_name = q.name
           )
         RETURNING name
     )
@@ -873,7 +876,7 @@ $$ LANGUAGE plpgsql;
  * or omitted when gone/expired/wrong generation. Busy never means lease lost.
  * Pass generations to bind renewals to specific queue incarnations.
  */
-CREATE OR REPLACE FUNCTION extend_queue_keep_alive_multi(
+CREATE OR REPLACE FUNCTION postgremq.extend_queue_keep_alive_multi(
     p_queue_names  VARCHAR[],
     p_intervals_ms BIGINT[],
     p_generations UUID[] DEFAULT NULL
@@ -887,10 +890,10 @@ BEGIN
     END IF;
     FOR r IN SELECT * FROM unnest(p_queue_names, p_intervals_ms, COALESCE(p_generations, array_fill(NULL::UUID, ARRAY[cardinality(p_queue_names)]))) AS t(name, ms, generation) ORDER BY name LOOP
         BEGIN
-            SELECT q.keep_alive_until INTO deadline FROM queues q
+            SELECT q.keep_alive_until INTO deadline FROM postgremq.queues q
             WHERE q.name = r.name AND q.exclusive AND (r.generation IS NULL OR q.generation = r.generation) FOR UPDATE NOWAIT;
             IF FOUND AND deadline > clock_timestamp() THEN
-                UPDATE queues q SET keep_alive_until = clock_timestamp() + make_interval(secs => r.ms / 1000.0)
+                UPDATE postgremq.queues q SET keep_alive_until = clock_timestamp() + make_interval(secs => r.ms / 1000.0)
                 WHERE q.name = r.name RETURNING q.keep_alive_until INTO deadline;
                 RETURN QUERY SELECT r.name, deadline, 'extended'::TEXT;
             END IF;
@@ -924,12 +927,12 @@ $$ LANGUAGE plpgsql;
  *   A TABLE with one column:
  *     - topic (VARCHAR): The name of the topic.
  */
-CREATE OR REPLACE FUNCTION list_topics()
+CREATE OR REPLACE FUNCTION postgremq.list_topics()
 RETURNS TABLE(topic VARCHAR(255)) AS $$
 BEGIN
   RETURN QUERY
     SELECT topics.name AS topic
-    FROM topics
+    FROM postgremq.topics
     ORDER BY topics.name;
 END;
 $$ LANGUAGE plpgsql;
@@ -949,7 +952,7 @@ $$ LANGUAGE plpgsql;
  *     - durable (BOOLEAN): Indicates if the queue is durable.
  *     - keep_alive_until (TIMESTAMPTZ): Expiration timestamp for non-durable queues.
  */
-CREATE OR REPLACE FUNCTION list_queues()
+CREATE OR REPLACE FUNCTION postgremq.list_queues()
 RETURNS TABLE(
   queue_name VARCHAR(255),
   topic_name VARCHAR(255),
@@ -965,7 +968,7 @@ BEGIN
       queues.max_delivery_attempts,
       queues.exclusive,  -- Changed from durable
       queues.keep_alive_until
-    FROM queues
+    FROM postgremq.queues
     ORDER BY queues.name;
 END;
 $$ LANGUAGE plpgsql;
@@ -996,7 +999,7 @@ $$ LANGUAGE plpgsql;
  *   call performs a heap seqscan. The return shape is unchanged (four BIGINT
  *   columns in the same order); Go/TS clients select all four by name.
  */
-CREATE OR REPLACE FUNCTION get_queue_statistics(p_queue VARCHAR(255) DEFAULT NULL)
+CREATE OR REPLACE FUNCTION postgremq.get_queue_statistics(p_queue VARCHAR(255) DEFAULT NULL)
 RETURNS TABLE(
   pending_count BIGINT,
   processing_count BIGINT,
@@ -1012,13 +1015,13 @@ BEGIN
       v_pending + v_processing + v_completed
     FROM (
       SELECT
-        (SELECT count(*) FROM queue_messages qm
+        (SELECT count(*) FROM postgremq.queue_messages qm
            WHERE qm.status = 'pending'
              AND (p_queue IS NULL OR qm.queue_name = p_queue)) AS v_pending,
-        (SELECT count(*) FROM queue_messages qm
+        (SELECT count(*) FROM postgremq.queue_messages qm
            WHERE qm.status = 'processing'
              AND (p_queue IS NULL OR qm.queue_name = p_queue)) AS v_processing,
-        (SELECT count(*) FROM queue_messages qm
+        (SELECT count(*) FROM postgremq.queue_messages qm
            WHERE qm.status = 'completed'
              AND (p_queue IS NULL OR qm.queue_name = p_queue)) AS v_completed
     ) counts;
@@ -1037,7 +1040,7 @@ $$ LANGUAGE plpgsql;
  *     - retry_count (INT): Number of delivery attempts made (as stored in DLQ).
  *     - published_at (TIMESTAMPTZ): Timestamp when the message was moved into the DLQ.
  */
-CREATE OR REPLACE FUNCTION list_dlq_messages()
+CREATE OR REPLACE FUNCTION postgremq.list_dlq_messages()
 RETURNS TABLE(
   queue_name VARCHAR(255),
   message_id BIGINT,
@@ -1047,7 +1050,7 @@ RETURNS TABLE(
 BEGIN
   RETURN QUERY
     SELECT dl.queue_name, dl.message_id, dl.retry_count, dl.published_at
-    FROM dead_letter_queue dl
+    FROM postgremq.dead_letter_queue dl
     ORDER BY dl.published_at;
 END;
 $$ LANGUAGE plpgsql;
@@ -1073,17 +1076,17 @@ $$ LANGUAGE plpgsql;
  *
  * Returns: VOID.
  */
-CREATE OR REPLACE FUNCTION requeue_dlq_messages(p_queue_name VARCHAR(255))
+CREATE OR REPLACE FUNCTION postgremq.requeue_dlq_messages(p_queue_name VARCHAR(255))
 RETURNS VOID AS $$
 DECLARE
     v_requeued INT;
 BEGIN
     WITH moved_messages AS (
-        DELETE FROM dead_letter_queue dlq
+        DELETE FROM postgremq.dead_letter_queue dlq
         WHERE dlq.queue_name = p_queue_name
         RETURNING dlq.queue_name, dlq.message_id
     )
-    INSERT INTO queue_messages(queue_name, message_id, status, delivery_attempts, vt)
+    INSERT INTO postgremq.queue_messages(queue_name, message_id, status, delivery_attempts, vt)
     SELECT queue_name, message_id, 'pending', 0, clock_timestamp()
     FROM moved_messages
     ON CONFLICT (queue_name, message_id) DO UPDATE
@@ -1114,10 +1117,10 @@ $$ LANGUAGE plpgsql;
  *
  * Returns: VOID.
  */
-CREATE OR REPLACE FUNCTION purge_dlq()
+CREATE OR REPLACE FUNCTION postgremq.purge_dlq()
 RETURNS VOID AS $$
 BEGIN
-  DELETE FROM dead_letter_queue;
+  DELETE FROM postgremq.dead_letter_queue;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1129,12 +1132,12 @@ $$ LANGUAGE plpgsql;
  *
  * Returns: VOID.
  */
-CREATE OR REPLACE FUNCTION purge_all_messages()
+CREATE OR REPLACE FUNCTION postgremq.purge_all_messages()
 RETURNS VOID AS $$
 BEGIN
-  DELETE FROM dead_letter_queue;
-  DELETE FROM queue_messages;
-  DELETE FROM messages;
+  DELETE FROM postgremq.dead_letter_queue;
+  DELETE FROM postgremq.queue_messages;
+  DELETE FROM postgremq.messages;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1152,14 +1155,14 @@ $$ LANGUAGE plpgsql;
  * Raises:
  *   Exception if messages exist for the topic.
  */
-CREATE OR REPLACE FUNCTION delete_topic(p_topic VARCHAR(255))
+CREATE OR REPLACE FUNCTION postgremq.delete_topic(p_topic VARCHAR(255))
 RETURNS VOID AS $$
 BEGIN
-  IF EXISTS (SELECT 1 FROM messages WHERE topic_name = p_topic) THEN
+  IF EXISTS (SELECT 1 FROM postgremq.messages WHERE topic_name = p_topic) THEN
     RAISE EXCEPTION 'Cannot delete topic "%" because messages exist. Clean up the topic first.', p_topic
       USING ERRCODE = 'PMQ03';
   END IF;
-  DELETE FROM topics WHERE name = p_topic;
+  DELETE FROM postgremq.topics WHERE name = p_topic;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1173,21 +1176,21 @@ $$ LANGUAGE plpgsql;
  *
  * Returns: VOID.
  */
-CREATE OR REPLACE FUNCTION delete_queue(p_queue VARCHAR(255))
+CREATE OR REPLACE FUNCTION postgremq.delete_queue(p_queue VARCHAR(255))
 RETURNS VOID AS $$
 DECLARE
   v_dlq_count INT;
 BEGIN
   -- Refuse if the queue has DLQ entries. Same reasoning as clean_up_topic:
   -- forensic data the operator may want to keep. Force an explicit
-  -- decision (purge_dlq() or requeue_dlq_messages()) before deletion.
+  -- decision (postgremq.purge_dlq() or postgremq.requeue_dlq_messages()) before deletion.
   SELECT count(*) INTO v_dlq_count
-  FROM dead_letter_queue WHERE queue_name = p_queue;
+  FROM postgremq.dead_letter_queue WHERE queue_name = p_queue;
   IF v_dlq_count > 0 THEN
-    RAISE EXCEPTION 'Cannot delete queue "%": % messages are in the dead letter queue. Use requeue_dlq_messages() or purge_dlq() first.', p_queue, v_dlq_count
+    RAISE EXCEPTION 'Cannot delete queue "%": % messages are in the dead letter queue. Use postgremq.requeue_dlq_messages() or postgremq.purge_dlq() first.', p_queue, v_dlq_count
       USING ERRCODE = 'PMQ03';
   END IF;
-  DELETE FROM queues WHERE name = p_queue;
+  DELETE FROM postgremq.queues WHERE name = p_queue;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1202,10 +1205,10 @@ $$ LANGUAGE plpgsql;
  *
  * Returns: VOID.
  */
-CREATE OR REPLACE FUNCTION delete_queue_message(p_queue_name VARCHAR(255), p_message_id BIGINT)
+CREATE OR REPLACE FUNCTION postgremq.delete_queue_message(p_queue_name VARCHAR(255), p_message_id BIGINT)
 RETURNS VOID AS $$
 BEGIN
-  DELETE FROM queue_messages
+  DELETE FROM postgremq.queue_messages
   WHERE queue_name = p_queue_name
     AND message_id = p_message_id;
 END;
@@ -1221,10 +1224,10 @@ $$ LANGUAGE plpgsql;
  *
  * Returns: VOID.
  */
-CREATE OR REPLACE FUNCTION clean_up_queue(p_queue VARCHAR(255))
+CREATE OR REPLACE FUNCTION postgremq.clean_up_queue(p_queue VARCHAR(255))
 RETURNS VOID AS $$
 BEGIN
-  DELETE FROM queue_messages WHERE queue_name = p_queue;
+  DELETE FROM postgremq.queue_messages WHERE queue_name = p_queue;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1238,23 +1241,23 @@ $$ LANGUAGE plpgsql;
  *
  * Returns: VOID.
  */
-CREATE OR REPLACE FUNCTION clean_up_topic(p_topic VARCHAR(255))
+CREATE OR REPLACE FUNCTION postgremq.clean_up_topic(p_topic VARCHAR(255))
 RETURNS VOID AS $$
 DECLARE
   v_dlq_count INT;
 BEGIN
   -- Refuse if any messages of this topic are in a DLQ — those entries
   -- are forensic data the operator may want to keep. Force an explicit
-  -- decision (purge_dlq() or requeue_dlq_messages()) before clean_up.
+  -- decision (postgremq.purge_dlq() or postgremq.requeue_dlq_messages()) before clean_up.
   SELECT count(*) INTO v_dlq_count
-  FROM dead_letter_queue dlq
-  JOIN messages m ON m.id = dlq.message_id
+  FROM postgremq.dead_letter_queue dlq
+  JOIN postgremq.messages m ON m.id = dlq.message_id
   WHERE m.topic_name = p_topic;
   IF v_dlq_count > 0 THEN
-    RAISE EXCEPTION 'Cannot clean up topic "%": % messages are in the dead letter queue. Use requeue_dlq_messages() or purge_dlq() first.', p_topic, v_dlq_count
+    RAISE EXCEPTION 'Cannot clean up topic "%": % messages are in the dead letter queue. Use postgremq.requeue_dlq_messages() or postgremq.purge_dlq() first.', p_topic, v_dlq_count
       USING ERRCODE = 'PMQ03';
   END IF;
-  DELETE FROM messages WHERE topic_name = p_topic;
+  DELETE FROM postgremq.messages WHERE topic_name = p_topic;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1266,18 +1269,18 @@ $$ LANGUAGE plpgsql;
  *
  * Returns: VOID.
  */
-CREATE OR REPLACE FUNCTION delete_inactive_queues()
+CREATE OR REPLACE FUNCTION postgremq.delete_inactive_queues()
 RETURNS VOID AS $$
 BEGIN
   -- See pmq_maintenance_fast: skip queues with DLQ entries; the FK
   -- is ON DELETE RESTRICT and the operator should explicitly handle
   -- DLQ before dropping the queue.
-  DELETE FROM queues q
+  DELETE FROM postgremq.queues q
   WHERE q.exclusive = true  -- Changed from durable = false
     -- Strict expiry, no grace window — see pmq_maintenance_fast.
     AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= clock_timestamp())
     AND NOT EXISTS (
-        SELECT 1 FROM dead_letter_queue dlq WHERE dlq.queue_name = q.name
+        SELECT 1 FROM postgremq.dead_letter_queue dlq WHERE dlq.queue_name = q.name
     );
 END;
 $$ LANGUAGE plpgsql;
@@ -1291,13 +1294,13 @@ $$ LANGUAGE plpgsql;
  * the known lease budget. Omitted rows have lost ownership or expired.
  * NOWAIT prevents one contended row from delaying unrelated renewals.
  */
-CREATE OR REPLACE FUNCTION set_vt_batch_multi(
+CREATE OR REPLACE FUNCTION postgremq.set_vt_batch_multi(
     p_queue_names     VARCHAR[],
     p_message_ids     BIGINT[],
     p_consumer_tokens VARCHAR[],
     p_vts             INTEGER[]
 ) RETURNS TABLE (queue_name VARCHAR, message_id BIGINT, vt TIMESTAMPTZ, consumer_token VARCHAR, outcome TEXT) AS $$
-DECLARE r RECORD; owned queue_messages%ROWTYPE;
+DECLARE r RECORD; owned postgremq.queue_messages%ROWTYPE;
 BEGIN
     IF cardinality(p_queue_names) IS DISTINCT FROM cardinality(p_message_ids)
        OR cardinality(p_message_ids) IS DISTINCT FROM cardinality(p_consumer_tokens)
@@ -1308,11 +1311,11 @@ BEGIN
     FOR r IN SELECT * FROM unnest(p_queue_names, p_message_ids, p_consumer_tokens, p_vts)
         AS t(qname, id, token, seconds) ORDER BY qname, id LOOP
         BEGIN
-            SELECT qm.* INTO owned FROM queue_messages qm
+            SELECT qm.* INTO owned FROM postgremq.queue_messages qm
             WHERE qm.queue_name = r.qname AND qm.message_id = r.id FOR UPDATE NOWAIT;
             IF FOUND AND owned.status = 'processing' AND owned.consumer_token = r.token
                AND owned.vt > clock_timestamp() THEN
-                UPDATE queue_messages qm SET vt = clock_timestamp() + make_interval(secs => r.seconds)
+                UPDATE postgremq.queue_messages qm SET vt = clock_timestamp() + make_interval(secs => r.seconds)
                 WHERE qm.queue_name = r.qname AND qm.message_id = r.id RETURNING qm.vt INTO owned.vt;
                 RETURN QUERY SELECT r.qname, r.id, owned.vt, r.token, 'extended'::TEXT;
             END IF;
@@ -1334,7 +1337,7 @@ $$ LANGUAGE plpgsql;
  * Returns:
  *   A TABLE with message details (excluding payload).
  */
-CREATE OR REPLACE FUNCTION list_messages(p_queue_name VARCHAR(255))
+CREATE OR REPLACE FUNCTION postgremq.list_messages(p_queue_name VARCHAR(255))
 RETURNS TABLE(
     message_id BIGINT,
     status VARCHAR(16),
@@ -1352,7 +1355,7 @@ BEGIN
         qm.delivery_attempts,
         qm.vt,
         qm.processed_at
-    FROM queue_messages qm
+    FROM postgremq.queue_messages qm
     WHERE qm.queue_name = p_queue_name
     ORDER BY qm.published_at;
 END;
@@ -1369,7 +1372,7 @@ $$ LANGUAGE plpgsql;
  * Returns:
  *   A TABLE with message details and payload.
  */
-CREATE OR REPLACE FUNCTION get_message(p_message_id BIGINT)
+CREATE OR REPLACE FUNCTION postgremq.get_message(p_message_id BIGINT)
 RETURNS TABLE(
     message_id BIGINT,
     topic_name VARCHAR(255),
@@ -1383,7 +1386,7 @@ BEGIN
         m.topic_name,
         m.payload,
         m.published_at
-    FROM messages m
+    FROM postgremq.messages m
     WHERE m.id = p_message_id;
 END;
 $$ LANGUAGE plpgsql;
@@ -1402,14 +1405,14 @@ $$ LANGUAGE plpgsql;
  * Returns:
  *   TIMESTAMPTZ indicating when the next message will be visible, or NULL if no messages.
  */
-CREATE OR REPLACE FUNCTION get_next_visible_time(p_queue_name VARCHAR(255))
+CREATE OR REPLACE FUNCTION postgremq.get_next_visible_time(p_queue_name VARCHAR(255))
 RETURNS TIMESTAMPTZ AS $$
 DECLARE
     v_next_vt TIMESTAMPTZ;
 BEGIN
     SELECT qm.vt INTO v_next_vt
-    FROM queue_messages qm
-    JOIN queues q ON q.name = qm.queue_name
+    FROM postgremq.queue_messages qm
+    JOIN postgremq.queues q ON q.name = qm.queue_name
     WHERE qm.queue_name = p_queue_name
       AND (qm.status = 'pending' OR qm.status = 'processing')
       AND (q.max_delivery_attempts = 0 OR qm.delivery_attempts < q.max_delivery_attempts)
@@ -1436,19 +1439,19 @@ $$ LANGUAGE plpgsql;
  *
  * Example:
  *   -- Delete messages completed more than 24 hours ago
- *   SELECT cleanup_completed_messages();
+ *   SELECT postgremq.cleanup_completed_messages();
  *
  *   -- Delete messages completed more than 7 days ago
- *   SELECT cleanup_completed_messages(168);
+ *   SELECT postgremq.cleanup_completed_messages(168);
  */
 -- Reference indexes make payload collection independent of queue count.
-CREATE INDEX idx_queue_messages_message_id ON queue_messages(message_id);
-CREATE INDEX idx_dlq_message_id ON dead_letter_queue(message_id);
-CREATE INDEX idx_messages_retention ON messages(published_at, id);
+CREATE INDEX idx_queue_messages_message_id ON postgremq.queue_messages(message_id);
+CREATE INDEX idx_dlq_message_id ON postgremq.dead_letter_queue(message_id);
+CREATE INDEX idx_messages_retention ON postgremq.messages(published_at, id);
 
 -- Run regularly, including when there are no completed deliveries (unrouted
 -- publications and queue/DLQ deletion also leave unreferenced payloads).
-CREATE OR REPLACE FUNCTION cleanup_unreferenced_messages(p_older_than_hours INT DEFAULT 24, p_batch_size INT DEFAULT 1000)
+CREATE OR REPLACE FUNCTION postgremq.cleanup_unreferenced_messages(p_older_than_hours INT DEFAULT 24, p_batch_size INT DEFAULT 1000)
 RETURNS INT AS $$
 DECLARE deleted INT;
 BEGIN
@@ -1456,18 +1459,18 @@ BEGIN
         RAISE EXCEPTION 'invalid retention or batch size' USING ERRCODE = 'PMQ03';
     END IF;
     WITH candidates AS (
-        SELECT m.id FROM messages m
+        SELECT m.id FROM postgremq.messages m
         WHERE m.published_at < clock_timestamp() - make_interval(hours => p_older_than_hours)
-          AND NOT EXISTS (SELECT 1 FROM queue_messages qm WHERE qm.message_id = m.id)
-          AND NOT EXISTS (SELECT 1 FROM dead_letter_queue d WHERE d.message_id = m.id)
+          AND NOT EXISTS (SELECT 1 FROM postgremq.queue_messages qm WHERE qm.message_id = m.id)
+          AND NOT EXISTS (SELECT 1 FROM postgremq.dead_letter_queue d WHERE d.message_id = m.id)
         ORDER BY m.published_at, m.id LIMIT p_batch_size FOR UPDATE SKIP LOCKED
-    ) DELETE FROM messages m USING candidates c WHERE m.id = c.id;
+    ) DELETE FROM postgremq.messages m USING candidates c WHERE m.id = c.id;
     GET DIAGNOSTICS deleted = ROW_COUNT;
     RETURN deleted;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION cleanup_completed_messages(p_older_than_hours INT DEFAULT 24, p_batch_size INT DEFAULT 1000)
+CREATE OR REPLACE FUNCTION postgremq.cleanup_completed_messages(p_older_than_hours INT DEFAULT 24, p_batch_size INT DEFAULT 1000)
 RETURNS INT AS $$
 DECLARE deleted INT;
 BEGIN
@@ -1475,14 +1478,14 @@ BEGIN
         RAISE EXCEPTION 'invalid retention or batch size' USING ERRCODE = 'PMQ03';
     END IF;
     WITH candidates AS (
-        SELECT qm.queue_name, qm.message_id FROM queue_messages qm
+        SELECT qm.queue_name, qm.message_id FROM postgremq.queue_messages qm
         WHERE qm.status = 'completed'
           AND qm.processed_at < clock_timestamp() - make_interval(hours => p_older_than_hours)
         ORDER BY qm.processed_at LIMIT p_batch_size FOR UPDATE SKIP LOCKED
-    ) DELETE FROM queue_messages qm USING candidates c
+    ) DELETE FROM postgremq.queue_messages qm USING candidates c
       WHERE qm.queue_name = c.queue_name AND qm.message_id = c.message_id;
     GET DIAGNOSTICS deleted = ROW_COUNT;
-    PERFORM cleanup_unreferenced_messages(p_older_than_hours, p_batch_size);
+    PERFORM postgremq.cleanup_unreferenced_messages(p_older_than_hours, p_batch_size);
     RETURN deleted;
 END;
 $$ LANGUAGE plpgsql;

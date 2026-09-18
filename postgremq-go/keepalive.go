@@ -147,7 +147,7 @@ func (c *Connection) extendKeepAliveLeases(ctx context.Context, names []string, 
 	leases := make(map[string]kaLease)
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		clear(leases)
-		rows, err := c.pool.Query(ctx, "SELECT queue_name, keep_alive_until, outcome FROM extend_queue_keep_alive_multi($1, $2, $3)", names, intervalsMs, generations)
+		rows, err := c.pool.Query(ctx, "SELECT queue_name, keep_alive_until, outcome FROM postgremq.extend_queue_keep_alive_multi($1, $2, $3)", names, intervalsMs, generations)
 		if err != nil {
 			return mapPgError(err)
 		}

@@ -2,6 +2,8 @@
 
 Go client library for PostgreMQ - a message queue system built on PostgreSQL.
 
+Install [the SQL schema](../mq/README.md) in the same database as the application. Queue objects use the fixed `postgremq` schema; client calls preserve your application's `search_path`. Pass the application transaction to `PublishWithTx` and `AckWithTx` for atomic application and queue writes.
+
 ## Testing Approach
 
 The test suite uses a robust approach designed for reliable parallel test execution:

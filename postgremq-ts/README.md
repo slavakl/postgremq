@@ -2,6 +2,8 @@
 
 A TypeScript client for PostgreMQ - a message queue system built on top of PostgreSQL.
 
+Install [the SQL schema](../mq/README.md) in the same database as the application. Queue objects use the fixed `postgremq` schema; client calls preserve your application's `search_path`. Pass the application transaction to `publishWithTransaction` and `ackWithTransaction` for atomic application and queue writes.
+
 ## Features
 
 - Simple, promise-based API for publishing and consuming messages

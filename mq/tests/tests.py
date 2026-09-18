@@ -82,11 +82,7 @@ def conn(test_db: str, db_config: dict[str, str]) -> Generator[psycopg2.extensio
     with conn.cursor() as cur:
         # First drop existing objects if they exist
         cur.execute("""
-            DROP TABLE IF EXISTS dead_letter_queue CASCADE;
-            DROP TABLE IF EXISTS queue_messages CASCADE;
-            DROP TABLE IF EXISTS queues CASCADE;
-            DROP TABLE IF EXISTS messages CASCADE;
-            DROP TABLE IF EXISTS topics CASCADE;
+            DROP SCHEMA IF EXISTS postgremq CASCADE;
         """)
         
         # Load MQ implementation
@@ -106,19 +102,19 @@ def cur(conn: psycopg2.extensions.connection) -> Generator[psycopg2.extensions.c
 def test_topic_and_queue_creation(cur: psycopg2.extensions.cursor) -> None:
     """Test basic topic and queue creation functionality."""
     cur.execute("""
-        SELECT create_topic('TestTopic');
-        SELECT create_queue('TestQueue', 'TestTopic', 3, false);
-        SELECT create_queue('TestQueue_Ex', 'TestTopic', 2, true, interval '300 seconds');
+        SELECT postgremq.create_topic('TestTopic');
+        SELECT postgremq.create_queue('TestQueue', 'TestTopic', 3, false);
+        SELECT postgremq.create_queue('TestQueue_Ex', 'TestTopic', 2, true, interval '300 seconds');
     """)
     
     # Verify queues were created
-    cur.execute("SELECT count(*) FROM queues WHERE topic_name = 'TestTopic'")
+    cur.execute("SELECT count(*) FROM postgremq.queues WHERE topic_name = 'TestTopic'")
     assert cur.fetchone()[0] == 2
 
     # Verify keep-alive for exclusive queue
     cur.execute("""
         SELECT keep_alive_until 
-        FROM queues 
+        FROM postgremq.queues
         WHERE name = 'TestQueue_Ex'
     """)
     keep_alive = cur.fetchone()[0]
@@ -127,39 +123,39 @@ def test_topic_and_queue_creation(cur: psycopg2.extensions.cursor) -> None:
     assert keep_alive < now + timedelta(minutes=6)
 
     cur.execute("""
-        SELECT * FROM consume_message('TestQueue', 30)
+        SELECT * FROM postgremq.consume_message('TestQueue', 30)
     """)
 
 def test_queue_messages_status_check_constraint(cur: psycopg2.extensions.cursor) -> None:
     """A typo'd status must be rejected by the CHECK constraint rather than
     silently stranding the row in a state no query matches."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('Q', 'TestTopic', 0, false)")
-    cur.execute("SELECT publish_message('TestTopic', '{}'::jsonb)")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('Q', 'TestTopic', 0, false)")
+    cur.execute("SELECT postgremq.publish_message('TestTopic', '{}'::jsonb)")
     with pytest.raises(psycopg2.errors.CheckViolation):
-        cur.execute("UPDATE queue_messages SET status = 'Processing'")  # capital P typo
+        cur.execute("UPDATE postgremq.queue_messages SET status = 'Processing'")  # capital P typo
 
 def test_fk_columns_not_null(cur: psycopg2.extensions.cursor) -> None:
     """queues.topic_name and messages.topic_name are NOT NULL (defense against
     direct-table writes that bypass the create_* functions)."""
     cur.execute("""
         SELECT is_nullable FROM information_schema.columns
-        WHERE table_name = 'queues' AND column_name = 'topic_name'
+        WHERE table_schema = 'postgremq' AND table_name = 'queues' AND column_name = 'topic_name'
     """)
     assert cur.fetchone()[0] == 'NO'
     cur.execute("""
         SELECT is_nullable FROM information_schema.columns
-        WHERE table_name = 'messages' AND column_name = 'topic_name'
+        WHERE table_schema = 'postgremq' AND table_name = 'messages' AND column_name = 'topic_name'
     """)
     assert cur.fetchone()[0] == 'NO'
 
 def test_consumer_token_is_uuid(cur: psycopg2.extensions.cursor) -> None:
     """consume_message now mints consumer tokens with gen_random_uuid(); the
     token should parse as a UUID (no more timestamp+random()+txid hack)."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('Q', 'TestTopic', 0, false)")
-    cur.execute("SELECT publish_message('TestTopic', '{}'::jsonb)")
-    cur.execute("SELECT consumer_token FROM consume_message('Q', 30, 1)")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('Q', 'TestTopic', 0, false)")
+    cur.execute("SELECT postgremq.publish_message('TestTopic', '{}'::jsonb)")
+    cur.execute("SELECT consumer_token FROM postgremq.consume_message('Q', 30, 1)")
     token = cur.fetchone()[0]
     # Raises ValueError if not a valid UUID.
     uuid.UUID(token)
@@ -171,33 +167,33 @@ def test_consume_missing_queue_raises_pmq02(cur: psycopg2.extensions.cursor) -> 
     return zero rows with no error (the common idle case)."""
     # Missing queue → PMQ02.
     with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT * FROM consume_message('NoSuchQueue', 30, 1)")
+        cur.execute("SELECT * FROM postgremq.consume_message('NoSuchQueue', 30, 1)")
     assert exc_info.value.pgcode == 'PMQ02', \
         f"expected PMQ02, got {exc_info.value.pgcode}: {exc_info.value}"
     cur.connection.rollback()
 
     # Existing but empty queue → zero rows, no error.
-    cur.execute("SELECT create_topic('EmptyTopic')")
-    cur.execute("SELECT create_queue('EmptyQueue', 'EmptyTopic', 0, false)")
-    cur.execute("SELECT * FROM consume_message('EmptyQueue', 30, 1)")
+    cur.execute("SELECT postgremq.create_topic('EmptyTopic')")
+    cur.execute("SELECT postgremq.create_queue('EmptyQueue', 'EmptyTopic', 0, false)")
+    cur.execute("SELECT * FROM postgremq.consume_message('EmptyQueue', 30, 1)")
     assert cur.fetchall() == []
 
 def test_consume_skips_redundant_keep_alive_write(cur: psycopg2.extensions.cursor) -> None:
     """Back-to-back consumes on an exclusive queue should NOT rewrite
     keep_alive_until every time — only once the deadline drifts past the
     half-interval point. Avoids dead-tuple churn on the hot queues row."""
-    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
     # Long interval so a second consume stays well inside the half-interval window.
-    cur.execute("SELECT create_queue('ExQ', 'TestTopic', 0, true, interval '1 hour')")
-    cur.execute("SELECT publish_message('TestTopic', '{}'::jsonb)")
-    cur.execute("SELECT publish_message('TestTopic', '{}'::jsonb)")
+    cur.execute("SELECT postgremq.create_queue('ExQ', 'TestTopic', 0, true, interval '1 hour')")
+    cur.execute("SELECT postgremq.publish_message('TestTopic', '{}'::jsonb)")
+    cur.execute("SELECT postgremq.publish_message('TestTopic', '{}'::jsonb)")
 
-    cur.execute("SELECT consume_message('ExQ', 30, 1)")
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExQ'")
+    cur.execute("SELECT postgremq.consume_message('ExQ', 30, 1)")
+    cur.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'ExQ'")
     first = cur.fetchone()[0]
 
-    cur.execute("SELECT consume_message('ExQ', 30, 1)")
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExQ'")
+    cur.execute("SELECT postgremq.consume_message('ExQ', 30, 1)")
+    cur.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'ExQ'")
     second = cur.fetchone()[0]
 
     assert first == second, "second consume should not have rewritten keep_alive_until"
@@ -207,19 +203,19 @@ def test_maintenance_reaps_expired_exclusive_queue_no_grace(cur: psycopg2.extens
     there is NO grace window (the reaper uses keep_alive_until > NOW()). A queue
     whose deadline is still in the future survives. (Commit 3b1788d removed the
     former 5s grace; clients must send keep-alive before expiry.)"""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('JustExpired', 'TestTopic', 0, true, interval '60 seconds')")
-    cur.execute("SELECT create_queue('StillAlive', 'TestTopic', 0, true, interval '60 seconds')")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('JustExpired', 'TestTopic', 0, true, interval '60 seconds')")
+    cur.execute("SELECT postgremq.create_queue('StillAlive', 'TestTopic', 0, true, interval '60 seconds')")
 
     # JustExpired: 2s past deadline (no grace → reaped). StillAlive: 60s out.
-    cur.execute("UPDATE queues SET keep_alive_until = NOW() - INTERVAL '2 seconds' WHERE name = 'JustExpired'")
-    cur.execute("UPDATE queues SET keep_alive_until = NOW() + INTERVAL '60 seconds' WHERE name = 'StillAlive'")
+    cur.execute("UPDATE postgremq.queues SET keep_alive_until = NOW() - INTERVAL '2 seconds' WHERE name = 'JustExpired'")
+    cur.execute("UPDATE postgremq.queues SET keep_alive_until = NOW() + INTERVAL '60 seconds' WHERE name = 'StillAlive'")
 
-    cur.execute("SELECT pmq_maintenance_fast()")
+    cur.execute("SELECT postgremq.pmq_maintenance_fast()")
 
-    cur.execute("SELECT count(*) FROM queues WHERE name = 'JustExpired'")
+    cur.execute("SELECT count(*) FROM postgremq.queues WHERE name = 'JustExpired'")
     assert cur.fetchone()[0] == 0, "a queue past keep_alive_until must be reaped (no grace)"
-    cur.execute("SELECT count(*) FROM queues WHERE name = 'StillAlive'")
+    cur.execute("SELECT count(*) FROM postgremq.queues WHERE name = 'StillAlive'")
     assert cur.fetchone()[0] == 1, "a queue whose deadline is still in the future must survive"
 
 def test_create_queue_idempotent_and_strict(cur: psycopg2.extensions.cursor) -> None:
@@ -227,27 +223,27 @@ def test_create_queue_idempotent_and_strict(cur: psycopg2.extensions.cursor) -> 
     re-creating with identical parameters is a no-op success; re-creating
     with any parameter different raises PMQ03 so accidental config drift
     surfaces loudly."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_topic('OtherTopic')")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_topic('OtherTopic')")
 
     # 1. Identical exclusive params → both calls succeed (no error).
-    cur.execute("SELECT create_queue('ExQueue', 'TestTopic', 2, true, interval '300 seconds')")
-    cur.execute("SELECT create_queue('ExQueue', 'TestTopic', 2, true, interval '300 seconds')")
+    cur.execute("SELECT postgremq.create_queue('ExQueue', 'TestTopic', 2, true, interval '300 seconds')")
+    cur.execute("SELECT postgremq.create_queue('ExQueue', 'TestTopic', 2, true, interval '300 seconds')")
 
     # 2. Identical non-exclusive params → idempotent.
-    cur.execute("SELECT create_queue('NxQueue', 'TestTopic', 2, false)")
-    cur.execute("SELECT create_queue('NxQueue', 'TestTopic', 2, false)")
+    cur.execute("SELECT postgremq.create_queue('NxQueue', 'TestTopic', 2, false)")
+    cur.execute("SELECT postgremq.create_queue('NxQueue', 'TestTopic', 2, false)")
 
     # 3. Param mismatches each raise PMQ03 with the existing values surfaced.
     mismatches = [
         # Different topic
-        "SELECT create_queue('ExQueue', 'OtherTopic', 2, true, interval '300 seconds')",
+        "SELECT postgremq.create_queue('ExQueue', 'OtherTopic', 2, true, interval '300 seconds')",
         # Different max_delivery_attempts
-        "SELECT create_queue('ExQueue', 'TestTopic', 5, true, interval '300 seconds')",
+        "SELECT postgremq.create_queue('ExQueue', 'TestTopic', 5, true, interval '300 seconds')",
         # Different exclusive flag
-        "SELECT create_queue('ExQueue', 'TestTopic', 2, false, interval '300 seconds')",
+        "SELECT postgremq.create_queue('ExQueue', 'TestTopic', 2, false, interval '300 seconds')",
         # Different keep_alive_interval
-        "SELECT create_queue('ExQueue', 'TestTopic', 2, true, interval '60 seconds')",
+        "SELECT postgremq.create_queue('ExQueue', 'TestTopic', 2, true, interval '60 seconds')",
     ]
     for stmt in mismatches:
         with pytest.raises(psycopg2.Error) as exc_info:
@@ -258,39 +254,39 @@ def test_create_queue_idempotent_and_strict(cur: psycopg2.extensions.cursor) -> 
         cur.connection.rollback()
 
 def test_expired_queue_cannot_be_revived(cur):
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('Revive', 'TestTopic', 0, true, interval '60 seconds')")
-    cur.execute("UPDATE queues SET keep_alive_until = clock_timestamp() - interval '1 hour' WHERE name = 'Revive'")
-    for statement in ["SELECT create_queue('Revive', 'TestTopic', 0, true, interval '60 seconds')", "SELECT consume_message('Revive', 30, 1)"]:
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('Revive', 'TestTopic', 0, true, interval '60 seconds')")
+    cur.execute("UPDATE postgremq.queues SET keep_alive_until = clock_timestamp() - interval '1 hour' WHERE name = 'Revive'")
+    for statement in ["SELECT postgremq.create_queue('Revive', 'TestTopic', 0, true, interval '60 seconds')", "SELECT postgremq.consume_message('Revive', 30, 1)"]:
         with pytest.raises(psycopg2.Error) as error:
             cur.execute(statement)
         assert error.value.pgcode == 'PMQ02'
-    cur.execute("SELECT * FROM extend_queue_keep_alive_multi(ARRAY['Revive']::varchar[], ARRAY[60000]::bigint[])")
+    cur.execute("SELECT * FROM postgremq.extend_queue_keep_alive_multi(ARRAY['Revive']::varchar[], ARRAY[60000]::bigint[])")
     assert cur.fetchall() == []
-    cur.execute("SELECT delete_queue('Revive')")
-    cur.execute("SELECT create_queue('Revive', 'TestTopic', 0, true, interval '60 seconds')")
-    cur.execute("SELECT keep_alive_until > clock_timestamp() FROM queues WHERE name='Revive'")
+    cur.execute("SELECT postgremq.delete_queue('Revive')")
+    cur.execute("SELECT postgremq.create_queue('Revive', 'TestTopic', 0, true, interval '60 seconds')")
+    cur.execute("SELECT keep_alive_until > clock_timestamp() FROM postgremq.queues WHERE name='Revive'")
     assert cur.fetchone()[0]
 
 def test_create_queue_idempotent_does_not_touch_nonexclusive(cur: psycopg2.extensions.cursor) -> None:
     """The keep_alive_until refresh in the idempotent path is gated on
     p_exclusive; non-exclusive queues' keep_alive_until stays NULL across
     re-creates."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('Plain', 'TestTopic', 0, false)")
-    cur.execute("SELECT create_queue('Plain', 'TestTopic', 0, false)")
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'Plain'")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('Plain', 'TestTopic', 0, false)")
+    cur.execute("SELECT postgremq.create_queue('Plain', 'TestTopic', 0, false)")
+    cur.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'Plain'")
     assert cur.fetchone()[0] is None
 
 def test_create_queue_rejects_negative_max_attempts(cur: psycopg2.extensions.cursor) -> None:
     """create_queue must reject p_max_attempts < 0 with PMQ03. A negative
-    value silently breaks consume_message (the filter
+    value silently breaks postgremq.consume_message (the filter
     qm.delivery_attempts < tq.max_delivery_attempts becomes never-true once
     delivery_attempts climbs past the negative threshold) and skips DLQ
     retirement (nack_message + pmq_maintenance_fast both gate on > 0)."""
-    cur.execute("SELECT create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
     with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT create_queue('Bad', 'TestTopic', -1, false)")
+        cur.execute("SELECT postgremq.create_queue('Bad', 'TestTopic', -1, false)")
     assert exc_info.value.pgcode == 'PMQ03'
     assert "must be >= 0" in str(exc_info.value)
 
@@ -299,7 +295,7 @@ def test_create_queue_missing_topic_raises_pmq02(cur: psycopg2.extensions.cursor
     referenced topic doesn't exist, so the client can map it to its
     QueueNotFoundError sentinel — same shape as publish_message."""
     with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT create_queue('Q', 'NoSuchTopic', 0, false)")
+        cur.execute("SELECT postgremq.create_queue('Q', 'NoSuchTopic', 0, false)")
     assert exc_info.value.pgcode == 'PMQ02', \
         f"expected PMQ02, got {exc_info.value.pgcode}: {exc_info.value}"
     assert "does not exist" in str(exc_info.value)
@@ -308,28 +304,28 @@ def test_unlimited_delivery_attempts(cur: psycopg2.extensions.cursor) -> None:
     """Test queue with unlimited delivery attempts (max_delivery_attempts = 0)."""
     # Setup
     cur.execute("""
-        SELECT create_topic('UnlimitedTopic');
-        SELECT create_queue('UnlimitedQueue', 'UnlimitedTopic', 0, false);
-        SELECT publish_message('UnlimitedTopic', '{"test": "unlimited"}'::jsonb);
+        SELECT postgremq.create_topic('UnlimitedTopic');
+        SELECT postgremq.create_queue('UnlimitedQueue', 'UnlimitedTopic', 0, false);
+        SELECT postgremq.publish_message('UnlimitedTopic', '{"test": "unlimited"}'::jsonb);
     """)
 
     # Try multiple delivery attempts
     for i in range(5):
         cur.execute("""
             SELECT message_id, consumer_token, delivery_attempts
-            FROM consume_message('UnlimitedQueue', 60, 1)
+            FROM postgremq.consume_message('UnlimitedQueue', 60, 1)
         """)
         msg_id, token, attempts = cur.fetchone()
         assert msg_id is not None, f"Message should be available for consumption on attempt {i+1}"
         assert attempts == i + 1, f"Delivery attempts should be {i+1}"
         
-        cur.execute("SELECT nack_message('UnlimitedQueue', %s, %s)", (msg_id, token))
+        cur.execute("SELECT postgremq.nack_message('UnlimitedQueue', %s, %s)", (msg_id, token))
 
     # Verify message wasn't moved to DLQ
     cur.execute("""
-        SELECT * FROM pmq_maintenance_fast();
+        SELECT * FROM postgremq.pmq_maintenance_fast();
         SELECT count(*)
-        FROM dead_letter_queue dlq
+        FROM postgremq.dead_letter_queue dlq
         WHERE dlq.queue_name = 'UnlimitedQueue';
     """)
     assert cur.fetchone()[0] == 0
@@ -337,11 +333,11 @@ def test_unlimited_delivery_attempts(cur: psycopg2.extensions.cursor) -> None:
 def test_default_keep_alive_for_exclusive_queue(cur: psycopg2.extensions.cursor) -> None:
     """Test that exclusive queues get the default 5-minute keep-alive."""
     cur.execute("""
-        SELECT create_topic('TestTopic');
-        SELECT create_queue('ExQueue', 'TestTopic', 2, true);
+        SELECT postgremq.create_topic('TestTopic');
+        SELECT postgremq.create_queue('ExQueue', 'TestTopic', 2, true);
     """)
 
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExQueue'")
+    cur.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'ExQueue'")
     keep_alive = cur.fetchone()[0]
     now = datetime.now(pytz.UTC)
     assert keep_alive > now + timedelta(minutes=4, seconds=55)
@@ -354,7 +350,7 @@ def test_queues_table_keep_alive_column_default(cur: psycopg2.extensions.cursor)
     cur.execute("""
         SELECT column_default
         FROM information_schema.columns
-        WHERE table_name = 'queues' AND column_name = 'keep_alive_interval'
+        WHERE table_schema = 'postgremq' AND table_name = 'queues' AND column_name = 'keep_alive_interval'
     """)
     column_default = cur.fetchone()[0]
     assert "00:05:00" in column_default or "5 minutes" in column_default, (
@@ -364,11 +360,11 @@ def test_queues_table_keep_alive_column_default(cur: psycopg2.extensions.cursor)
 def test_non_exclusive_queue_keep_alive_ignored(cur: psycopg2.extensions.cursor) -> None:
     """Test that keep_alive is ignored for non-exclusive queues."""
     cur.execute("""
-        SELECT create_topic('TestTopic');
-        SELECT create_queue('NonExQueue', 'TestTopic', 2, false, interval '300 seconds');
+        SELECT postgremq.create_topic('TestTopic');
+        SELECT postgremq.create_queue('NonExQueue', 'TestTopic', 2, false, interval '300 seconds');
     """)
 
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'NonExQueue'")
+    cur.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'NonExQueue'")
     assert cur.fetchone()[0] is None
 
 def test_consume_does_not_own_queue_lease(cur: psycopg2.extensions.cursor) -> None:
@@ -377,49 +373,49 @@ def test_consume_does_not_own_queue_lease(cur: psycopg2.extensions.cursor) -> No
     polling consumer cannot have its queue GC'd. (It deliberately SKIPS the
     write while the deadline is still in the first half — see
     test_consume_skips_redundant_keep_alive_write.)"""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('ExActive', 'TestTopic', 0, true, interval '60 seconds')")
-    cur.execute("SELECT publish_message('TestTopic', '{\"x\": 1}'::jsonb)")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('ExActive', 'TestTopic', 0, true, interval '60 seconds')")
+    cur.execute("SELECT postgremq.publish_message('TestTopic', '{\"x\": 1}'::jsonb)")
 
     # Force the deadline into the second half of the interval (10s of 60s left)
     # so the next consume's refresh predicate fires.
-    cur.execute("UPDATE queues SET keep_alive_until = NOW() + INTERVAL '10 seconds' WHERE name = 'ExActive'")
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExActive'")
+    cur.execute("UPDATE postgremq.queues SET keep_alive_until = NOW() + INTERVAL '10 seconds' WHERE name = 'ExActive'")
+    cur.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'ExActive'")
     before = cur.fetchone()[0]
 
-    cur.execute("SELECT consume_message('ExActive', 30, 1)")
+    cur.execute("SELECT postgremq.consume_message('ExActive', 30, 1)")
 
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExActive'")
+    cur.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'ExActive'")
     after = cur.fetchone()[0]
     assert after == before, "only keep-alive owns queue lifetime; polling must not lock the queue row"
 
 def test_consume_does_not_touch_keep_alive_for_non_exclusive(cur: psycopg2.extensions.cursor) -> None:
     """Non-exclusive queues have keep_alive_until = NULL; consume must leave it alone."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('NonExActive', 'TestTopic', 0, false)")
-    cur.execute("SELECT publish_message('TestTopic', '{\"x\": 1}'::jsonb)")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('NonExActive', 'TestTopic', 0, false)")
+    cur.execute("SELECT postgremq.publish_message('TestTopic', '{\"x\": 1}'::jsonb)")
 
-    cur.execute("SELECT consume_message('NonExActive', 30, 1)")
+    cur.execute("SELECT postgremq.consume_message('NonExActive', 30, 1)")
 
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'NonExActive'")
+    cur.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'NonExActive'")
     assert cur.fetchone()[0] is None
 
 def test_consume_does_not_revive_expired_exclusive_queue(cur: psycopg2.extensions.cursor) -> None:
     """If keep_alive_until has already expired the queue is logically dead and
     consume must NOT resurrect it via the implicit refresh — otherwise an
     expired queue could survive indefinitely if a stale consumer keeps polling."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('ExExpired', 'TestTopic', 0, true, interval '60 seconds')")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('ExExpired', 'TestTopic', 0, true, interval '60 seconds')")
     # Force expiry.
-    cur.execute("UPDATE queues SET keep_alive_until = NOW() - interval '5 seconds' WHERE name = 'ExExpired'")
+    cur.execute("UPDATE postgremq.queues SET keep_alive_until = NOW() - interval '5 seconds' WHERE name = 'ExExpired'")
 
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExExpired'")
+    cur.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'ExExpired'")
     expired_at = cur.fetchone()[0]
     with pytest.raises(psycopg2.Error) as error:
-        cur.execute("SELECT consume_message('ExExpired', 30, 1)")
+        cur.execute("SELECT postgremq.consume_message('ExExpired', 30, 1)")
     assert error.value.pgcode == 'PMQ02'
 
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'ExExpired'")
+    cur.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'ExExpired'")
     after = cur.fetchone()[0]
     assert after == expired_at, "expired exclusive queue must not be revived by consume"
 
@@ -435,43 +431,43 @@ def test_pmq_maintenance_fast(cur: psycopg2.extensions.cursor) -> None:
     predicate is gated on all three conditions; merely hitting the attempt
     cap with a still-valid lease (the consumer is mid-handler) must NOT
     retire the row — see test_maintenance_fast_skips_healthy_in_flight."""
-    cur.execute("SELECT create_topic('MaintTopic')")
+    cur.execute("SELECT postgremq.create_topic('MaintTopic')")
     # Queue with max_attempts=2 so we can manufacture a crashed-final-attempt
     # row by bumping delivery_attempts past the threshold AND expiring vt
     # without going through nack — mimicking a consumer that died after
     # consuming the last allowed attempt. consume_message refuses to re-pick
     # those rows (delivery_attempts >= max), so they'd stay stuck in
     # 'processing' without this recovery path.
-    cur.execute("SELECT create_queue('MaintQueue', 'MaintTopic', 2, false)")
-    cur.execute("SELECT publish_message('MaintTopic', '{\"x\": 1}'::jsonb)")
-    cur.execute("SELECT message_id FROM consume_message('MaintQueue', 30, 1)")
+    cur.execute("SELECT postgremq.create_queue('MaintQueue', 'MaintTopic', 2, false)")
+    cur.execute("SELECT postgremq.publish_message('MaintTopic', '{\"x\": 1}'::jsonb)")
+    cur.execute("SELECT message_id FROM postgremq.consume_message('MaintQueue', 30, 1)")
     msg_id = cur.fetchone()[0]
     cur.execute(
-        """UPDATE queue_messages
+        """UPDATE postgremq.queue_messages
            SET delivery_attempts = 2, vt = NOW() - interval '1 second'
            WHERE queue_name = 'MaintQueue' AND message_id = %s""",
         (msg_id,),
     )
 
     # Expired exclusive queue (the inactive-queue branch). Past the 5s grace.
-    cur.execute("SELECT create_queue('ExpiredEx', 'MaintTopic', 0, true, interval '60 seconds')")
-    cur.execute("UPDATE queues SET keep_alive_until = NOW() - interval '10 seconds' WHERE name = 'ExpiredEx'")
+    cur.execute("SELECT postgremq.create_queue('ExpiredEx', 'MaintTopic', 0, true, interval '60 seconds')")
+    cur.execute("UPDATE postgremq.queues SET keep_alive_until = NOW() - interval '10 seconds' WHERE name = 'ExpiredEx'")
 
-    cur.execute("SELECT retired_to_dlq, inactive_queues_dropped FROM pmq_maintenance_fast()")
+    cur.execute("SELECT retired_to_dlq, inactive_queues_dropped FROM postgremq.pmq_maintenance_fast()")
     retired, dropped = cur.fetchone()
     assert retired == 1, f"retired_to_dlq should be 1, got {retired}"
     assert dropped == 1, f"inactive_queues_dropped should be 1, got {dropped}"
 
     # Idempotency: a second call has nothing to do.
-    cur.execute("SELECT retired_to_dlq, inactive_queues_dropped FROM pmq_maintenance_fast()")
+    cur.execute("SELECT retired_to_dlq, inactive_queues_dropped FROM postgremq.pmq_maintenance_fast()")
     retired2, dropped2 = cur.fetchone()
     assert retired2 == 0 and dropped2 == 0
 
     # The retired message landed in the DLQ.
-    cur.execute("SELECT message_id FROM dead_letter_queue WHERE queue_name = 'MaintQueue'")
+    cur.execute("SELECT message_id FROM postgremq.dead_letter_queue WHERE queue_name = 'MaintQueue'")
     assert cur.fetchone()[0] == msg_id
     # The expired exclusive queue is gone.
-    cur.execute("SELECT count(*) FROM queues WHERE name = 'ExpiredEx'")
+    cur.execute("SELECT count(*) FROM postgremq.queues WHERE name = 'ExpiredEx'")
     assert cur.fetchone()[0] == 0
 
 def test_maintenance_fast_skips_healthy_in_flight(cur: psycopg2.extensions.cursor) -> None:
@@ -482,15 +478,15 @@ def test_maintenance_fast_skips_healthy_in_flight(cur: psycopg2.extensions.curso
     in the DLQ — silent inconsistency between application and queue state.
 
     Reproduces the bug reported in REVIEW.md §1.2/§2.1."""
-    cur.execute("SELECT create_topic('HealthyMaintTopic')")
-    cur.execute("SELECT create_queue('HealthyMaintQueue', 'HealthyMaintTopic', 1, false)")
-    cur.execute("SELECT publish_message('HealthyMaintTopic', '{\"x\": 1}'::jsonb)")
+    cur.execute("SELECT postgremq.create_topic('HealthyMaintTopic')")
+    cur.execute("SELECT postgremq.create_queue('HealthyMaintQueue', 'HealthyMaintTopic', 1, false)")
+    cur.execute("SELECT postgremq.publish_message('HealthyMaintTopic', '{\"x\": 1}'::jsonb)")
 
     # Consume with a comfortable VT so the lease is solidly in the future.
     # max_delivery_attempts=1 so this single consume puts us at the limit.
     cur.execute("""
         SELECT message_id, consumer_token, delivery_attempts, vt
-        FROM consume_message('HealthyMaintQueue', 60, 1)
+        FROM postgremq.consume_message('HealthyMaintQueue', 60, 1)
     """)
     row = cur.fetchone()
     msg_id, token, attempts, vt = row
@@ -498,13 +494,13 @@ def test_maintenance_fast_skips_healthy_in_flight(cur: psycopg2.extensions.curso
 
     # Run maintenance: the row hits delivery_attempts >= max but the lease is
     # still valid. Must NOT be retired.
-    cur.execute("SELECT retired_to_dlq FROM pmq_maintenance_fast()")
+    cur.execute("SELECT retired_to_dlq FROM postgremq.pmq_maintenance_fast()")
     retired = cur.fetchone()[0]
     assert retired == 0, "healthy in-flight final-attempt row must not be retired"
 
     # Row is still processing, still owned by the original consumer.
     cur.execute("""
-        SELECT status, consumer_token FROM queue_messages
+        SELECT status, consumer_token FROM postgremq.queue_messages
         WHERE queue_name = 'HealthyMaintQueue' AND message_id = %s
     """, (msg_id,))
     status, current_token = cur.fetchone()
@@ -512,34 +508,34 @@ def test_maintenance_fast_skips_healthy_in_flight(cur: psycopg2.extensions.curso
     assert current_token == token, "consumer_token must be unchanged (lease still held)"
 
     # And not in DLQ.
-    cur.execute("SELECT count(*) FROM dead_letter_queue WHERE queue_name = 'HealthyMaintQueue'")
+    cur.execute("SELECT count(*) FROM postgremq.dead_letter_queue WHERE queue_name = 'HealthyMaintQueue'")
     assert cur.fetchone()[0] == 0
 
     # Consumer can still ack successfully — the original goal of the lease.
-    cur.execute("SELECT ack_message('HealthyMaintQueue', %s, %s)", (msg_id, token))
+    cur.execute("SELECT postgremq.ack_message('HealthyMaintQueue', %s, %s)", (msg_id, token))
 
 def test_maintenance_fast_retires_only_when_vt_expired(cur: psycopg2.extensions.cursor) -> None:
     """Boundary test: same setup as the healthy-in-flight test, but force vt
     into the past. Now the row IS abandoned and must be retired."""
-    cur.execute("SELECT create_topic('ExpVtTopic')")
-    cur.execute("SELECT create_queue('ExpVtQueue', 'ExpVtTopic', 1, false)")
-    cur.execute("SELECT publish_message('ExpVtTopic', '{\"x\": 1}'::jsonb)")
-    cur.execute("SELECT message_id FROM consume_message('ExpVtQueue', 60, 1)")
+    cur.execute("SELECT postgremq.create_topic('ExpVtTopic')")
+    cur.execute("SELECT postgremq.create_queue('ExpVtQueue', 'ExpVtTopic', 1, false)")
+    cur.execute("SELECT postgremq.publish_message('ExpVtTopic', '{\"x\": 1}'::jsonb)")
+    cur.execute("SELECT message_id FROM postgremq.consume_message('ExpVtQueue', 60, 1)")
     msg_id = cur.fetchone()[0]
 
     # Expire the lease — simulates "consumer crashed mid-handler".
     cur.execute(
-        "UPDATE queue_messages SET vt = NOW() - interval '1 second' "
+        "UPDATE postgremq.queue_messages SET vt = NOW() - interval '1 second' "
         "WHERE queue_name = 'ExpVtQueue' AND message_id = %s",
         (msg_id,),
     )
 
-    cur.execute("SELECT retired_to_dlq FROM pmq_maintenance_fast()")
+    cur.execute("SELECT retired_to_dlq FROM postgremq.pmq_maintenance_fast()")
     assert cur.fetchone()[0] == 1
 
-    cur.execute("SELECT count(*) FROM dead_letter_queue WHERE queue_name = 'ExpVtQueue'")
+    cur.execute("SELECT count(*) FROM postgremq.dead_letter_queue WHERE queue_name = 'ExpVtQueue'")
     assert cur.fetchone()[0] == 1
-    cur.execute("SELECT count(*) FROM queue_messages WHERE queue_name = 'ExpVtQueue'")
+    cur.execute("SELECT count(*) FROM postgremq.queue_messages WHERE queue_name = 'ExpVtQueue'")
     assert cur.fetchone()[0] == 0
 
 def test_maintenance_fast_skips_pending_at_limit(cur: psycopg2.extensions.cursor) -> None:
@@ -547,16 +543,16 @@ def test_maintenance_fast_skips_pending_at_limit(cur: psycopg2.extensions.cursor
     can only exist via a direct UPDATE (not via the public API) but should
     still be ignored by maintenance — retirement is reserved for the
     expired-lease abandonment case."""
-    cur.execute("SELECT create_topic('PendingLimitTopic')")
-    cur.execute("SELECT create_queue('PendingLimitQueue', 'PendingLimitTopic', 1, false)")
-    cur.execute("SELECT publish_message('PendingLimitTopic', '{\"x\": 1}'::jsonb)")
-    cur.execute("SELECT message_id FROM consume_message('PendingLimitQueue', 60, 1)")
+    cur.execute("SELECT postgremq.create_topic('PendingLimitTopic')")
+    cur.execute("SELECT postgremq.create_queue('PendingLimitQueue', 'PendingLimitTopic', 1, false)")
+    cur.execute("SELECT postgremq.publish_message('PendingLimitTopic', '{\"x\": 1}'::jsonb)")
+    cur.execute("SELECT message_id FROM postgremq.consume_message('PendingLimitQueue', 60, 1)")
     msg_id = cur.fetchone()[0]
 
     # Pathological state: pending but at the attempt cap (and lease expired
     # for good measure — only the status filter should keep this row alive).
     cur.execute(
-        """UPDATE queue_messages
+        """UPDATE postgremq.queue_messages
            SET status = 'pending',
                vt = NOW() - interval '1 second',
                consumer_token = NULL
@@ -564,9 +560,9 @@ def test_maintenance_fast_skips_pending_at_limit(cur: psycopg2.extensions.cursor
         (msg_id,),
     )
 
-    cur.execute("SELECT retired_to_dlq FROM pmq_maintenance_fast()")
+    cur.execute("SELECT retired_to_dlq FROM postgremq.pmq_maintenance_fast()")
     assert cur.fetchone()[0] == 0, "pending rows are out of scope of maintenance retirement"
-    cur.execute("SELECT count(*) FROM queue_messages WHERE queue_name = 'PendingLimitQueue'")
+    cur.execute("SELECT count(*) FROM postgremq.queue_messages WHERE queue_name = 'PendingLimitQueue'")
     assert cur.fetchone()[0] == 1
 
 def test_release_floor_at_zero(cur: psycopg2.extensions.cursor) -> None:
@@ -574,63 +570,63 @@ def test_release_floor_at_zero(cur: psycopg2.extensions.cursor) -> None:
     guard a stale consumer racing a reclaim path could underflow the counter
     on repeated releases. The CHECK constraint on the column is the backstop
     — a direct UPDATE that would push it negative is rejected."""
-    cur.execute("SELECT create_topic('FloorTopic')")
-    cur.execute("SELECT create_queue('FloorQueue', 'FloorTopic', 0, false)")
-    cur.execute("SELECT publish_message('FloorTopic', '{\"x\": 1}'::jsonb)")
+    cur.execute("SELECT postgremq.create_topic('FloorTopic')")
+    cur.execute("SELECT postgremq.create_queue('FloorQueue', 'FloorTopic', 0, false)")
+    cur.execute("SELECT postgremq.publish_message('FloorTopic', '{\"x\": 1}'::jsonb)")
 
     # Consume → delivery_attempts becomes 1, status 'processing'.
-    cur.execute("SELECT message_id, consumer_token FROM consume_message('FloorQueue', 30, 1)")
+    cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('FloorQueue', 30, 1)")
     msg_id, token = cur.fetchone()
-    cur.execute("SELECT delivery_attempts FROM queue_messages WHERE queue_name='FloorQueue' AND message_id=%s", (msg_id,))
+    cur.execute("SELECT delivery_attempts FROM postgremq.queue_messages WHERE queue_name='FloorQueue' AND message_id=%s", (msg_id,))
     assert cur.fetchone()[0] == 1
 
     # Release once: 1 → 0.
-    cur.execute("SELECT release_message('FloorQueue', %s, %s)", (msg_id, token))
-    cur.execute("SELECT delivery_attempts FROM queue_messages WHERE queue_name='FloorQueue' AND message_id=%s", (msg_id,))
+    cur.execute("SELECT postgremq.release_message('FloorQueue', %s, %s)", (msg_id, token))
+    cur.execute("SELECT delivery_attempts FROM postgremq.queue_messages WHERE queue_name='FloorQueue' AND message_id=%s", (msg_id,))
     assert cur.fetchone()[0] == 0
 
     # Re-consume to obtain a fresh token, force delivery_attempts back to 0
     # (bypass the consume increment), then release again. Without the floor
     # this would write -1; with it, the value stays at 0.
-    cur.execute("SELECT message_id, consumer_token FROM consume_message('FloorQueue', 30, 1)")
+    cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('FloorQueue', 30, 1)")
     msg_id2, token2 = cur.fetchone()
     assert msg_id2 == msg_id
-    cur.execute("UPDATE queue_messages SET delivery_attempts = 0 WHERE queue_name='FloorQueue' AND message_id=%s", (msg_id,))
-    cur.execute("SELECT release_message('FloorQueue', %s, %s)", (msg_id, token2))
-    cur.execute("SELECT delivery_attempts FROM queue_messages WHERE queue_name='FloorQueue' AND message_id=%s", (msg_id,))
+    cur.execute("UPDATE postgremq.queue_messages SET delivery_attempts = 0 WHERE queue_name='FloorQueue' AND message_id=%s", (msg_id,))
+    cur.execute("SELECT postgremq.release_message('FloorQueue', %s, %s)", (msg_id, token2))
+    cur.execute("SELECT delivery_attempts FROM postgremq.queue_messages WHERE queue_name='FloorQueue' AND message_id=%s", (msg_id,))
     assert cur.fetchone()[0] == 0, "release_message must floor delivery_attempts at 0"
 
 def test_delivery_attempts_check_constraint(cur: psycopg2.extensions.cursor) -> None:
     """The queue_messages_delivery_attempts_nonneg CHECK constraint blocks any
     direct UPDATE that would write delivery_attempts < 0 — the backstop for
     paths the application-level floor doesn't cover."""
-    cur.execute("SELECT create_topic('CheckTopic')")
-    cur.execute("SELECT create_queue('CheckQueue', 'CheckTopic', 0, false)")
-    cur.execute("SELECT publish_message('CheckTopic', '{\"x\": 1}'::jsonb)")
-    cur.execute("SELECT message_id FROM consume_message('CheckQueue', 30, 1)")
+    cur.execute("SELECT postgremq.create_topic('CheckTopic')")
+    cur.execute("SELECT postgremq.create_queue('CheckQueue', 'CheckTopic', 0, false)")
+    cur.execute("SELECT postgremq.publish_message('CheckTopic', '{\"x\": 1}'::jsonb)")
+    cur.execute("SELECT message_id FROM postgremq.consume_message('CheckQueue', 30, 1)")
     msg_id = cur.fetchone()[0]
 
     with pytest.raises(psycopg2.errors.CheckViolation):
         cur.execute(
-            "UPDATE queue_messages SET delivery_attempts = -1 WHERE queue_name='CheckQueue' AND message_id=%s",
+            "UPDATE postgremq.queue_messages SET delivery_attempts = -1 WHERE queue_name='CheckQueue' AND message_id=%s",
             (msg_id,),
         )
 
 def test_message_delivery_and_acknowledgment(cur: psycopg2.extensions.cursor) -> None:
     """Test message publishing, consumption, and acknowledgment."""
     # Setup
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 3, true)")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('TestQueue', 'TestTopic', 3, true)")
     
     # Publish message
     cur.execute(
-        "SELECT publish_message('TestTopic', '{\"test\": \"ack_nack\"}'::jsonb)"
+        "SELECT postgremq.publish_message('TestTopic', '{\"test\": \"ack_nack\"}'::jsonb)"
     )
 
     # Consume message
     cur.execute("""
         SELECT message_id, consumer_token, payload 
-        FROM consume_message('TestQueue', 300, 1)
+        FROM postgremq.consume_message('TestQueue', 300, 1)
     """)
     result = cur.fetchone()
     assert result is not None
@@ -639,21 +635,21 @@ def test_message_delivery_and_acknowledgment(cur: psycopg2.extensions.cursor) ->
     # Verify message is locked
     cur.execute("""
         SELECT status 
-        FROM queue_messages qm 
+        FROM postgremq.queue_messages qm
         WHERE queue_name = 'TestQueue' AND message_id = %s
     """, (msg_id,))
     assert cur.fetchone()[0] == 'processing'
 
     # Acknowledge message
     cur.execute(
-        "SELECT ack_message('TestQueue', %s, %s)",
+        "SELECT postgremq.ack_message('TestQueue', %s, %s)",
         (msg_id, consumer_token)
     )
 
     # Verify message is completed
     cur.execute("""
         SELECT status 
-        FROM queue_messages qm 
+        FROM postgremq.queue_messages qm
         WHERE queue_name = 'TestQueue' AND message_id = %s
     """, (msg_id,))
     assert cur.fetchone()[0] == 'completed'
@@ -662,39 +658,39 @@ def test_message_retry_behavior(cur: psycopg2.extensions.cursor) -> None:
     """Test message delivery attempts behavior and dead letter queue functionality."""
     # Setup - queue with max 2 delivery attempts (initial + 1 retry)
     cur.execute("""
-        SELECT create_topic('RetryTopic');
-        SELECT create_queue('RetryQueue', 'RetryTopic', 2, true);
-        SELECT publish_message('RetryTopic', '{"test": "retry"}'::jsonb);
+        SELECT postgremq.create_topic('RetryTopic');
+        SELECT postgremq.create_queue('RetryQueue', 'RetryTopic', 2, true);
+        SELECT postgremq.publish_message('RetryTopic', '{"test": "retry"}'::jsonb);
     """)
 
     # First delivery attempt
     cur.execute("""
         SELECT message_id, consumer_token 
-        FROM consume_message('RetryQueue', 60, 1)
+        FROM postgremq.consume_message('RetryQueue', 60, 1)
     """)
     msg_id, token = cur.fetchone()
-    cur.execute("SELECT nack_message('RetryQueue', %s, %s)", (msg_id, token))
+    cur.execute("SELECT postgremq.nack_message('RetryQueue', %s, %s)", (msg_id, token))
 
     # Second delivery attempt
     cur.execute("""
         SELECT message_id, consumer_token 
-        FROM consume_message('RetryQueue', 60, 1)
+        FROM postgremq.consume_message('RetryQueue', 60, 1)
     """)
     msg_id, token = cur.fetchone()
-    cur.execute("SELECT nack_message('RetryQueue', %s, %s)", (msg_id, token))
+    cur.execute("SELECT postgremq.nack_message('RetryQueue', %s, %s)", (msg_id, token))
 
     # Verify no more attempts available
     cur.execute("""
         SELECT count(*) 
-        FROM consume_message('RetryQueue', 60, 1)
+        FROM postgremq.consume_message('RetryQueue', 60, 1)
     """)
     assert cur.fetchone()[0] == 0
 
     # Move to DLQ and verify
     cur.execute("""
-        SELECT * FROM pmq_maintenance_fast();
+        SELECT * FROM postgremq.pmq_maintenance_fast();
         SELECT count(*), MAX(retry_count)
-        FROM dead_letter_queue dlq
+        FROM postgremq.dead_letter_queue dlq
         WHERE dlq.queue_name = 'RetryQueue';
     """)
     count, retries = cur.fetchone()
@@ -704,12 +700,12 @@ def test_message_retry_behavior(cur: psycopg2.extensions.cursor) -> None:
 def test_queue_creation_with_delivery_attempts(cur: psycopg2.extensions.cursor) -> None:
     """Test queue creation with different max_delivery_attempts values."""
     cur.execute("""
-        SELECT create_topic('DeliveryTopic');
-        SELECT create_queue('UnlimitedQueue', 'DeliveryTopic', 0, true);
-        SELECT create_queue('LimitedQueue', 'DeliveryTopic', 3, true);
+        SELECT postgremq.create_topic('DeliveryTopic');
+        SELECT postgremq.create_queue('UnlimitedQueue', 'DeliveryTopic', 0, true);
+        SELECT postgremq.create_queue('LimitedQueue', 'DeliveryTopic', 3, true);
         
         SELECT name, max_delivery_attempts 
-        FROM queues 
+        FROM postgremq.queues
         WHERE topic_name = 'DeliveryTopic' 
         ORDER BY name;
     """)
@@ -724,69 +720,69 @@ def test_queue_creation_with_delivery_attempts(cur: psycopg2.extensions.cursor) 
 def test_concurrent_message_access(cur: psycopg2.extensions.cursor) -> None:
     """Test concurrent access to messages."""
     # Setup
-    cur.execute("SELECT create_topic('ConcurrentTopic')")
-    cur.execute("SELECT create_queue('ConcurrentQueue', 'ConcurrentTopic', 3, true)")
+    cur.execute("SELECT postgremq.create_topic('ConcurrentTopic')")
+    cur.execute("SELECT postgremq.create_queue('ConcurrentQueue', 'ConcurrentTopic', 3, true)")
     cur.execute(
-        "SELECT publish_message('ConcurrentTopic', '{\"test\": \"concurrent\"}'::jsonb)"
+        "SELECT postgremq.publish_message('ConcurrentTopic', '{\"test\": \"concurrent\"}'::jsonb)"
     )
 
     # First consumer gets the message
     cur.execute("""
         SELECT message_id, consumer_token 
-        FROM consume_message('ConcurrentQueue', 60, 1)
+        FROM postgremq.consume_message('ConcurrentQueue', 60, 1)
     """)
     assert cur.fetchone() is not None
 
     # Second consumer should get nothing
     cur.execute("""
         SELECT count(*) 
-        FROM consume_message('ConcurrentQueue', 60, 1)
+        FROM postgremq.consume_message('ConcurrentQueue', 60, 1)
     """)
     assert cur.fetchone()[0] == 0
 
 def test_queue_cleanup(cur: psycopg2.extensions.cursor) -> None:
     """Test queue cleanup functionality."""
     # Setup
-    cur.execute("SELECT create_topic('CleanupTopic')")
-    cur.execute("SELECT create_queue('CleanupQueue', 'CleanupTopic', 3, true)")
+    cur.execute("SELECT postgremq.create_topic('CleanupTopic')")
+    cur.execute("SELECT postgremq.create_queue('CleanupQueue', 'CleanupTopic', 3, true)")
     cur.execute(
-        "SELECT publish_message('CleanupTopic', '{\"test\": \"cleanup\"}'::jsonb)"
+        "SELECT postgremq.publish_message('CleanupTopic', '{\"test\": \"cleanup\"}'::jsonb)"
     )
 
     # Clean up topic
-    cur.execute("SELECT clean_up_topic('CleanupTopic')")
-    cur.execute("SELECT delete_topic('CleanupTopic')")
+    cur.execute("SELECT postgremq.clean_up_topic('CleanupTopic')")
+    cur.execute("SELECT postgremq.delete_topic('CleanupTopic')")
 
     # Verify cleanup
     cur.execute(
-        "SELECT count(*) FROM queues WHERE topic_name = 'CleanupTopic'"
+        "SELECT count(*) FROM postgremq.queues WHERE topic_name = 'CleanupTopic'"
     )
     assert cur.fetchone()[0] == 0
     cur.execute(
-        "SELECT count(*) FROM messages WHERE topic_name = 'CleanupTopic'"
+        "SELECT count(*) FROM postgremq.messages WHERE topic_name = 'CleanupTopic'"
     )
     assert cur.fetchone()[0] == 0
 
 def test_set_vt(cur: psycopg2.extensions.cursor) -> None:
     """Test setting visibility timeout for a single message."""
     # Create test topic and queue
-    cur.execute("SELECT create_topic('test_topic')")
-    cur.execute("SELECT create_queue('test_queue', 'test_topic')")
+    cur.execute("SELECT postgremq.create_topic('test_topic')")
+    cur.execute("SELECT postgremq.create_queue('test_queue', 'test_topic')")
     
     # Publish a test message
-    cur.execute("SELECT publish_message('test_topic', '{\"test\": \"data\"}'::jsonb)")
+    cur.execute("SELECT postgremq.publish_message('test_topic', '{\"test\": \"data\"}'::jsonb)")
     
     # Consume the message to get it into processing state
     cur.execute("""
         SELECT queue_name, message_id, consumer_token 
-        FROM consume_message('test_queue', 30)
+        FROM postgremq.consume_message('test_queue', 30)
     """)
     message = cur.fetchone()
     queue_name, message_id, consumer_token = message
     
     # Test valid extension
     cur.execute("""
-        SELECT set_vt(%s, %s, %s, 60)
+        SELECT postgremq.set_vt(%s, %s, %s, 60)
     """, (queue_name, message_id, consumer_token))
     new_vt = cur.fetchone()[0]
     assert new_vt > datetime.now(pytz.UTC)
@@ -795,19 +791,19 @@ def test_set_vt(cur: psycopg2.extensions.cursor) -> None:
     # Test wrong consumer token
     with pytest.raises(Exception):
         cur.execute("""
-            SELECT set_vt(%s, %s, %s, 60)
+            SELECT postgremq.set_vt(%s, %s, %s, 60)
         """, (queue_name, message_id, 'wrong-token'))
     
     # Test wrong message ID
     with pytest.raises(Exception):
         cur.execute("""
-            SELECT set_vt(%s, %s, %s, 60)
+            SELECT postgremq.set_vt(%s, %s, %s, 60)
         """, (queue_name, message_id + 1, consumer_token))
 
 def _consume_one(cur, queue, vt=30):
     """Consume a single message from a queue, returning (message_id, token)."""
     cur.execute(
-        "SELECT message_id, consumer_token FROM consume_message(%s, %s, 1)",
+        "SELECT message_id, consumer_token FROM postgremq.consume_message(%s, %s, 1)",
         (queue, vt),
     )
     row = cur.fetchone()
@@ -817,11 +813,11 @@ def _consume_one(cur, queue, vt=30):
 def test_set_vt_batch_multi_extends_across_queues(cur):
     """One set_vt_batch_multi call extends in-flight messages spanning several
     queues in a single round-trip, correlating results by (queue, message_id)."""
-    cur.execute("SELECT create_topic('MTopic')")
-    cur.execute("SELECT create_queue('MQ1', 'MTopic', 3, false)")
-    cur.execute("SELECT create_queue('MQ2', 'MTopic', 3, false)")
+    cur.execute("SELECT postgremq.create_topic('MTopic')")
+    cur.execute("SELECT postgremq.create_queue('MQ1', 'MTopic', 3, false)")
+    cur.execute("SELECT postgremq.create_queue('MQ2', 'MTopic', 3, false)")
     # One publish fans out to BOTH queues — same message_id lands in MQ1 and MQ2.
-    cur.execute("SELECT publish_message('MTopic', '{\"k\": 1}'::jsonb)")
+    cur.execute("SELECT postgremq.publish_message('MTopic', '{\"k\": 1}'::jsonb)")
 
     m1, t1 = _consume_one(cur, 'MQ1', vt=30)
     m2, t2 = _consume_one(cur, 'MQ2', vt=30)
@@ -830,7 +826,7 @@ def test_set_vt_batch_multi_extends_across_queues(cur):
     cur.execute(
         """
         SELECT queue_name, message_id, vt
-        FROM set_vt_batch_multi(%s, %s, %s, %s)
+        FROM postgremq.set_vt_batch_multi(%s, %s, %s, %s)
         """,
         (['MQ1', 'MQ2'], [m1, m2], [t1, t2], [600, 600]),
     )
@@ -839,7 +835,7 @@ def test_set_vt_batch_multi_extends_across_queues(cur):
 
     # Both rows pushed out to ~600s.
     cur.execute(
-        "SELECT queue_name, vt FROM queue_messages WHERE message_id = %s ORDER BY queue_name",
+        "SELECT queue_name, vt FROM postgremq.queue_messages WHERE message_id = %s ORDER BY queue_name",
         (m1,),
     )
     now = datetime.now(pytz.UTC)
@@ -850,10 +846,10 @@ def test_set_vt_batch_multi_extends_across_queues(cur):
 def test_set_vt_batch_multi_composite_key_no_cross_queue_bleed(cur):
     """The (queue, message_id) key must be respected: extending one queue's copy
     of a shared message_id must NOT touch the other queue's copy."""
-    cur.execute("SELECT create_topic('BleedTopic')")
-    cur.execute("SELECT create_queue('BQ1', 'BleedTopic', 3, false)")
-    cur.execute("SELECT create_queue('BQ2', 'BleedTopic', 3, false)")
-    cur.execute("SELECT publish_message('BleedTopic', '{}'::jsonb)")
+    cur.execute("SELECT postgremq.create_topic('BleedTopic')")
+    cur.execute("SELECT postgremq.create_queue('BQ1', 'BleedTopic', 3, false)")
+    cur.execute("SELECT postgremq.create_queue('BQ2', 'BleedTopic', 3, false)")
+    cur.execute("SELECT postgremq.publish_message('BleedTopic', '{}'::jsonb)")
 
     m1, t1 = _consume_one(cur, 'BQ1', vt=30)
     m2, t2 = _consume_one(cur, 'BQ2', vt=30)
@@ -861,13 +857,13 @@ def test_set_vt_batch_multi_composite_key_no_cross_queue_bleed(cur):
 
     # Record BQ2's current vt, then extend ONLY BQ1's copy.
     cur.execute(
-        "SELECT vt FROM queue_messages WHERE queue_name = 'BQ2' AND message_id = %s",
+        "SELECT vt FROM postgremq.queue_messages WHERE queue_name = 'BQ2' AND message_id = %s",
         (m2,),
     )
     bq2_vt_before = cur.fetchone()['vt']
 
     cur.execute(
-        "SELECT queue_name, message_id FROM set_vt_batch_multi(%s, %s, %s, %s)",
+        "SELECT queue_name, message_id FROM postgremq.set_vt_batch_multi(%s, %s, %s, %s)",
         (['BQ1'], [m1], [t1], [600]),
     )
     rows = [(r['queue_name'], r['message_id']) for r in cur.fetchall()]
@@ -875,7 +871,7 @@ def test_set_vt_batch_multi_composite_key_no_cross_queue_bleed(cur):
 
     # BQ1 extended, BQ2 untouched.
     cur.execute(
-        "SELECT queue_name, vt FROM queue_messages WHERE message_id = %s ORDER BY queue_name",
+        "SELECT queue_name, vt FROM postgremq.queue_messages WHERE message_id = %s ORDER BY queue_name",
         (m1,),
     )
     by_q = {r['queue_name']: r['vt'] for r in cur.fetchall()}
@@ -886,13 +882,13 @@ def test_set_vt_batch_multi_composite_key_no_cross_queue_bleed(cur):
 
 def test_set_vt_batch_multi_mixed_vt(cur):
     """Per-row VTs: each message gets its own new visibility timeout."""
-    cur.execute("SELECT create_topic('MixTopic')")
-    cur.execute("SELECT create_queue('MixQ', 'MixTopic', 3, false)")
+    cur.execute("SELECT postgremq.create_topic('MixTopic')")
+    cur.execute("SELECT postgremq.create_queue('MixQ', 'MixTopic', 3, false)")
     for _ in range(2):
-        cur.execute("SELECT publish_message('MixTopic', '{}'::jsonb)")
+        cur.execute("SELECT postgremq.publish_message('MixTopic', '{}'::jsonb)")
 
     cur.execute(
-        "SELECT message_id, consumer_token FROM consume_message('MixQ', 30, 2)"
+        "SELECT message_id, consumer_token FROM postgremq.consume_message('MixQ', 30, 2)"
     )
     rows = cur.fetchall()
     (a_id, a_tok), (b_id, b_tok) = (
@@ -901,7 +897,7 @@ def test_set_vt_batch_multi_mixed_vt(cur):
     )
 
     cur.execute(
-        "SELECT message_id, vt FROM set_vt_batch_multi(%s, %s, %s, %s)",
+        "SELECT message_id, vt FROM postgremq.set_vt_batch_multi(%s, %s, %s, %s)",
         (['MixQ', 'MixQ'], [a_id, b_id], [a_tok, b_tok], [120, 600]),
     )
     got = {r['message_id']: r['vt'] for r in cur.fetchall()}
@@ -914,16 +910,16 @@ def test_set_vt_batch_multi_mixed_vt(cur):
 def test_set_vt_batch_multi_partial_lease_loss(cur):
     """A wrong token (lease lost) is silently omitted; valid rows still extend —
     across queues, in the same call."""
-    cur.execute("SELECT create_topic('PartTopic')")
-    cur.execute("SELECT create_queue('PQ1', 'PartTopic', 3, false)")
-    cur.execute("SELECT create_queue('PQ2', 'PartTopic', 3, false)")
-    cur.execute("SELECT publish_message('PartTopic', '{}'::jsonb)")
+    cur.execute("SELECT postgremq.create_topic('PartTopic')")
+    cur.execute("SELECT postgremq.create_queue('PQ1', 'PartTopic', 3, false)")
+    cur.execute("SELECT postgremq.create_queue('PQ2', 'PartTopic', 3, false)")
+    cur.execute("SELECT postgremq.publish_message('PartTopic', '{}'::jsonb)")
 
     m1, t1 = _consume_one(cur, 'PQ1', vt=30)
     m2, _t2 = _consume_one(cur, 'PQ2', vt=30)
 
     cur.execute(
-        "SELECT queue_name, message_id FROM set_vt_batch_multi(%s, %s, %s, %s)",
+        "SELECT queue_name, message_id FROM postgremq.set_vt_batch_multi(%s, %s, %s, %s)",
         (['PQ1', 'PQ2'], [m1, m2], [t1, 'wrong-token'], [600, 600]),
     )
     rows = [(r['queue_name'], r['message_id']) for r in cur.fetchall()]
@@ -932,12 +928,12 @@ def test_set_vt_batch_multi_partial_lease_loss(cur):
 
 def test_set_vt_batch_multi_validation(cur):
     """Length mismatch and negative VT raise PMQ03; empty arrays are a no-op."""
-    cur.execute("SELECT create_topic('VTopic')")
-    cur.execute("SELECT create_queue('VQ', 'VTopic', 3, false)")
+    cur.execute("SELECT postgremq.create_topic('VTopic')")
+    cur.execute("SELECT postgremq.create_queue('VQ', 'VTopic', 3, false)")
 
     # Empty arrays -> zero rows, no error.
     cur.execute(
-        "SELECT COUNT(*) FROM set_vt_batch_multi(%s, %s, %s, %s)",
+        "SELECT COUNT(*) FROM postgremq.set_vt_batch_multi(%s, %s, %s, %s)",
         ([], [], [], []),
     )
     assert cur.fetchone()[0] == 0
@@ -945,7 +941,7 @@ def test_set_vt_batch_multi_validation(cur):
     # Mismatched lengths -> PMQ03.
     with pytest.raises(psycopg2.Error) as exc_info:
         cur.execute(
-            "SELECT * FROM set_vt_batch_multi("
+            "SELECT * FROM postgremq.set_vt_batch_multi("
             "ARRAY['VQ']::varchar[], ARRAY[1,2]::bigint[], "
             "ARRAY['a']::varchar[], ARRAY[60]::int[])"
         )
@@ -955,7 +951,7 @@ def test_set_vt_batch_multi_validation(cur):
     # Negative VT -> PMQ03.
     with pytest.raises(psycopg2.Error) as exc_info:
         cur.execute(
-            "SELECT * FROM set_vt_batch_multi("
+            "SELECT * FROM postgremq.set_vt_batch_multi("
             "ARRAY['VQ']::varchar[], ARRAY[1]::bigint[], "
             "ARRAY['a']::varchar[], ARRAY[-1]::int[])"
         )
@@ -964,19 +960,19 @@ def test_set_vt_batch_multi_validation(cur):
 
 
 def _keep_alive_until(cur, queue):
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = %s", (queue,))
+    cur.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = %s", (queue,))
     return cur.fetchone()['keep_alive_until']
 
 
 def test_extend_keep_alive_multi_extends_many_queues(cur):
     """One call advances keep_alive_until for several exclusive queues, using a
     per-queue interval, and returns each extended queue name."""
-    cur.execute("SELECT create_topic('KaTopic')")
-    cur.execute("SELECT create_queue('KaQ1', 'KaTopic', 0, true, interval '60 seconds')")
-    cur.execute("SELECT create_queue('KaQ2', 'KaTopic', 0, true, interval '60 seconds')")
+    cur.execute("SELECT postgremq.create_topic('KaTopic')")
+    cur.execute("SELECT postgremq.create_queue('KaQ1', 'KaTopic', 0, true, interval '60 seconds')")
+    cur.execute("SELECT postgremq.create_queue('KaQ2', 'KaTopic', 0, true, interval '60 seconds')")
 
     cur.execute(
-        "SELECT queue_name FROM extend_queue_keep_alive_multi(%s, %s)",
+        "SELECT queue_name FROM postgremq.extend_queue_keep_alive_multi(%s, %s)",
         (['KaQ1', 'KaQ2'], [600_000, 900_000]),  # milliseconds
     )
     extended = {r['queue_name'] for r in cur.fetchall()}
@@ -993,12 +989,12 @@ def test_extend_keep_alive_multi_extends_many_queues(cur):
 def test_extend_keep_alive_multi_omits_missing_and_nonexclusive(cur):
     """Missing or non-exclusive queues are silently omitted (permanent failure);
     valid exclusive queues still extend in the same call."""
-    cur.execute("SELECT create_topic('KaOmitTopic')")
-    cur.execute("SELECT create_queue('KaExcl', 'KaOmitTopic', 0, true, interval '60 seconds')")
-    cur.execute("SELECT create_queue('KaNonExcl', 'KaOmitTopic', 0, false)")
+    cur.execute("SELECT postgremq.create_topic('KaOmitTopic')")
+    cur.execute("SELECT postgremq.create_queue('KaExcl', 'KaOmitTopic', 0, true, interval '60 seconds')")
+    cur.execute("SELECT postgremq.create_queue('KaNonExcl', 'KaOmitTopic', 0, false)")
 
     cur.execute(
-        "SELECT queue_name FROM extend_queue_keep_alive_multi(%s, %s)",
+        "SELECT queue_name FROM postgremq.extend_queue_keep_alive_multi(%s, %s)",
         (
             ['KaExcl', 'KaNonExcl', 'KaGhost'],
             [600_000] * 3,  # milliseconds
@@ -1012,7 +1008,7 @@ def test_extend_keep_alive_multi_validation(cur):
     """Length mismatch raises PMQ03; empty arrays are a no-op."""
     # Empty arrays -> zero rows.
     cur.execute(
-        "SELECT COUNT(*) FROM extend_queue_keep_alive_multi(%s, %s)",
+        "SELECT COUNT(*) FROM postgremq.extend_queue_keep_alive_multi(%s, %s)",
         ([], []),
     )
     assert cur.fetchone()[0] == 0
@@ -1020,7 +1016,7 @@ def test_extend_keep_alive_multi_validation(cur):
     # Mismatched lengths -> PMQ03.
     with pytest.raises(psycopg2.Error) as exc_info:
         cur.execute(
-            "SELECT * FROM extend_queue_keep_alive_multi("
+            "SELECT * FROM postgremq.extend_queue_keep_alive_multi("
             "ARRAY['A','B']::varchar[], ARRAY[60000]::bigint[])"
         )
     assert exc_info.value.pgcode == 'PMQ03'
@@ -1031,53 +1027,53 @@ def test_requeue_dlq_messages_resets_delivery_attempts(cur):
     # Create topic and queue
     topic = "test_requeue_dlq_topic"
     queue = "test_requeue_dlq_queue"
-    cur.execute("SELECT create_topic(%s)", (topic,))
-    cur.execute("SELECT create_queue(%s, %s, %s, %s, %s * interval '1 sec')",
+    cur.execute("SELECT postgremq.create_topic(%s)", (topic,))
+    cur.execute("SELECT postgremq.create_queue(%s, %s, %s, %s, %s * interval '1 sec')",
                   (queue, topic, 2, True, 60))
 
     # Publish a message
-    cur.execute("SELECT publish_message(%s, %s)", 
+    cur.execute("SELECT postgremq.publish_message(%s, %s)",
                   (topic, '{"test":"requeue"}'))
-    cur.execute("SELECT id FROM messages ORDER BY id DESC LIMIT 1")
+    cur.execute("SELECT id FROM postgremq.messages ORDER BY id DESC LIMIT 1")
     msg_id = cur.fetchone()[0]
 
     # Consume and fail the message until it reaches max attempts
     for _ in range(2):  # max_delivery_attempts = 2
         cur.execute("""
             SELECT queue_name, message_id, payload, consumer_token 
-            FROM consume_message(%s, 30)
+            FROM postgremq.consume_message(%s, 30)
         """, (queue,))
         result = cur.fetchone()
         assert result is not None, "Should get a message"
         
         cur.execute("""
-            SELECT nack_message(%s, %s, %s)
+            SELECT postgremq.nack_message(%s, %s, %s)
         """, (queue, msg_id, result['consumer_token']))  # Use dictionary access for DictCursor
 
     # Move messages to DLQ
-    cur.execute("SELECT * FROM pmq_maintenance_fast()")
+    cur.execute("SELECT * FROM postgremq.pmq_maintenance_fast()")
 
     # Verify message moved to DLQ
-    cur.execute("SELECT message_id FROM dead_letter_queue WHERE queue_name = %s", (queue,))
+    cur.execute("SELECT message_id FROM postgremq.dead_letter_queue WHERE queue_name = %s", (queue,))
     dlq_messages = cur.fetchall()
     assert len(dlq_messages) == 1, "Message should be in DLQ"
     assert dlq_messages[0][0] == msg_id, "DLQ message ID mismatch"
 
     # Verify message is no longer in queue_messages
     cur.execute("""
-        SELECT COUNT(*) FROM queue_messages 
+        SELECT COUNT(*) FROM postgremq.queue_messages
         WHERE queue_name = %s AND message_id = %s
     """, (queue, msg_id))
     count = cur.fetchone()[0]
     assert count == 0, "Message should not be in queue_messages"
 
     # Requeue the message
-    cur.execute("SELECT requeue_dlq_messages(%s)", (queue,))
+    cur.execute("SELECT postgremq.requeue_dlq_messages(%s)", (queue,))
 
     # Verify message is back in queue with reset delivery attempts
     cur.execute("""
         SELECT message_id, delivery_attempts 
-        FROM queue_messages 
+        FROM postgremq.queue_messages
         WHERE queue_name = %s AND message_id = %s
     """, (queue, msg_id))
     result = cur.fetchone()
@@ -1086,7 +1082,7 @@ def test_requeue_dlq_messages_resets_delivery_attempts(cur):
     assert result[1] == 0, "Delivery attempts should be reset to 0"
 
     # Verify DLQ is empty
-    cur.execute("SELECT COUNT(*) FROM dead_letter_queue WHERE queue_name = %s", (queue,))
+    cur.execute("SELECT COUNT(*) FROM postgremq.dead_letter_queue WHERE queue_name = %s", (queue,))
     dlq_count = cur.fetchone()[0]
     assert dlq_count == 0, "DLQ should be empty after requeue"
 
@@ -1099,25 +1095,25 @@ def test_requeue_dlq_messages_emits_notify(cur: psycopg2.extensions.cursor) -> N
 
     Also asserts no NOTIFY fires when the DLQ is empty for the queue —
     avoids spurious wake-ups."""
-    cur.execute("SELECT create_topic('RequeueNotifyTopic')")
-    cur.execute("SELECT create_queue('RequeueNotifyQueue', 'RequeueNotifyTopic', 1, false)")
+    cur.execute("SELECT postgremq.create_topic('RequeueNotifyTopic')")
+    cur.execute("SELECT postgremq.create_queue('RequeueNotifyQueue', 'RequeueNotifyTopic', 1, false)")
     cur.execute('LISTEN "pmq:q:RequeueNotifyQueue"')
 
     # Empty DLQ: requeue should be a silent no-op.
-    cur.execute("SELECT requeue_dlq_messages('RequeueNotifyQueue')")
+    cur.execute("SELECT postgremq.requeue_dlq_messages('RequeueNotifyQueue')")
     cur.connection.poll()
     assert len(cur.connection.notifies) == 0, "no-op requeue must not NOTIFY"
 
     # Stage 3 messages in the DLQ via the inline-retire path (max_attempts=1
     # means the first nack moves them straight to DLQ).
     for i in range(3):
-        cur.execute("SELECT publish_message('RequeueNotifyTopic', %s::jsonb)",
+        cur.execute("SELECT postgremq.publish_message('RequeueNotifyTopic', %s::jsonb)",
                     (json.dumps({"i": i}),))
-        cur.execute("SELECT message_id, consumer_token FROM consume_message('RequeueNotifyQueue', 30)")
+        cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('RequeueNotifyQueue', 30)")
         msg_id, token = cur.fetchone()
-        cur.execute("SELECT nack_message('RequeueNotifyQueue', %s, %s)", (msg_id, token))
+        cur.execute("SELECT postgremq.nack_message('RequeueNotifyQueue', %s, %s)", (msg_id, token))
 
-    cur.execute("SELECT count(*) FROM dead_letter_queue WHERE queue_name = 'RequeueNotifyQueue'")
+    cur.execute("SELECT count(*) FROM postgremq.dead_letter_queue WHERE queue_name = 'RequeueNotifyQueue'")
     assert cur.fetchone()[0] == 3
 
     # Drain any stray notifications from the staging steps so we measure
@@ -1125,7 +1121,7 @@ def test_requeue_dlq_messages_emits_notify(cur: psycopg2.extensions.cursor) -> N
     cur.connection.poll()
     cur.connection.notifies.clear()
 
-    cur.execute("SELECT requeue_dlq_messages('RequeueNotifyQueue')")
+    cur.execute("SELECT postgremq.requeue_dlq_messages('RequeueNotifyQueue')")
     cur.connection.poll()
 
     # Exactly one NOTIFY per requeue call, empty payload.
@@ -1142,28 +1138,28 @@ def test_requeue_dlq_messages_idempotent_on_existing_row(cur: psycopg2.extension
     pending state instead of aborting the entire requeue with a unique
     constraint violation. This protects against partial-state recovery
     scenarios. Reported in REVIEW.md §2.2."""
-    cur.execute("SELECT create_topic('RequeueIdempotentTopic')")
-    cur.execute("SELECT create_queue('RequeueIdempotentQueue', 'RequeueIdempotentTopic', 1, false)")
+    cur.execute("SELECT postgremq.create_topic('RequeueIdempotentTopic')")
+    cur.execute("SELECT postgremq.create_queue('RequeueIdempotentQueue', 'RequeueIdempotentTopic', 1, false)")
 
-    cur.execute("SELECT publish_message('RequeueIdempotentTopic', '{\"x\":1}'::jsonb)")
-    cur.execute("SELECT message_id, consumer_token FROM consume_message('RequeueIdempotentQueue', 30)")
+    cur.execute("SELECT postgremq.publish_message('RequeueIdempotentTopic', '{\"x\":1}'::jsonb)")
+    cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('RequeueIdempotentQueue', 30)")
     msg_id, token = cur.fetchone()
-    cur.execute("SELECT nack_message('RequeueIdempotentQueue', %s, %s)", (msg_id, token))
+    cur.execute("SELECT postgremq.nack_message('RequeueIdempotentQueue', %s, %s)", (msg_id, token))
 
     # Now the message is in DLQ. Manually re-insert a stale queue_messages
     # row in 'completed' state to simulate the conflict scenario.
     cur.execute("""
-        INSERT INTO queue_messages (queue_name, message_id, status, delivery_attempts, processed_at, vt)
+        INSERT INTO postgremq.queue_messages (queue_name, message_id, status, delivery_attempts, processed_at, vt)
         VALUES ('RequeueIdempotentQueue', %s, 'completed', 5, NOW(), NOW())
     """, (msg_id,))
 
     # Requeue must NOT fail with a unique violation; it must reset the
     # stale row to pending.
-    cur.execute("SELECT requeue_dlq_messages('RequeueIdempotentQueue')")
+    cur.execute("SELECT postgremq.requeue_dlq_messages('RequeueIdempotentQueue')")
 
     cur.execute("""
         SELECT status, delivery_attempts, consumer_token, processed_at
-        FROM queue_messages
+        FROM postgremq.queue_messages
         WHERE queue_name = 'RequeueIdempotentQueue' AND message_id = %s
     """, (msg_id,))
     status, attempts, ctoken, processed_at = cur.fetchone()
@@ -1172,15 +1168,15 @@ def test_requeue_dlq_messages_idempotent_on_existing_row(cur: psycopg2.extension
     assert ctoken is None
     assert processed_at is None
 
-    cur.execute("SELECT count(*) FROM dead_letter_queue WHERE queue_name = 'RequeueIdempotentQueue'")
+    cur.execute("SELECT count(*) FROM postgremq.dead_letter_queue WHERE queue_name = 'RequeueIdempotentQueue'")
     assert cur.fetchone()[0] == 0, "DLQ should be drained after requeue"
 
 def test_delayed_message_delivery_notifications(cur: psycopg2.extensions.cursor) -> None:
     """Publish fires NOTIFY on per-topic channel `pmq:t:<topic>`. Payload is
     empty — the channel name is the wake-up signal; clients re-fetch from
     the queue on receipt."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 2, false)")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('TestQueue', 'TestTopic', 2, false)")
 
     # Listen on the per-topic channel.
     cur.execute('LISTEN "pmq:t:TestTopic"')
@@ -1188,7 +1184,7 @@ def test_delayed_message_delivery_notifications(cur: psycopg2.extensions.cursor)
     # Publish message with 2 second delay
     delay_time = datetime.now(pytz.UTC) + timedelta(seconds=2)
     cur.execute("""
-        SELECT publish_message('TestTopic', '{"test":"data"}'::jsonb, %s)
+        SELECT postgremq.publish_message('TestTopic', '{"test":"data"}'::jsonb, %s)
     """, (delay_time,))
 
     # Get notification
@@ -1201,7 +1197,7 @@ def test_delayed_message_delivery_notifications(cur: psycopg2.extensions.cursor)
 
     # Try to consume immediately - should get no messages
     cur.execute("""
-        SELECT * FROM consume_message('TestQueue', 30)
+        SELECT * FROM postgremq.consume_message('TestQueue', 30)
     """)
     assert cur.fetchone() is None
 
@@ -1210,21 +1206,21 @@ def test_delayed_message_delivery_notifications(cur: psycopg2.extensions.cursor)
 
     # Now should get the message
     cur.execute("""
-        SELECT * FROM consume_message('TestQueue', 30)
+        SELECT * FROM postgremq.consume_message('TestQueue', 30)
     """)
     assert cur.fetchone() is not None
 
 def test_delayed_nack_notifications(cur: psycopg2.extensions.cursor) -> None:
     """Nack fires NOTIFY on the per-queue channel `pmq:q:<queue>`. Payload
     is empty — the channel name is the wake-up signal."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 2, false)")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('TestQueue', 'TestTopic', 2, false)")
 
     # Publish and consume message
-    cur.execute("SELECT publish_message('TestTopic', '{\"test\":\"data\"}'::jsonb)")
+    cur.execute("SELECT postgremq.publish_message('TestTopic', '{\"test\":\"data\"}'::jsonb)")
     cur.execute("""
         SELECT message_id, consumer_token
-        FROM consume_message('TestQueue', 30)
+        FROM postgremq.consume_message('TestQueue', 30)
     """)
     msg_id, token = cur.fetchone()
 
@@ -1234,7 +1230,7 @@ def test_delayed_nack_notifications(cur: psycopg2.extensions.cursor) -> None:
     # Nack with 2 second delay
     delay_time = datetime.now(pytz.UTC) + timedelta(seconds=2)
     cur.execute("""
-        SELECT nack_message('TestQueue', %s, %s, %s)
+        SELECT postgremq.nack_message('TestQueue', %s, %s, %s)
     """, (msg_id, token, delay_time))
 
     # Get notification
@@ -1247,7 +1243,7 @@ def test_delayed_nack_notifications(cur: psycopg2.extensions.cursor) -> None:
 
     # Try to consume immediately - should get no messages
     cur.execute("""
-        SELECT * FROM consume_message('TestQueue', 30)
+        SELECT * FROM postgremq.consume_message('TestQueue', 30)
     """)
     assert cur.fetchone() is None
 
@@ -1256,7 +1252,7 @@ def test_delayed_nack_notifications(cur: psycopg2.extensions.cursor) -> None:
 
     # Now should get the message
     cur.execute("""
-        SELECT * FROM consume_message('TestQueue', 30)
+        SELECT * FROM postgremq.consume_message('TestQueue', 30)
     """)
     msg = cur.fetchone()
     assert msg is not None
@@ -1265,15 +1261,15 @@ def test_delayed_nack_notifications(cur: psycopg2.extensions.cursor) -> None:
 def test_release_message_emits_per_queue_notify(cur: psycopg2.extensions.cursor) -> None:
     """release_message fires NOTIFY on `pmq:q:<queue>` with empty payload —
     the channel is the wake-up signal; clients re-fetch on receipt."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 0, false)")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('TestQueue', 'TestTopic', 0, false)")
 
-    cur.execute("SELECT publish_message('TestTopic', '{\"k\":\"v\"}'::jsonb)")
-    cur.execute("SELECT message_id, consumer_token FROM consume_message('TestQueue', 30)")
+    cur.execute("SELECT postgremq.publish_message('TestTopic', '{\"k\":\"v\"}'::jsonb)")
+    cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('TestQueue', 30)")
     msg_id, token = cur.fetchone()
 
     cur.execute('LISTEN "pmq:q:TestQueue"')
-    cur.execute("SELECT release_message('TestQueue', %s, %s)", (msg_id, token))
+    cur.execute("SELECT postgremq.release_message('TestQueue', %s, %s)", (msg_id, token))
 
     conn = cur.connection
     conn.poll()
@@ -1283,21 +1279,21 @@ def test_release_message_emits_per_queue_notify(cur: psycopg2.extensions.cursor)
 
 def test_create_topic_validates_name(cur: psycopg2.extensions.cursor) -> None:
     """create_topic rejects names with characters that wouldn't be safe as NOTIFY channel suffixes."""
-    cur.execute("SELECT create_topic('valid_topic-1.2:3')")  # all permitted chars
+    cur.execute("SELECT postgremq.create_topic('valid_topic-1.2:3')")  # all permitted chars
     for bad in ["topic with spaces", "topic'name", 'topic"name', "topic;name", ""]:
         try:
-            cur.execute("SELECT create_topic(%s)", (bad,))
+            cur.execute("SELECT postgremq.create_topic(%s)", (bad,))
             raise AssertionError(f"create_topic should have rejected {bad!r}")
         except psycopg2.Error:
             cur.connection.rollback()
 
 def test_create_queue_validates_name(cur: psycopg2.extensions.cursor) -> None:
     """create_queue rejects names with characters that wouldn't be safe as NOTIFY channel suffixes."""
-    cur.execute("SELECT create_topic('Topic')")
-    cur.execute("SELECT create_queue('valid_queue-1.2:3', 'Topic', 0, false)")
+    cur.execute("SELECT postgremq.create_topic('Topic')")
+    cur.execute("SELECT postgremq.create_queue('valid_queue-1.2:3', 'Topic', 0, false)")
     for bad in ["queue with spaces", "queue'name", 'queue"name', "queue;name", ""]:
         try:
-            cur.execute("SELECT create_queue(%s, 'Topic', 0, false)", (bad,))
+            cur.execute("SELECT postgremq.create_queue(%s, 'Topic', 0, false)", (bad,))
             raise AssertionError(f"create_queue should have rejected {bad!r}")
         except psycopg2.Error:
             cur.connection.rollback()
@@ -1305,51 +1301,51 @@ def test_create_queue_validates_name(cur: psycopg2.extensions.cursor) -> None:
 def test_clean_up_topic_refuses_when_dlq_has_messages(cur: psycopg2.extensions.cursor) -> None:
     """clean_up_topic must refuse when any of the topic's messages are in
     DLQ. DLQ entries are forensic data; operators must explicitly
-    purge_dlq() or requeue_dlq_messages() before cleaning up.
+    postgremq.purge_dlq() or postgremq.requeue_dlq_messages() before cleaning up.
     (REVIEW.md §2.8)"""
-    cur.execute("SELECT create_topic('CleanDlqTopic')")
-    cur.execute("SELECT create_queue('CleanDlqQueue', 'CleanDlqTopic', 1, false)")
-    cur.execute("SELECT publish_message('CleanDlqTopic', '{\"x\":1}'::jsonb)")
-    cur.execute("SELECT message_id, consumer_token FROM consume_message('CleanDlqQueue', 30)")
+    cur.execute("SELECT postgremq.create_topic('CleanDlqTopic')")
+    cur.execute("SELECT postgremq.create_queue('CleanDlqQueue', 'CleanDlqTopic', 1, false)")
+    cur.execute("SELECT postgremq.publish_message('CleanDlqTopic', '{\"x\":1}'::jsonb)")
+    cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('CleanDlqQueue', 30)")
     msg_id, token = cur.fetchone()
     # max=1 → first nack retires inline to DLQ.
-    cur.execute("SELECT nack_message('CleanDlqQueue', %s, %s)", (msg_id, token))
+    cur.execute("SELECT postgremq.nack_message('CleanDlqQueue', %s, %s)", (msg_id, token))
 
-    cur.execute("SELECT count(*) FROM dead_letter_queue WHERE queue_name = 'CleanDlqQueue'")
+    cur.execute("SELECT count(*) FROM postgremq.dead_letter_queue WHERE queue_name = 'CleanDlqQueue'")
     assert cur.fetchone()[0] == 1
 
     with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT clean_up_topic('CleanDlqTopic')")
+        cur.execute("SELECT postgremq.clean_up_topic('CleanDlqTopic')")
     assert exc_info.value.pgcode == 'PMQ03'
     assert 'dead letter queue' in str(exc_info.value)
     cur.connection.rollback()
 
     # After purge_dlq, clean_up_topic succeeds.
-    cur.execute("SELECT purge_dlq()")
-    cur.execute("SELECT clean_up_topic('CleanDlqTopic')")
-    cur.execute("SELECT count(*) FROM messages WHERE topic_name = 'CleanDlqTopic'")
+    cur.execute("SELECT postgremq.purge_dlq()")
+    cur.execute("SELECT postgremq.clean_up_topic('CleanDlqTopic')")
+    cur.execute("SELECT count(*) FROM postgremq.messages WHERE topic_name = 'CleanDlqTopic'")
     assert cur.fetchone()[0] == 0
 
 def test_delete_queue_refuses_when_dlq_has_messages(cur: psycopg2.extensions.cursor) -> None:
     """delete_queue must refuse when the queue has DLQ entries. Same
     reason as clean_up_topic. (REVIEW.md §2.8)"""
-    cur.execute("SELECT create_topic('DeleteDlqTopic')")
-    cur.execute("SELECT create_queue('DeleteDlqQueue', 'DeleteDlqTopic', 1, false)")
-    cur.execute("SELECT publish_message('DeleteDlqTopic', '{\"x\":1}'::jsonb)")
-    cur.execute("SELECT message_id, consumer_token FROM consume_message('DeleteDlqQueue', 30)")
+    cur.execute("SELECT postgremq.create_topic('DeleteDlqTopic')")
+    cur.execute("SELECT postgremq.create_queue('DeleteDlqQueue', 'DeleteDlqTopic', 1, false)")
+    cur.execute("SELECT postgremq.publish_message('DeleteDlqTopic', '{\"x\":1}'::jsonb)")
+    cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('DeleteDlqQueue', 30)")
     msg_id, token = cur.fetchone()
-    cur.execute("SELECT nack_message('DeleteDlqQueue', %s, %s)", (msg_id, token))
+    cur.execute("SELECT postgremq.nack_message('DeleteDlqQueue', %s, %s)", (msg_id, token))
 
     with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT delete_queue('DeleteDlqQueue')")
+        cur.execute("SELECT postgremq.delete_queue('DeleteDlqQueue')")
     assert exc_info.value.pgcode == 'PMQ03'
     assert 'dead letter queue' in str(exc_info.value)
     cur.connection.rollback()
 
     # After purge_dlq, delete_queue succeeds.
-    cur.execute("SELECT purge_dlq()")
-    cur.execute("SELECT delete_queue('DeleteDlqQueue')")
-    cur.execute("SELECT count(*) FROM queues WHERE name = 'DeleteDlqQueue'")
+    cur.execute("SELECT postgremq.purge_dlq()")
+    cur.execute("SELECT postgremq.delete_queue('DeleteDlqQueue')")
+    cur.execute("SELECT count(*) FROM postgremq.queues WHERE name = 'DeleteDlqQueue'")
     assert cur.fetchone()[0] == 0
 
 def test_pmq_maintenance_fast_skips_inactive_queue_with_dlq(cur: psycopg2.extensions.cursor) -> None:
@@ -1357,27 +1353,27 @@ def test_pmq_maintenance_fast_skips_inactive_queue_with_dlq(cur: psycopg2.extens
     DLQ entries — those entries are forensic data the operator may want
     to keep. The queue stays around until the operator handles its DLQ.
     (REVIEW.md §2.8)"""
-    cur.execute("SELECT create_topic('MaintDlqTopic')")
-    cur.execute("SELECT create_queue('MaintDlqQueue', 'MaintDlqTopic', 1, true, interval '60 seconds')")
-    cur.execute("SELECT publish_message('MaintDlqTopic', '{\"x\":1}'::jsonb)")
-    cur.execute("SELECT message_id, consumer_token FROM consume_message('MaintDlqQueue', 30)")
+    cur.execute("SELECT postgremq.create_topic('MaintDlqTopic')")
+    cur.execute("SELECT postgremq.create_queue('MaintDlqQueue', 'MaintDlqTopic', 1, true, interval '60 seconds')")
+    cur.execute("SELECT postgremq.publish_message('MaintDlqTopic', '{\"x\":1}'::jsonb)")
+    cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('MaintDlqQueue', 30)")
     msg_id, token = cur.fetchone()
-    cur.execute("SELECT nack_message('MaintDlqQueue', %s, %s)", (msg_id, token))
+    cur.execute("SELECT postgremq.nack_message('MaintDlqQueue', %s, %s)", (msg_id, token))
 
     # Force the queue's keep_alive_until past the 5s grace — eligible for reaping.
-    cur.execute("UPDATE queues SET keep_alive_until = NOW() - interval '10 seconds' WHERE name = 'MaintDlqQueue'")
+    cur.execute("UPDATE postgremq.queues SET keep_alive_until = NOW() - interval '10 seconds' WHERE name = 'MaintDlqQueue'")
 
-    cur.execute("SELECT inactive_queues_dropped FROM pmq_maintenance_fast()")
+    cur.execute("SELECT inactive_queues_dropped FROM postgremq.pmq_maintenance_fast()")
     assert cur.fetchone()[0] == 0, "queue with DLQ entries must not be reaped"
 
-    cur.execute("SELECT count(*) FROM queues WHERE name = 'MaintDlqQueue'")
+    cur.execute("SELECT count(*) FROM postgremq.queues WHERE name = 'MaintDlqQueue'")
     assert cur.fetchone()[0] == 1, "queue must still exist"
 
     # After purge_dlq, the next maintenance call reaps it.
-    cur.execute("SELECT purge_dlq()")
-    cur.execute("SELECT inactive_queues_dropped FROM pmq_maintenance_fast()")
+    cur.execute("SELECT postgremq.purge_dlq()")
+    cur.execute("SELECT inactive_queues_dropped FROM postgremq.pmq_maintenance_fast()")
     assert cur.fetchone()[0] == 1
-    cur.execute("SELECT count(*) FROM queues WHERE name = 'MaintDlqQueue'")
+    cur.execute("SELECT count(*) FROM postgremq.queues WHERE name = 'MaintDlqQueue'")
     assert cur.fetchone()[0] == 0
 
 def test_create_topic_rejects_long_name(cur: psycopg2.extensions.cursor) -> None:
@@ -1385,38 +1381,38 @@ def test_create_topic_rejects_long_name(cur: psycopg2.extensions.cursor) -> None
     risk silent cross-delivery between topics that share their first 57
     bytes. Boundary check at exactly 57 / 58 bytes. (REVIEW.md §2.3)"""
     name_57 = 'A' * 57
-    cur.execute("SELECT create_topic(%s)", (name_57,))  # boundary: 57 OK
+    cur.execute("SELECT postgremq.create_topic(%s)", (name_57,))  # boundary: 57 OK
     name_58 = 'B' * 58
     with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT create_topic(%s)", (name_58,))
+        cur.execute("SELECT postgremq.create_topic(%s)", (name_58,))
     assert exc_info.value.pgcode == 'PMQ03'
     assert 'too long' in str(exc_info.value)
 
 def test_create_queue_rejects_long_name(cur: psycopg2.extensions.cursor) -> None:
     """Queue names > 57 bytes would truncate the NOTIFY channel name."""
-    cur.execute("SELECT create_topic('LenTopic')")
+    cur.execute("SELECT postgremq.create_topic('LenTopic')")
     name_57 = 'a' * 57
-    cur.execute("SELECT create_queue(%s, 'LenTopic', 0, false)", (name_57,))
+    cur.execute("SELECT postgremq.create_queue(%s, 'LenTopic', 0, false)", (name_57,))
     name_58 = 'b' * 58
     with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT create_queue(%s, 'LenTopic', 0, false)", (name_58,))
+        cur.execute("SELECT postgremq.create_queue(%s, 'LenTopic', 0, false)", (name_58,))
     assert exc_info.value.pgcode == 'PMQ03'
     assert 'too long' in str(exc_info.value)
 
 def test_sqlstate_codes_pmq01_lease_lost(cur: psycopg2.extensions.cursor) -> None:
     """ack/nack/release/set_vt all raise PMQ01 when token doesn't match or vt expired."""
-    cur.execute("SELECT create_topic('SqlstateTopic')")
-    cur.execute("SELECT create_queue('SqlstateQueue', 'SqlstateTopic', 0, false)")
-    cur.execute("SELECT publish_message('SqlstateTopic', '{}'::jsonb)")
-    cur.execute("SELECT message_id, consumer_token FROM consume_message('SqlstateQueue', 30)")
+    cur.execute("SELECT postgremq.create_topic('SqlstateTopic')")
+    cur.execute("SELECT postgremq.create_queue('SqlstateQueue', 'SqlstateTopic', 0, false)")
+    cur.execute("SELECT postgremq.publish_message('SqlstateTopic', '{}'::jsonb)")
+    cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('SqlstateQueue', 30)")
     msg_id, _ = cur.fetchone()
 
     # Wrong token → PMQ01 from each operation.
     for sql, args in [
-        ("SELECT ack_message('SqlstateQueue', %s, %s)", (msg_id, 'bogus')),
-        ("SELECT nack_message('SqlstateQueue', %s, %s)", (msg_id, 'bogus')),
-        ("SELECT release_message('SqlstateQueue', %s, %s)", (msg_id, 'bogus')),
-        ("SELECT set_vt('SqlstateQueue', %s, %s, 60)", (msg_id, 'bogus')),
+        ("SELECT postgremq.ack_message('SqlstateQueue', %s, %s)", (msg_id, 'bogus')),
+        ("SELECT postgremq.nack_message('SqlstateQueue', %s, %s)", (msg_id, 'bogus')),
+        ("SELECT postgremq.release_message('SqlstateQueue', %s, %s)", (msg_id, 'bogus')),
+        ("SELECT postgremq.set_vt('SqlstateQueue', %s, %s, 60)", (msg_id, 'bogus')),
     ]:
         with pytest.raises(psycopg2.Error) as exc_info:
             cur.execute(sql, args)
@@ -1426,37 +1422,37 @@ def test_sqlstate_codes_pmq01_lease_lost(cur: psycopg2.extensions.cursor) -> Non
 def test_sqlstate_codes_pmq02_topic_not_found(cur: psycopg2.extensions.cursor) -> None:
     """publish_message on a non-existent topic raises PMQ02."""
     with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT publish_message('NoSuchTopic', '{}'::jsonb)")
+        cur.execute("SELECT postgremq.publish_message('NoSuchTopic', '{}'::jsonb)")
     assert exc_info.value.pgcode == 'PMQ02', f"expected PMQ02, got {exc_info.value.pgcode}"
     cur.connection.rollback()
 
 def test_sqlstate_codes_pmq03_validation(cur: psycopg2.extensions.cursor) -> None:
     """Validation paths raise PMQ03: negative vt, p_limit<=0, mismatched arrays, malformed names."""
-    cur.execute("SELECT create_topic('VTopic')")
-    cur.execute("SELECT create_queue('VQueue', 'VTopic', 0, false)")
+    cur.execute("SELECT postgremq.create_topic('VTopic')")
+    cur.execute("SELECT postgremq.create_queue('VQueue', 'VTopic', 0, false)")
 
     # consume_message: negative vt
     with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT * FROM consume_message('VQueue', -1, 1)")
+        cur.execute("SELECT * FROM postgremq.consume_message('VQueue', -1, 1)")
     assert exc_info.value.pgcode == 'PMQ03'
     cur.connection.rollback()
 
     # consume_message: p_limit <= 0
     with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT * FROM consume_message('VQueue', 30, 0)")
+        cur.execute("SELECT * FROM postgremq.consume_message('VQueue', 30, 0)")
     assert exc_info.value.pgcode == 'PMQ03'
     cur.connection.rollback()
 
     # set_vt: negative vt
     with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT set_vt('VQueue', 1, 'tok', -1)")
+        cur.execute("SELECT postgremq.set_vt('VQueue', 1, 'tok', -1)")
     assert exc_info.value.pgcode == 'PMQ03'
     cur.connection.rollback()
 
     # set_vt_batch_multi: mismatched array lengths
     with pytest.raises(psycopg2.Error) as exc_info:
         cur.execute("""
-            SELECT * FROM set_vt_batch_multi(
+            SELECT * FROM postgremq.set_vt_batch_multi(
                 ARRAY['VQueue']::varchar[], ARRAY[1,2]::bigint[],
                 ARRAY['a']::varchar[], ARRAY[60]::int[])
         """)
@@ -1465,31 +1461,31 @@ def test_sqlstate_codes_pmq03_validation(cur: psycopg2.extensions.cursor) -> Non
 
     # create_topic: invalid name
     with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT create_topic('bad name')")
+        cur.execute("SELECT postgremq.create_topic('bad name')")
     assert exc_info.value.pgcode == 'PMQ03'
     cur.connection.rollback()
 
     # create_queue: invalid name
     with pytest.raises(psycopg2.Error) as exc_info:
-        cur.execute("SELECT create_queue('bad queue', 'VTopic', 0, false)")
+        cur.execute("SELECT postgremq.create_queue('bad queue', 'VTopic', 0, false)")
     assert exc_info.value.pgcode == 'PMQ03'
     cur.connection.rollback()
 
 def test_nack_final_attempt_inline_dlq(cur: psycopg2.extensions.cursor) -> None:
     """Final-attempt nack moves the row to DLQ inline (no maintenance call needed)."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 2, false)")  # max_attempts=2
-    cur.execute("SELECT publish_message('TestTopic', '{\"k\":\"v\"}'::jsonb)")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('TestQueue', 'TestTopic', 2, false)")  # max_attempts=2
+    cur.execute("SELECT postgremq.publish_message('TestTopic', '{\"k\":\"v\"}'::jsonb)")
 
     # First consume + nack: not the final attempt, message resets to pending.
     cur.execute("""
-        SELECT message_id, consumer_token FROM consume_message('TestQueue', 30)
+        SELECT message_id, consumer_token FROM postgremq.consume_message('TestQueue', 30)
     """)
     msg_id, token = cur.fetchone()
-    cur.execute("SELECT nack_message('TestQueue', %s, %s, NOW())", (msg_id, token))
+    cur.execute("SELECT postgremq.nack_message('TestQueue', %s, %s, NOW())", (msg_id, token))
 
     cur.execute("""
-        SELECT status, delivery_attempts FROM queue_messages
+        SELECT status, delivery_attempts FROM postgremq.queue_messages
         WHERE queue_name='TestQueue' AND message_id=%s
     """, (msg_id,))
     row = cur.fetchone()
@@ -1498,23 +1494,23 @@ def test_nack_final_attempt_inline_dlq(cur: psycopg2.extensions.cursor) -> None:
 
     # Second consume + nack: this is the final attempt; should retire inline.
     cur.execute("""
-        SELECT message_id, consumer_token FROM consume_message('TestQueue', 30)
+        SELECT message_id, consumer_token FROM postgremq.consume_message('TestQueue', 30)
     """)
     msg_id2, token2 = cur.fetchone()
     assert msg_id2 == msg_id
 
-    cur.execute("SELECT nack_message('TestQueue', %s, %s, NOW())", (msg_id, token2))
+    cur.execute("SELECT postgremq.nack_message('TestQueue', %s, %s, NOW())", (msg_id, token2))
 
-    # Row should be gone from queue_messages and present in DLQ — without
+    # Row should be gone from postgremq.queue_messages and present in DLQ — without
     # any maintenance call.
     cur.execute("""
-        SELECT 1 FROM queue_messages
+        SELECT 1 FROM postgremq.queue_messages
         WHERE queue_name='TestQueue' AND message_id=%s
     """, (msg_id,))
     assert cur.fetchone() is None
 
     cur.execute("""
-        SELECT retry_count FROM dead_letter_queue
+        SELECT retry_count FROM postgremq.dead_letter_queue
         WHERE queue_name='TestQueue' AND message_id=%s
     """, (msg_id,))
     dlq_row = cur.fetchone()
@@ -1523,38 +1519,38 @@ def test_nack_final_attempt_inline_dlq(cur: psycopg2.extensions.cursor) -> None:
 
 def test_nack_non_final_does_not_dlq(cur: psycopg2.extensions.cursor) -> None:
     """A non-final nack must not retire the message to DLQ even if retries remain."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 5, false)")
-    cur.execute("SELECT publish_message('TestTopic', '{\"k\":\"v\"}'::jsonb)")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('TestQueue', 'TestTopic', 5, false)")
+    cur.execute("SELECT postgremq.publish_message('TestTopic', '{\"k\":\"v\"}'::jsonb)")
 
-    cur.execute("SELECT message_id, consumer_token FROM consume_message('TestQueue', 30)")
+    cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('TestQueue', 30)")
     msg_id, token = cur.fetchone()
-    cur.execute("SELECT nack_message('TestQueue', %s, %s, NOW())", (msg_id, token))
+    cur.execute("SELECT postgremq.nack_message('TestQueue', %s, %s, NOW())", (msg_id, token))
 
     cur.execute("""
-        SELECT status FROM queue_messages
+        SELECT status FROM postgremq.queue_messages
         WHERE queue_name='TestQueue' AND message_id=%s
     """, (msg_id,))
     assert cur.fetchone()['status'] == 'pending'
 
     cur.execute("""
-        SELECT 1 FROM dead_letter_queue
+        SELECT 1 FROM postgremq.dead_letter_queue
         WHERE queue_name='TestQueue' AND message_id=%s
     """, (msg_id,))
     assert cur.fetchone() is None
 
 def test_unlimited_attempts_never_dlq_inline(cur: psycopg2.extensions.cursor) -> None:
     """When max_delivery_attempts=0 (unlimited), nack must never retire inline."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 0, false)")
-    cur.execute("SELECT publish_message('TestTopic', '{\"k\":\"v\"}'::jsonb)")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('TestQueue', 'TestTopic', 0, false)")
+    cur.execute("SELECT postgremq.publish_message('TestTopic', '{\"k\":\"v\"}'::jsonb)")
 
     for _ in range(5):
-        cur.execute("SELECT message_id, consumer_token FROM consume_message('TestQueue', 30)")
+        cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('TestQueue', 30)")
         msg_id, token = cur.fetchone()
-        cur.execute("SELECT nack_message('TestQueue', %s, %s, NOW())", (msg_id, token))
+        cur.execute("SELECT postgremq.nack_message('TestQueue', %s, %s, NOW())", (msg_id, token))
 
-    cur.execute("SELECT count(*) FROM dead_letter_queue WHERE queue_name='TestQueue'")
+    cur.execute("SELECT count(*) FROM postgremq.dead_letter_queue WHERE queue_name='TestQueue'")
     assert cur.fetchone()[0] == 0
 
 def parse_timestamp(ts_str: str) -> datetime:
@@ -1563,55 +1559,55 @@ def parse_timestamp(ts_str: str) -> datetime:
 
 def test_get_next_visible_time(cur: psycopg2.extensions.cursor) -> None:
     """Test getting next message visibility time."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 2, false)")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('TestQueue', 'TestTopic', 2, false)")
     
     # When no messages, should return NULL
-    cur.execute("SELECT get_next_visible_time('TestQueue')")
+    cur.execute("SELECT postgremq.get_next_visible_time('TestQueue')")
     assert cur.fetchone()[0] is None
     
     # Publish message with 2 second delay
     delay_time = datetime.now(pytz.UTC) + timedelta(seconds=2)
     cur.execute("""
-        SELECT publish_message('TestTopic', '{"test":"data"}'::jsonb, %s)
+        SELECT postgremq.publish_message('TestTopic', '{"test":"data"}'::jsonb, %s)
     """, (delay_time,))
     
     # Should return the delay time
-    cur.execute("SELECT get_next_visible_time('TestQueue')")
+    cur.execute("SELECT postgremq.get_next_visible_time('TestQueue')")
     next_time = cur.fetchone()[0]
     assert abs(next_time - delay_time) < timedelta(milliseconds=100)
     
     # Publish immediate message
     cur.execute("""
-        SELECT publish_message('TestTopic', '{"test":"immediate"}'::jsonb)
+        SELECT postgremq.publish_message('TestTopic', '{"test":"immediate"}'::jsonb)
     """)
     
     # Should return current time (immediate message)
-    cur.execute("SELECT get_next_visible_time('TestQueue')")
+    cur.execute("SELECT postgremq.get_next_visible_time('TestQueue')")
     next_time = cur.fetchone()[0]
     assert abs(next_time - datetime.now(pytz.UTC)) < timedelta(seconds=1)
     
     # Consume one message
-    cur.execute("SELECT * FROM consume_message('TestQueue', 30)")
+    cur.execute("SELECT * FROM postgremq.consume_message('TestQueue', 30)")
     msg = cur.fetchone()
     
     # Should still return delay_time for the delayed message
-    cur.execute("SELECT get_next_visible_time('TestQueue')")
+    cur.execute("SELECT postgremq.get_next_visible_time('TestQueue')")
     next_time = cur.fetchone()[0]
     assert abs(next_time - delay_time) < timedelta(milliseconds=100)
 
 def test_consume_message_published_at(cur: psycopg2.extensions.cursor) -> None:
     """Test that consume_message returns published_at timestamp."""
-    cur.execute("SELECT create_topic('TestTopic')")
-    cur.execute("SELECT create_queue('TestQueue', 'TestTopic', 2, false)")
+    cur.execute("SELECT postgremq.create_topic('TestTopic')")
+    cur.execute("SELECT postgremq.create_queue('TestQueue', 'TestTopic', 2, false)")
     
     # Publish a message and record approximate time
     before_publish = datetime.now(pytz.UTC)
-    cur.execute("SELECT publish_message('TestTopic', '{\"test\":\"data\"}'::jsonb)")
+    cur.execute("SELECT postgremq.publish_message('TestTopic', '{\"test\":\"data\"}'::jsonb)")
     after_publish = datetime.now(pytz.UTC)
     
     # Consume the message
-    cur.execute("SELECT * FROM consume_message('TestQueue', 30)")
+    cur.execute("SELECT * FROM postgremq.consume_message('TestQueue', 30)")
     msg = cur.fetchone()
     
     # Verify published_at is set and within the expected timeframe
@@ -1622,112 +1618,112 @@ def test_consume_message_published_at(cur: psycopg2.extensions.cursor) -> None:
 def test_cascade_behavior(cur: psycopg2.extensions.cursor) -> None:
     """Test that CASCADE relationships work correctly between tables."""
     # Setup - Create test data
-    cur.execute("SELECT create_topic('test_cascade_topic')")
-    cur.execute("SELECT create_queue('test_cascade_queue', 'test_cascade_topic', 3, false)")
+    cur.execute("SELECT postgremq.create_topic('test_cascade_topic')")
+    cur.execute("SELECT postgremq.create_queue('test_cascade_queue', 'test_cascade_topic', 3, false)")
     
     # Publish 3 test messages
     for i in range(1, 4):
-        query = f"SELECT publish_message('test_cascade_topic', '{{\"test\": \"cascade{i}\"}}'::jsonb)"
+        query = f"SELECT postgremq.publish_message('test_cascade_topic', '{{\"test\": \"cascade{i}\"}}'::jsonb)"
         cur.execute(query)
     
     # Verify initial state - should be 3 messages in the queue
-    cur.execute("SELECT COUNT(*) FROM list_messages('test_cascade_queue')")
+    cur.execute("SELECT COUNT(*) FROM postgremq.list_messages('test_cascade_queue')")
     assert cur.fetchone()[0] == 3, "Should have 3 messages initially"
     
     # Get one message ID to delete directly
-    cur.execute("SELECT message_id FROM queue_messages WHERE queue_name = 'test_cascade_queue' LIMIT 1")
+    cur.execute("SELECT message_id FROM postgremq.queue_messages WHERE queue_name = 'test_cascade_queue' LIMIT 1")
     message_id = cur.fetchone()[0]
     
     # Test 1: Delete a message directly - should cascade to queue_messages
-    cur.execute("DELETE FROM messages WHERE id = %s", (message_id,))
+    cur.execute("DELETE FROM postgremq.messages WHERE id = %s", (message_id,))
     
-    # Verify message is gone from queue_messages too
-    cur.execute("SELECT COUNT(*) FROM queue_messages WHERE message_id = %s", (message_id,))
-    assert cur.fetchone()[0] == 0, "Message reference should be deleted from queue_messages"
+    # Verify message is gone from postgremq.queue_messages too
+    cur.execute("SELECT COUNT(*) FROM postgremq.queue_messages WHERE message_id = %s", (message_id,))
+    assert cur.fetchone()[0] == 0, "Message reference should be deleted from postgremq.queue_messages"
     
     # Verify we now have 2 messages in the queue
-    cur.execute("SELECT COUNT(*) FROM list_messages('test_cascade_queue')")
+    cur.execute("SELECT COUNT(*) FROM postgremq.list_messages('test_cascade_queue')")
     assert cur.fetchone()[0] == 2, "Should have 2 messages after direct deletion"
     
     # Test 2: Clean up topic - should cascade to queue_messages
-    cur.execute("SELECT clean_up_topic('test_cascade_topic')")
+    cur.execute("SELECT postgremq.clean_up_topic('test_cascade_topic')")
     
     # Verify all messages are gone
-    cur.execute("SELECT COUNT(*) FROM list_messages('test_cascade_queue')")
+    cur.execute("SELECT COUNT(*) FROM postgremq.list_messages('test_cascade_queue')")
     assert cur.fetchone()[0] == 0, "No messages should remain after topic cleanup"
     
     # Create new messages for test 3
     for i in range(1, 4):
-        query = f"SELECT publish_message('test_cascade_topic', '{{\"test\": \"cascade_test3_{i}\"}}'::jsonb)"
+        query = f"SELECT postgremq.publish_message('test_cascade_topic', '{{\"test\": \"cascade_test3_{i}\"}}'::jsonb)"
         cur.execute(query)
     
     # Test 3: Delete topic - should cascade to queues, messages, and queue_messages
-    cur.execute("DELETE FROM topics WHERE name = 'test_cascade_topic'")
+    cur.execute("DELETE FROM postgremq.topics WHERE name = 'test_cascade_topic'")
     
     # Verify queue is gone
-    cur.execute("SELECT COUNT(*) FROM queues WHERE name = 'test_cascade_queue'")
+    cur.execute("SELECT COUNT(*) FROM postgremq.queues WHERE name = 'test_cascade_queue'")
     assert cur.fetchone()[0] == 0, "Queue should be deleted when topic is deleted"
     
     # Verify no messages remain for this topic
-    cur.execute("SELECT COUNT(*) FROM messages WHERE topic_name = 'test_cascade_topic'")
+    cur.execute("SELECT COUNT(*) FROM postgremq.messages WHERE topic_name = 'test_cascade_topic'")
     assert cur.fetchone()[0] == 0, "Messages should be deleted when topic is deleted"
     
     # Verify no queue_messages entries remain
-    cur.execute("SELECT COUNT(*) FROM queue_messages WHERE queue_name = 'test_cascade_queue'")
+    cur.execute("SELECT COUNT(*) FROM postgremq.queue_messages WHERE queue_name = 'test_cascade_queue'")
     assert cur.fetchone()[0] == 0, "Queue message entries should be deleted when topic is deleted"
 
 def test_delete_inactive_queues_edge_cases(cur: psycopg2.extensions.cursor) -> None:
     """Test edge cases for delete_inactive_queues function."""
     # Test 1: Empty database
-    cur.execute("SELECT delete_inactive_queues()")
+    cur.execute("SELECT postgremq.delete_inactive_queues()")
     # Should complete without error
     
     # Test 2: Queue with NULL keep_alive_until
-    cur.execute("SELECT create_topic('null_ka_topic')")
-    cur.execute("SELECT create_queue('null_ka_queue', 'null_ka_topic', 3, true)")
+    cur.execute("SELECT postgremq.create_topic('null_ka_topic')")
+    cur.execute("SELECT postgremq.create_queue('null_ka_queue', 'null_ka_topic', 3, true)")
     
     # Manually set keep_alive_until to NULL
-    cur.execute("UPDATE queues SET keep_alive_until = NULL WHERE name = 'null_ka_queue'")
+    cur.execute("UPDATE postgremq.queues SET keep_alive_until = NULL WHERE name = 'null_ka_queue'")
     
     # Verify it's NULL
-    cur.execute("SELECT keep_alive_until FROM queues WHERE name = 'null_ka_queue'")
+    cur.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'null_ka_queue'")
     assert cur.fetchone()[0] is None
     
     # Delete inactive queues
-    cur.execute("SELECT delete_inactive_queues()")
+    cur.execute("SELECT postgremq.delete_inactive_queues()")
     
     # Verify the queue was deleted (should be, as it's exclusive with NULL keep_alive_until)
-    cur.execute("SELECT COUNT(*) FROM queues WHERE name = 'null_ka_queue'")
+    cur.execute("SELECT COUNT(*) FROM postgremq.queues WHERE name = 'null_ka_queue'")
     assert cur.fetchone()[0] == 0
     
     # Clean up
-    cur.execute("DELETE FROM topics WHERE name = 'null_ka_topic'")
+    cur.execute("DELETE FROM postgremq.topics WHERE name = 'null_ka_topic'")
 
 def test_get_next_visible_time_multiple_queues(cur: psycopg2.extensions.cursor) -> None:
     """Test get_next_visible_time with multiple queues."""
     # Create separate topics for each queue to avoid cross-routing of messages
-    cur.execute("SELECT create_topic('MultiQTopic1')")
-    cur.execute("SELECT create_topic('MultiQTopic2')")
-    cur.execute("SELECT create_queue('Queue1', 'MultiQTopic1', 2, false)")
-    cur.execute("SELECT create_queue('Queue2', 'MultiQTopic2', 2, false)")
+    cur.execute("SELECT postgremq.create_topic('MultiQTopic1')")
+    cur.execute("SELECT postgremq.create_topic('MultiQTopic2')")
+    cur.execute("SELECT postgremq.create_queue('Queue1', 'MultiQTopic1', 2, false)")
+    cur.execute("SELECT postgremq.create_queue('Queue2', 'MultiQTopic2', 2, false)")
     
     # Add a message to Queue1 with a 5-second delay
     delay1 = datetime.now(pytz.UTC) + timedelta(seconds=5)
     cur.execute("""
-        SELECT publish_message('MultiQTopic1', '{"test":"queue1"}'::jsonb, %s)
+        SELECT postgremq.publish_message('MultiQTopic1', '{"test":"queue1"}'::jsonb, %s)
     """, (delay1,))
     
     # Add a message to Queue2 with a 2-second delay
     delay2 = datetime.now(pytz.UTC) + timedelta(seconds=2)
     cur.execute("""
-        SELECT publish_message('MultiQTopic2', '{"test":"queue2"}'::jsonb, %s)
+        SELECT postgremq.publish_message('MultiQTopic2', '{"test":"queue2"}'::jsonb, %s)
     """, (delay2,))
     
     # Check both queues
-    cur.execute("SELECT get_next_visible_time('Queue1')")
+    cur.execute("SELECT postgremq.get_next_visible_time('Queue1')")
     next_time1 = cur.fetchone()[0]
     
-    cur.execute("SELECT get_next_visible_time('Queue2')")
+    cur.execute("SELECT postgremq.get_next_visible_time('Queue2')")
     next_time2 = cur.fetchone()[0]
     
     # Check that next_time2 is earlier than next_time1
@@ -1735,72 +1731,72 @@ def test_get_next_visible_time_multiple_queues(cur: psycopg2.extensions.cursor) 
     assert next_time2 < next_time1, "Queue2 should have an earlier next visible time than Queue1"
     
     # Clean up
-    cur.execute("DELETE FROM queues WHERE name IN ('Queue1', 'Queue2')")
-    cur.execute("DELETE FROM topics WHERE name IN ('MultiQTopic1', 'MultiQTopic2')")
+    cur.execute("DELETE FROM postgremq.queues WHERE name IN ('Queue1', 'Queue2')")
+    cur.execute("DELETE FROM postgremq.topics WHERE name IN ('MultiQTopic1', 'MultiQTopic2')")
 
 def test_cleanup_functions_edge_cases(cur: psycopg2.extensions.cursor) -> None:
     """Test edge cases for cleanup functions."""
     # Setup
-    cur.execute("SELECT create_topic('CleanupTopic')")
-    cur.execute("SELECT create_queue('CleanupQueue', 'CleanupTopic', 3, false)")
+    cur.execute("SELECT postgremq.create_topic('CleanupTopic')")
+    cur.execute("SELECT postgremq.create_queue('CleanupQueue', 'CleanupTopic', 3, false)")
     
     # Test 1: Clean up empty topic/queue
-    cur.execute("SELECT clean_up_queue('CleanupQueue')")
-    cur.execute("SELECT clean_up_topic('CleanupTopic')")
+    cur.execute("SELECT postgremq.clean_up_queue('CleanupQueue')")
+    cur.execute("SELECT postgremq.clean_up_topic('CleanupTopic')")
     
     # Test 2: Clean up non-existent queue/topic - should execute without errors
-    cur.execute("SELECT clean_up_queue('NonExistentQueue')")
-    cur.execute("SELECT clean_up_topic('NonExistentTopic')")
+    cur.execute("SELECT postgremq.clean_up_queue('NonExistentQueue')")
+    cur.execute("SELECT postgremq.clean_up_topic('NonExistentTopic')")
     
     # Test 3: Publish messages, then clean up
     for i in range(3):
         cur.execute(
-            "SELECT publish_message('CleanupTopic', %s::jsonb)",
+            "SELECT postgremq.publish_message('CleanupTopic', %s::jsonb)",
             (json.dumps({"test": f"cleanup-{i}"}),)
         )
     
     # Consume one message to have mixed statuses
-    cur.execute("SELECT * FROM consume_message('CleanupQueue', 30, 1)")
+    cur.execute("SELECT * FROM postgremq.consume_message('CleanupQueue', 30, 1)")
     
     # Clean up the queue
-    cur.execute("SELECT clean_up_queue('CleanupQueue')")
+    cur.execute("SELECT postgremq.clean_up_queue('CleanupQueue')")
     
     # Verify all messages are gone from queue
-    cur.execute("SELECT COUNT(*) FROM queue_messages WHERE queue_name = 'CleanupQueue'")
+    cur.execute("SELECT COUNT(*) FROM postgremq.queue_messages WHERE queue_name = 'CleanupQueue'")
     assert cur.fetchone()[0] == 0
     
     # Clean up the topic
-    cur.execute("SELECT clean_up_topic('CleanupTopic')")
+    cur.execute("SELECT postgremq.clean_up_topic('CleanupTopic')")
     
     # Verify all messages are gone from the topic
-    cur.execute("SELECT COUNT(*) FROM messages WHERE topic_name = 'CleanupTopic'")
+    cur.execute("SELECT COUNT(*) FROM postgremq.messages WHERE topic_name = 'CleanupTopic'")
     assert cur.fetchone()[0] == 0
     
     # Clean up
-    cur.execute("DELETE FROM queues WHERE name = 'CleanupQueue'")
-    cur.execute("DELETE FROM topics WHERE name = 'CleanupTopic'")
+    cur.execute("DELETE FROM postgremq.queues WHERE name = 'CleanupQueue'")
+    cur.execute("DELETE FROM postgremq.topics WHERE name = 'CleanupTopic'")
 
 def test_cleanup_completed_messages(cur: psycopg2.extensions.cursor) -> None:
     """Test cleanup_completed_messages removes only stale completed entries."""
-    cur.execute("SELECT create_topic('CleanupRetentionTopic')")
-    cur.execute("SELECT create_queue('CleanupRetentionQueue', 'CleanupRetentionTopic', 3, false)")
+    cur.execute("SELECT postgremq.create_topic('CleanupRetentionTopic')")
+    cur.execute("SELECT postgremq.create_queue('CleanupRetentionQueue', 'CleanupRetentionTopic', 3, false)")
     
     for i in range(2):
         cur.execute(
-            "SELECT publish_message('CleanupRetentionTopic', %s::jsonb)",
+            "SELECT postgremq.publish_message('CleanupRetentionTopic', %s::jsonb)",
             (json.dumps({"test": f"cleanup-retention-{i}"}),)
         )
     
     cur.execute("""
         SELECT message_id, consumer_token
-        FROM consume_message('CleanupRetentionQueue', 30, 2)
+        FROM postgremq.consume_message('CleanupRetentionQueue', 30, 2)
     """)
     messages = cur.fetchall()
     assert len(messages) == 2, "Should consume both messages"
     
     for msg in messages:
         cur.execute(
-            "SELECT ack_message('CleanupRetentionQueue', %s, %s)",
+            "SELECT postgremq.ack_message('CleanupRetentionQueue', %s, %s)",
             (msg['message_id'], msg['consumer_token'])
         )
     
@@ -1808,124 +1804,124 @@ def test_cleanup_completed_messages(cur: psycopg2.extensions.cursor) -> None:
     newer_id = messages[1]['message_id']
     
     cur.execute("""
-        UPDATE queue_messages
+        UPDATE postgremq.queue_messages
         SET processed_at = NOW() - interval '2 hours'
         WHERE queue_name = 'CleanupRetentionQueue' AND message_id = %s
     """, (older_id,))
     cur.execute("""
-        UPDATE queue_messages
+        UPDATE postgremq.queue_messages
         SET processed_at = NOW() - interval '30 minutes'
         WHERE queue_name = 'CleanupRetentionQueue' AND message_id = %s
     """, (newer_id,))
     
-    cur.execute("SELECT cleanup_completed_messages(1)")
+    cur.execute("SELECT postgremq.cleanup_completed_messages(1)")
     deleted = cur.fetchone()[0]
     assert deleted == 1, "Exactly one completed message should be removed"
     
     cur.execute("""
         SELECT COUNT(*)
-        FROM queue_messages
+        FROM postgremq.queue_messages
         WHERE queue_name = 'CleanupRetentionQueue' AND message_id = %s
     """, (older_id,))
     assert cur.fetchone()[0] == 0, "Old completed message should be deleted"
     
     cur.execute("""
         SELECT status
-        FROM queue_messages
+        FROM postgremq.queue_messages
         WHERE queue_name = 'CleanupRetentionQueue' AND message_id = %s
     """, (newer_id,))
     assert cur.fetchone()[0] == 'completed', "Recent completed message should remain"
     
     cur.execute("""
-        UPDATE queue_messages
+        UPDATE postgremq.queue_messages
         SET processed_at = NOW() - interval '2 days'
         WHERE queue_name = 'CleanupRetentionQueue' AND message_id = %s
     """, (newer_id,))
     
-    cur.execute("SELECT cleanup_completed_messages()")
+    cur.execute("SELECT postgremq.cleanup_completed_messages()")
     deleted_second = cur.fetchone()[0]
     assert deleted_second == 1, "Default retention should remove stale completed entries"
     
     cur.execute("""
         SELECT COUNT(*)
-        FROM queue_messages
+        FROM postgremq.queue_messages
         WHERE queue_name = 'CleanupRetentionQueue'
     """)
     assert cur.fetchone()[0] == 0, "No queue entries should remain after cleanup"
     
-    cur.execute("SELECT clean_up_topic('CleanupRetentionTopic')")
-    cur.execute("SELECT delete_queue('CleanupRetentionQueue')")
-    cur.execute("SELECT delete_topic('CleanupRetentionTopic')")
+    cur.execute("SELECT postgremq.clean_up_topic('CleanupRetentionTopic')")
+    cur.execute("SELECT postgremq.delete_queue('CleanupRetentionQueue')")
+    cur.execute("SELECT postgremq.delete_topic('CleanupRetentionTopic')")
 
 def test_purge_all_messages_states(cur: psycopg2.extensions.cursor) -> None:
     """Test purge_all_messages with messages in different states."""
     # Setup multiple topics and queues
-    cur.execute("SELECT create_topic('PurgeTopic1')")
-    cur.execute("SELECT create_topic('PurgeTopic2')")
-    cur.execute("SELECT create_queue('PurgeQueue1', 'PurgeTopic1', 3, false)")
-    cur.execute("SELECT create_queue('PurgeQueue2', 'PurgeTopic2', 3, false)")
+    cur.execute("SELECT postgremq.create_topic('PurgeTopic1')")
+    cur.execute("SELECT postgremq.create_topic('PurgeTopic2')")
+    cur.execute("SELECT postgremq.create_queue('PurgeQueue1', 'PurgeTopic1', 3, false)")
+    cur.execute("SELECT postgremq.create_queue('PurgeQueue2', 'PurgeTopic2', 3, false)")
     
     # Publish messages to both topics
     for i in range(3):
         cur.execute(
-            "SELECT publish_message('PurgeTopic1', %s::jsonb)",
+            "SELECT postgremq.publish_message('PurgeTopic1', %s::jsonb)",
             (json.dumps({"test": f"purge1-{i}"}),)
         )
         cur.execute(
-            "SELECT publish_message('PurgeTopic2', %s::jsonb)",
+            "SELECT postgremq.publish_message('PurgeTopic2', %s::jsonb)",
             (json.dumps({"test": f"purge2-{i}"}),)
         )
     
     # Consume some messages to get them in different states
-    cur.execute("SELECT * FROM consume_message('PurgeQueue1', 30, 2)")
+    cur.execute("SELECT * FROM postgremq.consume_message('PurgeQueue1', 30, 2)")
     msg = cur.fetchone()
     if msg:
         # Complete one message
         cur.execute("""
-            SELECT ack_message('PurgeQueue1', %s, %s)
+            SELECT postgremq.ack_message('PurgeQueue1', %s, %s)
         """, (msg['message_id'], msg['consumer_token']))
     
     # Nack one message from queue2 with delay
-    cur.execute("SELECT * FROM consume_message('PurgeQueue2', 30, 1)")
+    cur.execute("SELECT * FROM postgremq.consume_message('PurgeQueue2', 30, 1)")
     msg = cur.fetchone()
     if msg:
         delay_time = datetime.now(pytz.UTC) + timedelta(seconds=10)
         cur.execute("""
-            SELECT nack_message('PurgeQueue2', %s, %s, %s)
+            SELECT postgremq.nack_message('PurgeQueue2', %s, %s, %s)
         """, (msg['message_id'], msg['consumer_token'], delay_time))
     
     # Verify initial message counts
-    cur.execute("SELECT COUNT(*) FROM messages")
+    cur.execute("SELECT COUNT(*) FROM postgremq.messages")
     initial_msg_count = cur.fetchone()[0]
     assert initial_msg_count > 0
     
     # Purge all messages
-    cur.execute("SELECT purge_all_messages()")
+    cur.execute("SELECT postgremq.purge_all_messages()")
     
     # Verify all messages are gone
-    cur.execute("SELECT COUNT(*) FROM messages")
+    cur.execute("SELECT COUNT(*) FROM postgremq.messages")
     assert cur.fetchone()[0] == 0
     
-    cur.execute("SELECT COUNT(*) FROM queue_messages")
+    cur.execute("SELECT COUNT(*) FROM postgremq.queue_messages")
     assert cur.fetchone()[0] == 0
     
     # Clean up
-    cur.execute("DELETE FROM queues WHERE name IN ('PurgeQueue1', 'PurgeQueue2')")
-    cur.execute("DELETE FROM topics WHERE name IN ('PurgeTopic1', 'PurgeTopic2')")
+    cur.execute("DELETE FROM postgremq.queues WHERE name IN ('PurgeQueue1', 'PurgeQueue2')")
+    cur.execute("DELETE FROM postgremq.topics WHERE name IN ('PurgeTopic1', 'PurgeTopic2')")
 
 def test_complex_cascade_behavior(cur: psycopg2.extensions.cursor) -> None:
     """Test cascade behavior with complex relationships between topics, queues, and messages."""
     # Setup - create multiple topics and queues
     topics = ['CascadeTopic1', 'CascadeTopic2']
     for topic in topics:
-        cur.execute(f"SELECT create_topic('{topic}')")
+        cur.execute(f"SELECT postgremq.create_topic('{topic}')")
     
     # Create 2 queues per topic (4 total)
     queues = []
     for topic in topics:
         for i in range(1, 3):
             queue_name = f"{topic}_Queue{i}"
-            cur.execute(f"SELECT create_queue('{queue_name}', '{topic}', 3, false)")
+            cur.execute(f"SELECT postgremq.create_queue('{queue_name}', '{topic}', 3, false)")
             queues.append(queue_name)
     
     # Publish multiple messages to each topic
@@ -1933,158 +1929,158 @@ def test_complex_cascade_behavior(cur: psycopg2.extensions.cursor) -> None:
     for topic in topics:
         for i in range(3):
             cur.execute(
-                "SELECT publish_message(%s, %s::jsonb)",
+                "SELECT postgremq.publish_message(%s, %s::jsonb)",
                 (topic, json.dumps({"test": f"{topic}-msg{i}"})))
             cur.execute("SELECT lastval()")
             msg_ids.append(cur.fetchone()[0])
     
     # Consume some messages from each queue
     for queue in queues:
-        cur.execute(f"SELECT * FROM consume_message('{queue}', 30, 1)")
+        cur.execute(f"SELECT * FROM postgremq.consume_message('{queue}', 30, 1)")
         msg = cur.fetchone()
         if msg:
             # Complete some, leave others in processing state
             if queue.endswith("Queue1"):
                 cur.execute(
-                    "SELECT ack_message(%s, %s, %s)",
+                    "SELECT postgremq.ack_message(%s, %s, %s)",
                     (queue, msg['message_id'], msg['consumer_token'])
                 )
     
     # Test 1: Delete one queue and verify its queue_messages are gone
     test_queue = queues[0]
-    cur.execute(f"SELECT delete_queue('{test_queue}')")
+    cur.execute(f"SELECT postgremq.delete_queue('{test_queue}')")
     
-    cur.execute(f"SELECT COUNT(*) FROM queue_messages WHERE queue_name = '{test_queue}'")
+    cur.execute(f"SELECT COUNT(*) FROM postgremq.queue_messages WHERE queue_name = '{test_queue}'")
     assert cur.fetchone()[0] == 0
     
     # Test 2: Delete one topic and verify cascade effects
     test_topic = topics[0]
     
     # Get counts before
-    cur.execute(f"SELECT COUNT(*) FROM messages WHERE topic_name = '{test_topic}'")
+    cur.execute(f"SELECT COUNT(*) FROM postgremq.messages WHERE topic_name = '{test_topic}'")
     topic_msg_count = cur.fetchone()[0]
     assert topic_msg_count > 0
     
     topic_queues = [q for q in queues if q.startswith(test_topic)]
     queue_msg_count = 0
     for queue in topic_queues:
-        cur.execute(f"SELECT COUNT(*) FROM queue_messages WHERE queue_name = '{queue}'")
+        cur.execute(f"SELECT COUNT(*) FROM postgremq.queue_messages WHERE queue_name = '{queue}'")
         queue_msg_count += cur.fetchone()[0]
     
     # Delete the topic
     # First, clean up all messages for this topic 
-    cur.execute(f"DELETE FROM messages WHERE topic_name = '{test_topic}'")
+    cur.execute(f"DELETE FROM postgremq.messages WHERE topic_name = '{test_topic}'")
     
     # Now we can delete the topic
-    cur.execute(f"SELECT delete_topic('{test_topic}')")
+    cur.execute(f"SELECT postgremq.delete_topic('{test_topic}')")
     
     # Verify topic is gone
-    cur.execute(f"SELECT COUNT(*) FROM messages WHERE topic_name = '{test_topic}'")
+    cur.execute(f"SELECT COUNT(*) FROM postgremq.messages WHERE topic_name = '{test_topic}'")
     assert cur.fetchone()[0] == 0
     
     for queue in topic_queues:
-        cur.execute(f"SELECT COUNT(*) FROM queues WHERE name = '{queue}'")
+        cur.execute(f"SELECT COUNT(*) FROM postgremq.queues WHERE name = '{queue}'")
         assert cur.fetchone()[0] == 0
         
-        cur.execute(f"SELECT COUNT(*) FROM queue_messages WHERE queue_name = '{queue}'")
+        cur.execute(f"SELECT COUNT(*) FROM postgremq.queue_messages WHERE queue_name = '{queue}'")
         assert cur.fetchone()[0] == 0
     
     # Clean up
     # Delete messages for remaining topics
     for topic in topics:
         if topic != test_topic:  # We already deleted messages for test_topic
-            cur.execute(f"DELETE FROM messages WHERE topic_name = '{topic}'")
-            cur.execute(f"SELECT delete_topic('{topic}')")
+            cur.execute(f"DELETE FROM postgremq.messages WHERE topic_name = '{topic}'")
+            cur.execute(f"SELECT postgremq.delete_topic('{topic}')")
 
 def test_nack_message_delays(cur: psycopg2.extensions.cursor) -> None:
     """Test nack_message with different delay strategies."""
     # Setup
-    cur.execute("SELECT create_topic('NackTopic')")
-    cur.execute("SELECT create_queue('NackQueue', 'NackTopic', 3, false)")
+    cur.execute("SELECT postgremq.create_topic('NackTopic')")
+    cur.execute("SELECT postgremq.create_queue('NackQueue', 'NackTopic', 3, false)")
     
     # Publish a series of messages
     for i in range(4):
         cur.execute(
-            "SELECT publish_message('NackTopic', %s::jsonb)",
+            "SELECT postgremq.publish_message('NackTopic', %s::jsonb)",
             (json.dumps({"test": f"nack-{i}"}),)
         )
     
     # Consume all messages
-    cur.execute("SELECT * FROM consume_message('NackQueue', 30, 4)")
+    cur.execute("SELECT * FROM postgremq.consume_message('NackQueue', 30, 4)")
     messages = cur.fetchall()
     
     # Test different nack delay strategies
     # 1. Immediate nack
     msg1 = messages[0]
     cur.execute("""
-        SELECT nack_message('NackQueue', %s, %s)
+        SELECT postgremq.nack_message('NackQueue', %s, %s)
     """, (msg1['message_id'], msg1['consumer_token']))
     
     # 2. Short delay (1 second)
     msg2 = messages[1]
     short_delay = datetime.now(pytz.UTC) + timedelta(seconds=1)
     cur.execute("""
-        SELECT nack_message('NackQueue', %s, %s, %s)
+        SELECT postgremq.nack_message('NackQueue', %s, %s, %s)
     """, (msg2['message_id'], msg2['consumer_token'], short_delay))
     
     # 3. Medium delay (3 seconds)
     msg3 = messages[2]
     medium_delay = datetime.now(pytz.UTC) + timedelta(seconds=3)
     cur.execute("""
-        SELECT nack_message('NackQueue', %s, %s, %s)
+        SELECT postgremq.nack_message('NackQueue', %s, %s, %s)
     """, (msg3['message_id'], msg3['consumer_token'], medium_delay))
     
     # 4. Long delay (5 seconds)
     msg4 = messages[3]
     long_delay = datetime.now(pytz.UTC) + timedelta(seconds=5)
     cur.execute("""
-        SELECT nack_message('NackQueue', %s, %s, %s)
+        SELECT postgremq.nack_message('NackQueue', %s, %s, %s)
     """, (msg4['message_id'], msg4['consumer_token'], long_delay))
     
     # Test immediate message availability
-    cur.execute("SELECT * FROM consume_message('NackQueue', 30, 1)")
+    cur.execute("SELECT * FROM postgremq.consume_message('NackQueue', 30, 1)")
     immediately_available = cur.fetchone()
     assert immediately_available is not None
     assert immediately_available['message_id'] == msg1['message_id']
     
     # Wait for 1.1 seconds and check for next message
     time.sleep(1.1)
-    cur.execute("SELECT * FROM consume_message('NackQueue', 30, 1)")
+    cur.execute("SELECT * FROM postgremq.consume_message('NackQueue', 30, 1)")
     short_delay_msg = cur.fetchone()
     assert short_delay_msg is not None
     assert short_delay_msg['message_id'] == msg2['message_id']
     
     # Wait for 2 more seconds and check
     time.sleep(2)
-    cur.execute("SELECT * FROM consume_message('NackQueue', 30, 1)")
+    cur.execute("SELECT * FROM postgremq.consume_message('NackQueue', 30, 1)")
     medium_delay_msg = cur.fetchone()
     assert medium_delay_msg is not None
     assert medium_delay_msg['message_id'] == msg3['message_id']
     
     # Wait final 2 seconds
     time.sleep(2)
-    cur.execute("SELECT * FROM consume_message('NackQueue', 30, 1)")
+    cur.execute("SELECT * FROM postgremq.consume_message('NackQueue', 30, 1)")
     long_delay_msg = cur.fetchone()
     assert long_delay_msg is not None
     assert long_delay_msg['message_id'] == msg4['message_id']
     
     # Clean up
-    cur.execute("DELETE FROM queues WHERE name = 'NackQueue'")
-    cur.execute("DELETE FROM topics WHERE name = 'NackTopic'")
+    cur.execute("DELETE FROM postgremq.queues WHERE name = 'NackQueue'")
+    cur.execute("DELETE FROM postgremq.topics WHERE name = 'NackTopic'")
 
 def test_release_message(cur: psycopg2.extensions.cursor) -> None:
     """Test release_message function for explicitly releasing a message without redelivery."""
     # Setup
-    cur.execute("SELECT create_topic('ReleaseTopic')")
-    cur.execute("SELECT create_queue('ReleaseQueue', 'ReleaseTopic', 3, false)")
+    cur.execute("SELECT postgremq.create_topic('ReleaseTopic')")
+    cur.execute("SELECT postgremq.create_queue('ReleaseQueue', 'ReleaseTopic', 3, false)")
     
     # Publish a message
-    cur.execute("SELECT publish_message('ReleaseTopic', '{\"test\": \"release\"}'::jsonb)")
+    cur.execute("SELECT postgremq.publish_message('ReleaseTopic', '{\"test\": \"release\"}'::jsonb)")
     
     # Consume the message
     cur.execute("""
         SELECT message_id, consumer_token
-        FROM consume_message('ReleaseQueue', 30)
+        FROM postgremq.consume_message('ReleaseQueue', 30)
     """)
     result = cur.fetchone()
     assert result is not None
@@ -2093,20 +2089,20 @@ def test_release_message(cur: psycopg2.extensions.cursor) -> None:
     # Verify message is in processing state
     cur.execute("""
         SELECT status
-        FROM queue_messages
+        FROM postgremq.queue_messages
         WHERE queue_name = 'ReleaseQueue' AND message_id = %s
     """, (msg_id,))
     assert cur.fetchone()[0] == 'processing'
     
     # Release the message - returns void, no result to assert
     cur.execute("""
-        SELECT release_message('ReleaseQueue', %s, %s)
+        SELECT postgremq.release_message('ReleaseQueue', %s, %s)
     """, (msg_id, token))
     
     # Verify message is back to pending state
     cur.execute("""
         SELECT status, delivery_attempts
-        FROM queue_messages
+        FROM postgremq.queue_messages
         WHERE queue_name = 'ReleaseQueue' AND message_id = %s
     """, (msg_id,))
     row = cur.fetchone()
@@ -2117,48 +2113,48 @@ def test_release_message(cur: psycopg2.extensions.cursor) -> None:
     # Message should be immediately available for consumption again
     cur.execute("""
         SELECT message_id
-        FROM consume_message('ReleaseQueue', 30)
+        FROM postgremq.consume_message('ReleaseQueue', 30)
     """)
     assert cur.fetchone()[0] == msg_id, "Message should be available for consumption again"
     
     # Test with invalid consumer token
     with pytest.raises(Exception):
         cur.execute("""
-            SELECT release_message('ReleaseQueue', %s, 'invalid-token')
+            SELECT postgremq.release_message('ReleaseQueue', %s, 'invalid-token')
         """, (msg_id,))
 
 def test_list_topics(cur: psycopg2.extensions.cursor) -> None:
     """Test list_topics function returns all created topics."""
     # Clean up any existing topics first
-    cur.execute("SELECT name FROM topics")
+    cur.execute("SELECT name FROM postgremq.topics")
     existing_topics = [row[0] for row in cur.fetchall()]
     for topic in existing_topics:
-        cur.execute("SELECT clean_up_topic(%s)", (topic,))
-        cur.execute("SELECT delete_topic(%s)", (topic,))
+        cur.execute("SELECT postgremq.clean_up_topic(%s)", (topic,))
+        cur.execute("SELECT postgremq.delete_topic(%s)", (topic,))
     
     # Verify no topics exist
-    cur.execute("SELECT COUNT(*) FROM list_topics()")
+    cur.execute("SELECT COUNT(*) FROM postgremq.list_topics()")
     assert cur.fetchone()[0] == 0, "Should start with no topics"
     
     # Create test topics
     test_topics = ['ListTopicA', 'ListTopicB', 'ListTopicC']
     for topic in test_topics:
-        cur.execute(f"SELECT create_topic('{topic}')")
+        cur.execute(f"SELECT postgremq.create_topic('{topic}')")
     
     # Test list_topics returns all topics - column is named "topic" not "name"
-    cur.execute("SELECT topic FROM list_topics() ORDER BY topic")
+    cur.execute("SELECT topic FROM postgremq.list_topics() ORDER BY topic")
     topics = [row[0] for row in cur.fetchall()]
     assert topics == sorted(test_topics), "list_topics should return all created topics"
     
     # Clean up
     for topic in test_topics:
-        cur.execute(f"SELECT delete_topic('{topic}')")
+        cur.execute(f"SELECT postgremq.delete_topic('{topic}')")
 
 def test_list_queues(cur: psycopg2.extensions.cursor) -> None:
     """Test list_queues function returns all created queues."""
     # Setup - create topics and queues
-    cur.execute("SELECT create_topic('ListQueueTopic1')")
-    cur.execute("SELECT create_topic('ListQueueTopic2')")
+    cur.execute("SELECT postgremq.create_topic('ListQueueTopic1')")
+    cur.execute("SELECT postgremq.create_topic('ListQueueTopic2')")
     
     # Create multiple queues for each topic
     queues = [
@@ -2170,11 +2166,11 @@ def test_list_queues(cur: psycopg2.extensions.cursor) -> None:
     
     for name, topic, attempts, exclusive in queues:
         cur.execute(f"""
-            SELECT create_queue('{name}', '{topic}', {attempts}, {exclusive})
+            SELECT postgremq.create_queue('{name}', '{topic}', {attempts}, {exclusive})
         """)
     
     # Test list_queues returns all queues - correct column names from function definition
-    cur.execute("SELECT queue_name, topic_name, max_delivery_attempts, exclusive FROM list_queues() ORDER BY queue_name")
+    cur.execute("SELECT queue_name, topic_name, max_delivery_attempts, exclusive FROM postgremq.list_queues() ORDER BY queue_name")
     result = cur.fetchall()
     assert len(result) >= len(queues), "Should return at least our test queues"
     
@@ -2192,36 +2188,36 @@ def test_list_queues(cur: psycopg2.extensions.cursor) -> None:
     
     # Clean up
     for name, topic, _, _ in queues:
-        cur.execute(f"SELECT delete_queue('{name}')")
+        cur.execute(f"SELECT postgremq.delete_queue('{name}')")
     
-    cur.execute("SELECT delete_topic('ListQueueTopic1')")
-    cur.execute("SELECT delete_topic('ListQueueTopic2')")
+    cur.execute("SELECT postgremq.delete_topic('ListQueueTopic1')")
+    cur.execute("SELECT postgremq.delete_topic('ListQueueTopic2')")
 
 def test_get_queue_statistics(cur: psycopg2.extensions.cursor) -> None:
     """Test get_queue_statistics function returns correct statistics for queues."""
     # Setup - create topic and queue
-    cur.execute("SELECT create_topic('StatsTopic')")
-    cur.execute("SELECT create_queue('StatsQueue', 'StatsTopic', 3, false)")
+    cur.execute("SELECT postgremq.create_topic('StatsTopic')")
+    cur.execute("SELECT postgremq.create_queue('StatsQueue', 'StatsTopic', 3, false)")
     
     # Publish messages
     for i in range(5):
         cur.execute(
-            "SELECT publish_message('StatsTopic', %s::jsonb)",
+            "SELECT postgremq.publish_message('StatsTopic', %s::jsonb)",
             (json.dumps({"test": f"stats-{i}"}),)
         )
     
     # Consume some messages to get different states
-    cur.execute("SELECT * FROM consume_message('StatsQueue', 30, 2)")
+    cur.execute("SELECT * FROM postgremq.consume_message('StatsQueue', 30, 2)")
     messages = cur.fetchall()
     
     # Complete one message
     if len(messages) > 0:
         cur.execute("""
-            SELECT ack_message('StatsQueue', %s, %s)
+            SELECT postgremq.ack_message('StatsQueue', %s, %s)
         """, (messages[0]['message_id'], messages[0]['consumer_token']))
     
     # Get statistics for this queue - uses correct column names from SQL function
-    cur.execute("SELECT pending_count, processing_count, completed_count, total_count FROM get_queue_statistics('StatsQueue')")
+    cur.execute("SELECT pending_count, processing_count, completed_count, total_count FROM postgremq.get_queue_statistics('StatsQueue')")
     stats = cur.fetchone()
     assert stats is not None
     
@@ -2232,45 +2228,45 @@ def test_get_queue_statistics(cur: psycopg2.extensions.cursor) -> None:
     assert stats[3] == 5, "Should have 5 total messages"
     
     # Test getting statistics for all queues
-    cur.execute("SELECT pending_count, processing_count, completed_count, total_count FROM get_queue_statistics()")
+    cur.execute("SELECT pending_count, processing_count, completed_count, total_count FROM postgremq.get_queue_statistics()")
     all_stats = cur.fetchone()
     assert all_stats is not None, "Should return statistics for all queues"
     assert all_stats[3] >= 5, "Should include at least our test messages in total"
     
     # Clean up - make sure to clean up the topic before deleting it
-    cur.execute("SELECT clean_up_queue('StatsQueue')")
-    cur.execute("SELECT delete_queue('StatsQueue')")
-    cur.execute("SELECT clean_up_topic('StatsTopic')")
-    cur.execute("SELECT delete_topic('StatsTopic')")
+    cur.execute("SELECT postgremq.clean_up_queue('StatsQueue')")
+    cur.execute("SELECT postgremq.delete_queue('StatsQueue')")
+    cur.execute("SELECT postgremq.clean_up_topic('StatsTopic')")
+    cur.execute("SELECT postgremq.delete_topic('StatsTopic')")
 
 def test_list_dlq_messages(cur: psycopg2.extensions.cursor) -> None:
     """Test list_dlq_messages function returns messages in the dead letter queue."""
     # Setup - create topic and queue
-    cur.execute("SELECT create_topic('DLQListTopic')")
-    cur.execute("SELECT create_queue('DLQListQueue', 'DLQListTopic', 1, false)")  # Only 1 retry
+    cur.execute("SELECT postgremq.create_topic('DLQListTopic')")
+    cur.execute("SELECT postgremq.create_queue('DLQListQueue', 'DLQListTopic', 1, false)")  # Only 1 retry
     
     # Publish messages
     for i in range(3):
         cur.execute(
-            "SELECT publish_message('DLQListTopic', %s::jsonb)",
+            "SELECT postgremq.publish_message('DLQListTopic', %s::jsonb)",
             (json.dumps({"test": f"dlq-{i}"}),)
         )
     
     # Consume and nack all messages to exceed max delivery attempts
     for _ in range(2):  # Need to consume and nack twice to exceed max_delivery_attempts
-        cur.execute("SELECT * FROM consume_message('DLQListQueue', 30, 3)")
+        cur.execute("SELECT * FROM postgremq.consume_message('DLQListQueue', 30, 3)")
         messages = cur.fetchall()
         
         for msg in messages:
             cur.execute("""
-                SELECT nack_message('DLQListQueue', %s, %s)
+                SELECT postgremq.nack_message('DLQListQueue', %s, %s)
             """, (msg['message_id'], msg['consumer_token']))
     
     # Move to DLQ
-    cur.execute("SELECT * FROM pmq_maintenance_fast()")
+    cur.execute("SELECT * FROM postgremq.pmq_maintenance_fast()")
     
     # Test list_dlq_messages with column names from SQL function
-    cur.execute("SELECT queue_name, message_id, retry_count, published_at FROM list_dlq_messages()")
+    cur.execute("SELECT queue_name, message_id, retry_count, published_at FROM postgremq.list_dlq_messages()")
     dlq_messages = cur.fetchall()
     
     assert len(dlq_messages) == 3, "All 3 messages should be in DLQ"
@@ -2283,68 +2279,68 @@ def test_list_dlq_messages(cur: psycopg2.extensions.cursor) -> None:
         assert msg[3] is not None  # published_at
     
     # Clean up - purge DLQ, clean up queue and topic before deletion
-    cur.execute("SELECT purge_dlq()")
-    cur.execute("SELECT clean_up_queue('DLQListQueue')")
-    cur.execute("SELECT delete_queue('DLQListQueue')")
-    cur.execute("SELECT clean_up_topic('DLQListTopic')")
-    cur.execute("SELECT delete_topic('DLQListTopic')")
+    cur.execute("SELECT postgremq.purge_dlq()")
+    cur.execute("SELECT postgremq.clean_up_queue('DLQListQueue')")
+    cur.execute("SELECT postgremq.delete_queue('DLQListQueue')")
+    cur.execute("SELECT postgremq.clean_up_topic('DLQListTopic')")
+    cur.execute("SELECT postgremq.delete_topic('DLQListTopic')")
 
 def test_purge_dlq(cur: psycopg2.extensions.cursor) -> None:
     """Test purge_dlq function removes all messages from the dead letter queue."""
     # Setup - create topic and queues
-    cur.execute("SELECT create_topic('PurgeDLQTopic')")
-    cur.execute("SELECT create_queue('PurgeDLQQueue1', 'PurgeDLQTopic', 1, false)")
+    cur.execute("SELECT postgremq.create_topic('PurgeDLQTopic')")
+    cur.execute("SELECT postgremq.create_queue('PurgeDLQQueue1', 'PurgeDLQTopic', 1, false)")
     
     # Publish messages to one queue
     for i in range(2):
         cur.execute(
-            "SELECT publish_message('PurgeDLQTopic', %s::jsonb)",
+            "SELECT postgremq.publish_message('PurgeDLQTopic', %s::jsonb)",
             (json.dumps({"test": f"purge-q1-{i}"}),)
         )
     
     # Consume and nack messages to exceed max delivery attempts
     for _ in range(2):  # Need to consume and nack twice to exceed max_delivery_attempts
-        cur.execute("SELECT * FROM consume_message('PurgeDLQQueue1', 30, 2)")
+        cur.execute("SELECT * FROM postgremq.consume_message('PurgeDLQQueue1', 30, 2)")
         messages = cur.fetchall()
         
         for msg in messages:
             cur.execute("""
-                SELECT nack_message('PurgeDLQQueue1', %s, %s)
+                SELECT postgremq.nack_message('PurgeDLQQueue1', %s, %s)
             """, (msg['message_id'], msg['consumer_token']))
     
     # Move to DLQ
-    cur.execute("SELECT * FROM pmq_maintenance_fast()")
+    cur.execute("SELECT * FROM postgremq.pmq_maintenance_fast()")
     
     # Verify messages are in DLQ
-    cur.execute("SELECT COUNT(*) FROM list_dlq_messages()")
+    cur.execute("SELECT COUNT(*) FROM postgremq.list_dlq_messages()")
     assert cur.fetchone()[0] == 2, "Should have 2 messages in DLQ"
     
     # Test purge_dlq
-    cur.execute("SELECT purge_dlq()")
+    cur.execute("SELECT postgremq.purge_dlq()")
     
     # Verify DLQ is empty
-    cur.execute("SELECT COUNT(*) FROM list_dlq_messages()")
+    cur.execute("SELECT COUNT(*) FROM postgremq.list_dlq_messages()")
     assert cur.fetchone()[0] == 0, "DLQ should be empty after purge"
     
     # Clean up - make sure to clean up topic before deletion
-    cur.execute("SELECT clean_up_queue('PurgeDLQQueue1')")
-    cur.execute("SELECT delete_queue('PurgeDLQQueue1')")
-    cur.execute("SELECT clean_up_topic('PurgeDLQTopic')")
-    cur.execute("SELECT delete_topic('PurgeDLQTopic')")
+    cur.execute("SELECT postgremq.clean_up_queue('PurgeDLQQueue1')")
+    cur.execute("SELECT postgremq.delete_queue('PurgeDLQQueue1')")
+    cur.execute("SELECT postgremq.clean_up_topic('PurgeDLQTopic')")
+    cur.execute("SELECT postgremq.delete_topic('PurgeDLQTopic')")
 
 def test_delete_queue_message(cur: psycopg2.extensions.cursor) -> None:
     """Test deleting a specific message from a queue."""
     # Create test topic and queue
     topic = "DeleteMsgTopic"
     queue = "DeleteMsgQueue"
-    cur.execute("SELECT create_topic(%s)", (topic,))
-    cur.execute("SELECT create_queue(%s, %s)", (queue, topic))
+    cur.execute("SELECT postgremq.create_topic(%s)", (topic,))
+    cur.execute("SELECT postgremq.create_queue(%s, %s)", (queue, topic))
     
     # Publish messages
     message_ids = []
     for i in range(3):
         cur.execute(
-            "SELECT publish_message(%s, %s::jsonb)",
+            "SELECT postgremq.publish_message(%s, %s::jsonb)",
             (topic, json.dumps({"test": f"delete-test-{i}"}))
         )
         cur.execute("SELECT lastval()")
@@ -2352,41 +2348,41 @@ def test_delete_queue_message(cur: psycopg2.extensions.cursor) -> None:
     
     # Delete the second message
     target_msg_id = message_ids[1]
-    cur.execute("SELECT delete_queue_message(%s, %s)", (queue, target_msg_id))
+    cur.execute("SELECT postgremq.delete_queue_message(%s, %s)", (queue, target_msg_id))
     
     # Verify message is deleted
-    cur.execute("SELECT COUNT(*) FROM queue_messages WHERE queue_name = %s AND message_id = %s", (queue, target_msg_id))
+    cur.execute("SELECT COUNT(*) FROM postgremq.queue_messages WHERE queue_name = %s AND message_id = %s", (queue, target_msg_id))
     assert cur.fetchone()[0] == 0, f"Message {target_msg_id} should be deleted"
     
     # Count remaining messages
-    cur.execute("SELECT COUNT(*) FROM queue_messages WHERE queue_name = %s", (queue,))
+    cur.execute("SELECT COUNT(*) FROM postgremq.queue_messages WHERE queue_name = %s", (queue,))
     assert cur.fetchone()[0] == 2, "Should have 2 messages remaining"
     
     # Clean up
-    cur.execute("SELECT clean_up_queue(%s)", (queue,))
-    cur.execute("SELECT delete_queue(%s)", (queue,))
-    cur.execute("SELECT clean_up_topic(%s)", (topic,))
-    cur.execute("SELECT delete_topic(%s)", (topic,))
+    cur.execute("SELECT postgremq.clean_up_queue(%s)", (queue,))
+    cur.execute("SELECT postgremq.delete_queue(%s)", (queue,))
+    cur.execute("SELECT postgremq.clean_up_topic(%s)", (topic,))
+    cur.execute("SELECT postgremq.delete_topic(%s)", (topic,))
 
 def test_get_message(cur: psycopg2.extensions.cursor) -> None:
     """Test retrieving a specific message by ID."""
     # Create test topic and queue
     topic = "GetMsgTopic"
     queue = "GetMsgQueue"
-    cur.execute("SELECT create_topic(%s)", (topic,))
-    cur.execute("SELECT create_queue(%s, %s)", (queue, topic))
+    cur.execute("SELECT postgremq.create_topic(%s)", (topic,))
+    cur.execute("SELECT postgremq.create_queue(%s, %s)", (queue, topic))
     
     # Publish a message
     test_payload = {"test": "get-message-test", "value": 42}
     cur.execute(
-        "SELECT publish_message(%s, %s::jsonb)",
+        "SELECT postgremq.publish_message(%s, %s::jsonb)",
         (topic, json.dumps(test_payload))
     )
     cur.execute("SELECT lastval()")
     msg_id = cur.fetchone()[0]
     
     # Get the message by ID
-    cur.execute("SELECT message_id, topic_name, payload, published_at FROM get_message(%s)", (msg_id,))
+    cur.execute("SELECT message_id, topic_name, payload, published_at FROM postgremq.get_message(%s)", (msg_id,))
     msg = cur.fetchone()
     
     # Verify message properties
@@ -2397,26 +2393,26 @@ def test_get_message(cur: psycopg2.extensions.cursor) -> None:
     assert msg[3] is not None, "Published timestamp should exist"
     
     # Clean up
-    cur.execute("SELECT clean_up_queue(%s)", (queue,))
-    cur.execute("SELECT delete_queue(%s)", (queue,))
-    cur.execute("SELECT clean_up_topic(%s)", (topic,))
-    cur.execute("SELECT delete_topic(%s)", (topic,))
+    cur.execute("SELECT postgremq.clean_up_queue(%s)", (queue,))
+    cur.execute("SELECT postgremq.delete_queue(%s)", (queue,))
+    cur.execute("SELECT postgremq.clean_up_topic(%s)", (topic,))
+    cur.execute("SELECT postgremq.delete_topic(%s)", (topic,))
 
 
 def test_heartbeat_contention_is_local_and_clock_is_fresh(cur, conn, db_config, test_db):
-    cur.execute("SELECT create_topic('t'); SELECT create_queue('q','t')")
-    for i in range(2): cur.execute("SELECT publish_message('t', %s::jsonb)", [json.dumps(i)])
-    cur.execute("SELECT * FROM consume_message('q', 10, 2)")
+    cur.execute("SELECT postgremq.create_topic('t'); SELECT postgremq.create_queue('q','t')")
+    for i in range(2): cur.execute("SELECT postgremq.publish_message('t', %s::jsonb)", [json.dumps(i)])
+    cur.execute("SELECT * FROM postgremq.consume_message('q', 10, 2)")
     deliveries = cur.fetchall()
     blocker = psycopg2.connect(**{**db_config, 'dbname':test_db})
     try:
         with blocker.cursor() as locked:
-            locked.execute("SELECT 1 FROM queue_messages WHERE message_id=%s FOR UPDATE", [deliveries[0]['message_id']])
+            locked.execute("SELECT 1 FROM postgremq.queue_messages WHERE message_id=%s FOR UPDATE", [deliveries[0]['message_id']])
         with pytest.raises(psycopg2.Error) as busy:
-            cur.execute("SELECT set_vt('q',%s,%s,10)",[deliveries[0]['message_id'],deliveries[0]['consumer_token']])
+            cur.execute("SELECT postgremq.set_vt('q',%s,%s,10)",[deliveries[0]['message_id'],deliveries[0]['consumer_token']])
         assert busy.value.pgcode == '55P03'
         cur.execute("SET statement_timeout='500ms'")
-        cur.execute("SELECT * FROM set_vt_batch_multi(%s::varchar[], %s::bigint[], %s::varchar[], %s::int[])",
+        cur.execute("SELECT * FROM postgremq.set_vt_batch_multi(%s::varchar[], %s::bigint[], %s::varchar[], %s::int[])",
                     [['q','q'], [m['message_id'] for m in deliveries], [m['consumer_token'] for m in deliveries], [10,10]])
         outcomes = {r['message_id']:r['outcome'] for r in cur.fetchall()}
         assert outcomes == {deliveries[0]['message_id']:'busy', deliveries[1]['message_id']:'extended'}
@@ -2426,77 +2422,77 @@ def test_heartbeat_contention_is_local_and_clock_is_fresh(cur, conn, db_config, 
     # An old transaction must not extend a lease that expired after BEGIN.
     cur.execute("BEGIN")
     cur.execute("SELECT now()")
-    cur.execute("UPDATE queue_messages SET vt=clock_timestamp()-interval '1 ms'")
-    cur.execute("SELECT * FROM set_vt_batch_multi(%s::varchar[], %s::bigint[], %s::varchar[], %s::int[])",
+    cur.execute("UPDATE postgremq.queue_messages SET vt=clock_timestamp()-interval '1 ms'")
+    cur.execute("SELECT * FROM postgremq.set_vt_batch_multi(%s::varchar[], %s::bigint[], %s::varchar[], %s::int[])",
                 [['q'], [deliveries[0]['message_id']], [deliveries[0]['consumer_token']], [10]])
     assert cur.fetchall() == []
     cur.execute("ROLLBACK")
 
 
 def test_payload_gc_preserves_lagging_queues_and_dlq(cur):
-    cur.execute("SELECT create_topic('t'); SELECT create_queue('fast','t'); SELECT create_queue('slow','t',1)")
-    cur.execute("SELECT publish_message('t','{}')")
+    cur.execute("SELECT postgremq.create_topic('t'); SELECT postgremq.create_queue('fast','t'); SELECT postgremq.create_queue('slow','t',1)")
+    cur.execute("SELECT postgremq.publish_message('t','{}')")
     id = cur.fetchone()[0]
-    cur.execute("SELECT * FROM consume_message('fast',30,1)")
+    cur.execute("SELECT * FROM postgremq.consume_message('fast',30,1)")
     token = cur.fetchone()['consumer_token']
-    cur.execute("SELECT ack_message('fast',%s,%s)",[id,token])
-    cur.execute("SELECT cleanup_completed_messages(0)")
+    cur.execute("SELECT postgremq.ack_message('fast',%s,%s)",[id,token])
+    cur.execute("SELECT postgremq.cleanup_completed_messages(0)")
     assert cur.fetchone()[0] == 1
-    cur.execute("SELECT count(*) FROM messages")
+    cur.execute("SELECT count(*) FROM postgremq.messages")
     assert cur.fetchone()[0] == 1
-    cur.execute("SELECT * FROM consume_message('slow',30,1)")
+    cur.execute("SELECT * FROM postgremq.consume_message('slow',30,1)")
     token = cur.fetchone()['consumer_token']
-    cur.execute("SELECT nack_message('slow',%s,%s)",[id,token])
-    cur.execute("SELECT cleanup_unreferenced_messages(0)")
+    cur.execute("SELECT postgremq.nack_message('slow',%s,%s)",[id,token])
+    cur.execute("SELECT postgremq.cleanup_unreferenced_messages(0)")
     assert cur.fetchone()[0] == 0
-    cur.execute("SELECT requeue_dlq_messages('slow')")
-    cur.execute("SELECT cleanup_unreferenced_messages(0)")
+    cur.execute("SELECT postgremq.requeue_dlq_messages('slow')")
+    cur.execute("SELECT postgremq.cleanup_unreferenced_messages(0)")
     assert cur.fetchone()[0] == 0
-    cur.execute("SELECT clean_up_queue('slow')")
-    cur.execute("SELECT cleanup_unreferenced_messages(0)")
+    cur.execute("SELECT postgremq.clean_up_queue('slow')")
+    cur.execute("SELECT postgremq.cleanup_unreferenced_messages(0)")
     assert cur.fetchone()[0] == 1
 
 
 def test_payload_gc_is_bounded_and_collects_unrouted_messages(cur):
-    cur.execute("SELECT create_topic('t')")
-    for i in range(5): cur.execute("SELECT publish_message('t', '{}')")
-    cur.execute("SELECT cleanup_unreferenced_messages(0,2)")
+    cur.execute("SELECT postgremq.create_topic('t')")
+    for i in range(5): cur.execute("SELECT postgremq.publish_message('t', '{}')")
+    cur.execute("SELECT postgremq.cleanup_unreferenced_messages(0,2)")
     assert cur.fetchone()[0] == 2
-    cur.execute("SELECT count(*) FROM messages")
+    cur.execute("SELECT count(*) FROM postgremq.messages")
     assert cur.fetchone()[0] == 3
 
 
 def test_old_queue_generation_cannot_renew_or_consume_replacement(cur):
-    cur.execute("SELECT create_topic('t'); SELECT create_queue('q','t',0,true)")
+    cur.execute("SELECT postgremq.create_topic('t'); SELECT postgremq.create_queue('q','t',0,true)")
     old = cur.fetchone()[0]
-    cur.execute("SELECT delete_queue('q'); SELECT create_queue('q','t',0,true)")
+    cur.execute("SELECT postgremq.delete_queue('q'); SELECT postgremq.create_queue('q','t',0,true)")
     new = cur.fetchone()[0]
     assert old != new
-    cur.execute("SELECT * FROM extend_queue_keep_alive_multi(ARRAY['q']::varchar[], ARRAY[60000]::bigint[], ARRAY[%s]::uuid[])",[old])
+    cur.execute("SELECT * FROM postgremq.extend_queue_keep_alive_multi(ARRAY['q']::varchar[], ARRAY[60000]::bigint[], ARRAY[%s]::uuid[])",[old])
     assert cur.fetchall() == []
-    cur.execute("SELECT publish_message('t','{}')")
+    cur.execute("SELECT postgremq.publish_message('t','{}')")
     with pytest.raises(psycopg2.Error) as error:
-        cur.execute("SELECT * FROM consume_message('q',30,1,%s)",[old])
+        cur.execute("SELECT * FROM postgremq.consume_message('q',30,1,%s)",[old])
     assert error.value.pgcode == 'PMQ02'
-    cur.execute("SELECT * FROM consume_message('q',30,1,%s)",[new])
+    cur.execute("SELECT * FROM postgremq.consume_message('q',30,1,%s)",[new])
     assert len(cur.fetchall()) == 1
 
 
 def test_gc_preserves_a_concurrently_inserted_reference(cur, db_config, test_db):
-    cur.execute("SELECT create_topic('t'); SELECT publish_message('t','{}')")
+    cur.execute("SELECT postgremq.create_topic('t'); SELECT postgremq.publish_message('t','{}')")
     id = cur.fetchone()[0]
-    cur.execute("SELECT create_queue('q','t')")
+    cur.execute("SELECT postgremq.create_queue('q','t')")
     writer = psycopg2.connect(**{**db_config, 'dbname': test_db})
     try:
         with writer.cursor() as other:
-            other.execute("INSERT INTO queue_messages(queue_name,message_id) VALUES ('q',%s)", [id])
+            other.execute("INSERT INTO postgremq.queue_messages(queue_name,message_id) VALUES ('q',%s)", [id])
         # The new reference is uncommitted, but its FK holds a key-share lock
         # on the payload. GC must skip that payload rather than cascade-delete it.
         cur.execute("SET statement_timeout='500ms'")
-        cur.execute("SELECT cleanup_unreferenced_messages(0)")
+        cur.execute("SELECT postgremq.cleanup_unreferenced_messages(0)")
         assert cur.fetchone()[0] == 0
         writer.commit()
-        cur.execute("SELECT count(*) FROM queue_messages WHERE message_id=%s", [id])
+        cur.execute("SELECT count(*) FROM postgremq.queue_messages WHERE message_id=%s", [id])
         assert cur.fetchone()[0] == 1
     finally:
         writer.close()
@@ -2504,15 +2500,53 @@ def test_gc_preserves_a_concurrently_inserted_reference(cur, db_config, test_db)
 
 
 def test_keepalive_contention_does_not_block_other_queues(cur, db_config, test_db):
-    cur.execute("SELECT create_topic('t'); SELECT create_queue('a','t',0,true); SELECT create_queue('b','t',0,true)")
+    cur.execute("SELECT postgremq.create_topic('t'); SELECT postgremq.create_queue('a','t',0,true); SELECT postgremq.create_queue('b','t',0,true)")
     blocker = psycopg2.connect(**{**db_config, 'dbname': test_db})
     try:
         with blocker.cursor() as locked:
-            locked.execute("SELECT 1 FROM queues WHERE name='a' FOR UPDATE")
+            locked.execute("SELECT 1 FROM postgremq.queues WHERE name='a' FOR UPDATE")
         cur.execute("SET statement_timeout='500ms'")
-        cur.execute("SELECT * FROM extend_queue_keep_alive_multi(ARRAY['a','b']::varchar[],ARRAY[60000,60000]::bigint[])")
+        cur.execute("SELECT * FROM postgremq.extend_queue_keep_alive_multi(ARRAY['a','b']::varchar[],ARRAY[60000,60000]::bigint[])")
         outcomes = {r['queue_name']:r['outcome'] for r in cur.fetchall()}
         assert outcomes == {'a':'busy','b':'extended'}
     finally:
         blocker.rollback(); blocker.close()
         cur.execute("SET statement_timeout=0")
+
+
+def test_schema_isolation_with_application_and_temporary_objects(conn):
+    """Installation and function bodies must ignore the application's path."""
+    with conn.cursor() as cur:
+        cur.execute('DROP SCHEMA postgremq CASCADE; CREATE SCHEMA app')
+        try:
+            for name in ['topics', 'queues', 'messages', 'queue_messages', 'dead_letter_queue']:
+                cur.execute(f'CREATE TABLE app.{name} (marker text)')
+                cur.execute(f'CREATE TEMP TABLE {name} (marker text)')
+            cur.execute('SET search_path = app, pg_temp')
+            cur.execute(SQL_FILE.read_text())
+            cur.execute('SHOW search_path')
+            assert cur.fetchone()[0] == 'app, pg_temp'
+            cur.execute("SELECT count(*) FROM pg_class WHERE relnamespace='public'::regnamespace")
+            assert cur.fetchone()[0] == 0
+            cur.execute("SELECT count(*) FROM pg_proc WHERE pronamespace='public'::regnamespace")
+            assert cur.fetchone()[0] == 0
+            cur.execute("SELECT postgremq.create_topic('t'); SELECT postgremq.create_queue('q', 't')")
+            cur.execute("SELECT postgremq.publish_message('t', '{}'::jsonb)")
+            msg_id = cur.fetchone()[0]
+            cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('q', 30, 1)")
+            found_id, token = cur.fetchone()
+            assert found_id == msg_id
+            cur.execute("SELECT postgremq.set_vt('q', %s, %s, 30)", (msg_id, token))
+            cur.execute("SELECT postgremq.ack_message('q', %s, %s)", (msg_id, token))
+            cur.execute('SELECT * FROM postgremq.pmq_maintenance_fast()')
+            cur.execute('SELECT postgremq.cleanup_completed_messages(0, 1000)')
+            assert cur.fetchone()[0] == 1
+            cur.execute('SELECT count(*) FROM postgremq.messages')
+            assert cur.fetchone()[0] == 0
+            for name in ['topics', 'queues', 'messages', 'queue_messages', 'dead_letter_queue']:
+                cur.execute(f'SELECT count(*) FROM app.{name}')
+                assert cur.fetchone()[0] == 0
+                cur.execute(f'SELECT count(*) FROM pg_temp.{name}')
+                assert cur.fetchone()[0] == 0
+        finally:
+            cur.execute('RESET search_path; DROP SCHEMA app CASCADE')

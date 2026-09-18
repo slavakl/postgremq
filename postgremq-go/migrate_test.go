@@ -163,7 +163,7 @@ func TestMigration_MigrationsTableName(t *testing.T) {
 	err = pool.QueryRow(ctx, `
 		SELECT table_name
 		FROM information_schema.tables
-		WHERE table_name = 'postgremq_migrations'
+		WHERE table_schema = 'postgremq' AND table_name = 'postgremq_migrations'
 	`).Scan(&tableName)
 	require.NoError(t, err, "Should find postgremq_migrations table")
 	assert.Equal(t, "postgremq_migrations", tableName)

@@ -43,15 +43,18 @@ func Migrate(pool *pgxpool.Pool, opts MigrateOptions) error {
 	}
 
 	// Create a sql.DB connection using pgx stdlib driver
-	db, err := openMigrationDB(pool)
-	if err != nil {
-		return fmt.Errorf("failed to open database for migration: %w", err)
-	}
+	db := openMigrationDB(pool)
 	defer db.Close()
+
+	// The driver creates its version table before executing migration SQL.
+	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS postgremq"); err != nil {
+		return fmt.Errorf("failed to create queue schema: %w", err)
+	}
 
 	// Create the database driver with our custom config
 	driver, err := migratepgx.WithInstance(db, &migratepgx.Config{
 		MigrationsTable: MigrationsTable,
+		SchemaName:      "postgremq",
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create migration driver: %w", err)
@@ -81,61 +84,30 @@ func Migrate(pool *pgxpool.Pool, opts MigrateOptions) error {
 // GetMigrationStatus returns current migration status using the provided pool.
 // This is a standalone function for schema management, separate from
 // the Connection type which is used for message queue operations.
-//
-// No ctx parameter: golang-migrate's Version() doesn't accept one.
 func GetMigrationStatus(pool *pgxpool.Pool) (*MigrationStatus, error) {
-	source, err := iofs.New(mq.MigrationsFS, "migrations")
-	if err != nil {
-		return nil, err
-	}
-
-	// Create a sql.DB connection using pgx stdlib driver
-	db, err := openMigrationDB(pool)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
-	}
+	db := openMigrationDB(pool)
 	defer db.Close()
 
-	// Create the database driver with our custom config
-	driver, err := migratepgx.WithInstance(db, &migratepgx.Config{
-		MigrationsTable: MigrationsTable,
-	})
-	if err != nil {
+	status := &MigrationStatus{LatestVersion: getLatestMigrationVersion()}
+	var exists bool
+	if err := db.QueryRow("SELECT to_regclass('postgremq.postgremq_migrations') IS NOT NULL").Scan(&exists); err != nil {
 		return nil, err
 	}
-
-	m, err := migrate.NewWithInstance("iofs", source, "postgres", driver)
-	if err != nil {
-		return nil, err
+	if exists {
+		err := db.QueryRow("SELECT version, dirty FROM postgremq.postgremq_migrations LIMIT 1").Scan(&status.CurrentVersion, &status.Dirty)
+		if err != nil && err != sql.ErrNoRows {
+			return nil, err
+		}
 	}
-	defer m.Close()
-
-	currentVersion, dirty, err := m.Version()
-	if err != nil && err != migrate.ErrNilVersion {
-		return nil, err
-	}
-
-	// Find latest version from embedded migrations
-	latestVersion := getLatestMigrationVersion()
-
-	return &MigrationStatus{
-		CurrentVersion: currentVersion,
-		Dirty:          dirty,
-		LatestVersion:  latestVersion,
-		NeedsMigration: currentVersion < latestVersion,
-	}, nil
+	status.NeedsMigration = status.CurrentVersion < status.LatestVersion
+	return status, nil
 }
 
-// openMigrationDB creates a sql.DB connection from the pgxpool configuration
-// using the pgx stdlib driver. By using RegisterConnConfig, we ensure the exact
-// same connection parameters (including TLS settings) as the pool are used.
-func openMigrationDB(pool *pgxpool.Pool) (*sql.DB, error) {
+// openMigrationDB preserves the pool's connection parameters without changing
+// its search_path or registering a global connection configuration.
+func openMigrationDB(pool *pgxpool.Pool) *sql.DB {
 	cfg := pool.Config().ConnConfig.Copy()
-
-	// Register the config and get a connection string identifier
-	connStr := stdlib.RegisterConnConfig(cfg)
-
-	return sql.Open("pgx/v5", connStr)
+	return stdlib.OpenDB(*cfg)
 }
 
 // getLatestMigrationVersion returns the highest migration version from embedded files

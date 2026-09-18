@@ -150,7 +150,7 @@ describe('Queue-fatal teardown', () => {
     await connection.createTopic('topic');
     await connection.createQueue('exq', 'topic', true, { keepAliveInterval: 1 }); // flush ~500ms
 
-    await isoPool!.query(`DELETE FROM queues WHERE name = 'exq'`);
+    await isoPool!.query(`DELETE FROM postgremq.queues WHERE name = 'exq'`);
 
     const ev = await withTimeout(fatalEvent, 4000, 'producer-only exclusive queue did not surface queueFatal');
     expect(ev.queue).toBe('exq');

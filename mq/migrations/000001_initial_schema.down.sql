@@ -1,5 +1,3 @@
--- Down migrations are not supported for PostgreMQ
--- The schema should not be rolled back in production
---
--- If you need to remove the PostgreMQ schema, manually drop the tables and functions
--- or use a separate cleanup script
+-- Down migrations are not supported for PostgreMQ.
+-- To remove an installation and all queue data, explicitly run:
+-- DROP SCHEMA postgremq CASCADE;

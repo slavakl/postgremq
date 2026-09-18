@@ -648,17 +648,17 @@ describe('Connection', () => {
       await consumer.stop();
 
       await pool.query(
-        "UPDATE queue_messages SET processed_at = NOW() - interval '2 hours' WHERE queue_name = $1 AND message_id = $2",
+        "UPDATE postgremq.queue_messages SET processed_at = NOW() - interval '2 hours' WHERE queue_name = $1 AND message_id = $2",
         ['cleanup-retention-queue', firstId]
       );
       await pool.query(
-        "UPDATE queue_messages SET processed_at = NOW() - interval '30 minutes' WHERE queue_name = $1 AND message_id = $2",
+        "UPDATE postgremq.queue_messages SET processed_at = NOW() - interval '30 minutes' WHERE queue_name = $1 AND message_id = $2",
         ['cleanup-retention-queue', secondId]
       );
 
       // Verify how many rows qualify as older than 1 hour
       const olderCountRes = await pool.query(
-        "SELECT COUNT(*)::int AS cnt FROM queue_messages WHERE queue_name = $1 AND status = 'completed' AND processed_at < NOW() - interval '1 hour'",
+        "SELECT COUNT(*)::int AS cnt FROM postgremq.queue_messages WHERE queue_name = $1 AND status = 'completed' AND processed_at < NOW() - interval '1 hour'",
         ['cleanup-retention-queue']
       );
       const olderCount: number = olderCountRes.rows[0].cnt;
@@ -670,7 +670,7 @@ describe('Connection', () => {
       expect(messages).toHaveLength(2 - deletedOld);
 
       await pool.query(
-        "UPDATE queue_messages SET processed_at = NOW() - interval '48 hours' WHERE queue_name = $1 AND message_id = $2",
+        "UPDATE postgremq.queue_messages SET processed_at = NOW() - interval '48 hours' WHERE queue_name = $1 AND message_id = $2",
         ['cleanup-retention-queue', secondId]
       );
 

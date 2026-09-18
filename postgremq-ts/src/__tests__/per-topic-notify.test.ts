@@ -33,7 +33,7 @@ describe('Per-topic NOTIFY', () => {
 
       // Drop the queue at the SQL level so a DB lookup would fail. The
       // cache entry from createQueue lets consume() succeed regardless.
-      await pool.query("DELETE FROM queues WHERE name = 'QueueCacheHit'");
+      await pool.query("DELETE FROM postgremq.queues WHERE name = 'QueueCacheHit'");
 
       const consumer = connection.consume('QueueCacheHit', { visibilityTimeoutSec: 30 });
       // Force the iterator to start so the topic resolution and subscribe
@@ -52,8 +52,8 @@ describe('Per-topic NOTIFY', () => {
     try {
       // Queue created out of band: not via this Connection's createQueue, so
       // the topic cache is empty for this queue.
-      await pool.query("SELECT create_topic('TopicOutOfBand')");
-      await pool.query("SELECT create_queue('QueueOutOfBand', 'TopicOutOfBand', 0, false, interval '30 seconds')");
+      await pool.query("SELECT postgremq.create_topic('TopicOutOfBand')");
+      await pool.query("SELECT postgremq.create_queue('QueueOutOfBand', 'TopicOutOfBand', 0, false, interval '30 seconds')");
 
       // Without explicit topic, starting iteration must throw — no DB fallback.
       const noTopicConsumer = connection.consume('QueueOutOfBand', { visibilityTimeoutSec: 30 });

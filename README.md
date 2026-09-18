@@ -42,12 +42,12 @@ PostgreMQ is a message queue system that leverages PostgreSQL's reliability and 
 
 #### SQL Schema
 
-First, install the core PostgreMQ schema in your PostgreSQL database:
+First, install the core PostgreMQ schema in the same database as your application. Queue objects live in the fixed `postgremq` schema; application tables can stay in `public` or another schema. No `search_path` configuration is needed.
 
 ```sql
 -- Run the SQL from mq/sql/latest.sql
 -- This creates the topics, queues, messages, and queue_messages tables
--- along with all necessary functions and triggers
+-- along with all necessary functions and triggers in the postgremq schema
 ```
 
 #### Go Client
@@ -159,7 +159,7 @@ main().catch(console.error);
 
 1. **Publish**: Messages are published to a **topic**
 2. **Distribution**: A trigger automatically copies messages to all **queues** subscribed to that topic
-3. **Consume**: Consumers fetch messages from queues with a **visibility timeout**
+3. **Consume**: Consumers fetch messages from postgremq.queues with a **visibility timeout**
 4. **Processing**: Messages are invisible to other consumers during processing
 5. **Acknowledgment**: Messages can be:
    - **Acked**: Marked as successfully processed (removed from queue)

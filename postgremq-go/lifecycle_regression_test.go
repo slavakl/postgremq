@@ -35,7 +35,7 @@ func TestCloseAllowsDeliverySettlement(t *testing.T) {
 	require.NoError(t, msg.Ack(ctx))
 	<-closed
 	var status string
-	require.NoError(t, pool.QueryRow(ctx, "SELECT status FROM queue_messages WHERE message_id=$1", msg.ID).Scan(&status))
+	require.NoError(t, pool.QueryRow(ctx, "SELECT status FROM postgremq.queue_messages WHERE message_id=$1", msg.ID).Scan(&status))
 	require.Equal(t, "completed", status)
 }
 func TestCancelledHandlerReturnDoesNotAcknowledge(t *testing.T) {
@@ -60,7 +60,7 @@ func TestCancelledHandlerReturnDoesNotAcknowledge(t *testing.T) {
 	hc.Stop()
 	var status string
 	var attempts int
-	require.NoError(t, pool.QueryRow(ctx, "SELECT status,delivery_attempts FROM queue_messages WHERE message_id=$1", id).Scan(&status, &attempts))
+	require.NoError(t, pool.QueryRow(ctx, "SELECT status,delivery_attempts FROM postgremq.queue_messages WHERE message_id=$1", id).Scan(&status, &attempts))
 	require.Equal(t, "pending", status)
 	require.Equal(t, 1, attempts)
 	require.Equal(t, 0, c.EventListener().SubscriberCount("pmq:t:t"))
@@ -77,13 +77,13 @@ func TestCloseCancelsBlockedFetch(t *testing.T) {
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
-	_, err = tx.Exec(ctx, "LOCK TABLE queue_messages IN ACCESS EXCLUSIVE MODE")
+	_, err = tx.Exec(ctx, "LOCK TABLE postgremq.queue_messages IN ACCESS EXCLUSIVE MODE")
 	require.NoError(t, err)
 	_, err = c.Consume("q")
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		var waiting bool
-		_ = pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%FROM consume_message(%')").Scan(&waiting)
+		_ = pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%FROM postgremq.consume_message(%')").Scan(&waiting)
 		return waiting
 	}, time.Second, 5*time.Millisecond)
 	done := make(chan struct{})
@@ -113,7 +113,7 @@ func TestFailedQueueDeletionKeepsItsLeaseAlive(t *testing.T) {
 	require.Error(t, c.DeleteQueue(ctx, "q")) // DLQ reference prevents deletion.
 	time.Sleep(600 * time.Millisecond)
 	var live bool
-	require.NoError(t, pool.QueryRow(ctx, "SELECT keep_alive_until > clock_timestamp() FROM queues WHERE name='q'").Scan(&live))
+	require.NoError(t, pool.QueryRow(ctx, "SELECT keep_alive_until > clock_timestamp() FROM postgremq.queues WHERE name='q'").Scan(&live))
 	require.True(t, live, "failed deletion must not stop keepalive")
 }
 

@@ -453,7 +453,7 @@ describe('Consumer', () => {
   describe('Message ID widening (BIGINT round-trip)', () => {
     test('publish/consume round-trips a message id past 2^31', async () => {
       const seedTo = 2_200_000_000; // > 2^31 (2_147_483_647)
-      await isoPool!.query("SELECT setval('messages_id_seq', $1)", [seedTo]);
+      await isoPool!.query("SELECT setval('postgremq.messages_id_seq', $1)", [seedTo]);
 
       const publishedId = await connection.publish('consumer-test-topic', { big: true });
       expect(typeof publishedId).toBe('number');

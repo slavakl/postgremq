@@ -238,11 +238,11 @@ func cleanTestData(t *testing.T, pool *pgxpool.Pool, ctx context.Context) {
 	t.Helper()
 
 	_, err := pool.Exec(ctx, `
-		DELETE FROM dead_letter_queue;
-		DELETE FROM queue_messages;
-		DELETE FROM messages;
-		DELETE FROM queues;
-		DELETE FROM topics;
+		DELETE FROM postgremq.dead_letter_queue;
+		DELETE FROM postgremq.queue_messages;
+		DELETE FROM postgremq.messages;
+		DELETE FROM postgremq.queues;
+		DELETE FROM postgremq.topics;
 	`)
 	if err != nil {
 		t.Logf("Warning: Failed to clean test data: %v", err)

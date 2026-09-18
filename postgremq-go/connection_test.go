@@ -1116,7 +1116,7 @@ func TestCleanupCompletedMessages(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	rows, err := pool.Query(ctx,
-		"SELECT message_id, consumer_token FROM consume_message($1, $2, $3)",
+		"SELECT message_id, consumer_token FROM postgremq.consume_message($1, $2, $3)",
 		queueName, 60, 2,
 	)
 	require.NoError(t, err, "Failed to consume messages directly")
@@ -1136,18 +1136,18 @@ func TestCleanupCompletedMessages(t *testing.T) {
 	require.Len(t, messageIDs, 2, "Should have consumed two messages")
 
 	for i, id := range messageIDs {
-		_, err = pool.Exec(ctx, "SELECT ack_message($1, $2, $3)", queueName, id, tokens[i])
+		_, err = pool.Exec(ctx, "SELECT postgremq.ack_message($1, $2, $3)", queueName, id, tokens[i])
 		require.NoError(t, err, "Failed to ack message")
 	}
 
 	_, err = pool.Exec(ctx,
-		"UPDATE queue_messages SET processed_at = NOW() - interval '2 hours' WHERE queue_name = $1 AND message_id = $2",
+		"UPDATE postgremq.queue_messages SET processed_at = NOW() - interval '2 hours' WHERE queue_name = $1 AND message_id = $2",
 		queueName, messageIDs[0],
 	)
 	require.NoError(t, err, "Failed to age processed_at for first message")
 
 	_, err = pool.Exec(ctx,
-		"UPDATE queue_messages SET processed_at = NOW() - interval '30 minutes' WHERE queue_name = $1 AND message_id = $2",
+		"UPDATE postgremq.queue_messages SET processed_at = NOW() - interval '30 minutes' WHERE queue_name = $1 AND message_id = $2",
 		queueName, messageIDs[1],
 	)
 	require.NoError(t, err, "Failed to set recent processed_at for second message")
@@ -1164,7 +1164,7 @@ func TestCleanupCompletedMessages(t *testing.T) {
 	assert.Equal(t, postgremq.MessageStatusCompleted, msgs[0].Status, "Remaining entry should still be completed")
 
 	_, err = pool.Exec(ctx,
-		"UPDATE queue_messages SET processed_at = NOW() - interval '48 hours' WHERE queue_name = $1 AND message_id = $2",
+		"UPDATE postgremq.queue_messages SET processed_at = NOW() - interval '48 hours' WHERE queue_name = $1 AND message_id = $2",
 		queueName, messageIDs[1],
 	)
 	require.NoError(t, err, "Failed to age remaining message for default cleanup")
