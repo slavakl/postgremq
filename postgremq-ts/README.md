@@ -129,6 +129,10 @@ const delayedId = await client.publish('orders', { orderId: '67890' }, {
   deliverAfter: new Date(Date.now() + 60000) // Deliver after 1 minute
 });
 
+// Ordered delivery within a group: each queue delivers a group's messages
+// one at a time, in publish commit order (msg.groupKey / msg.groupSeq).
+await client.publish('session-events', { kind: 'started' }, { groupKey: sessionId });
+
 // Publishing within a transaction.
 // The caller owns the transaction lifecycle (BEGIN/COMMIT/ROLLBACK); the
 // message is published atomically with the caller's other writes and only

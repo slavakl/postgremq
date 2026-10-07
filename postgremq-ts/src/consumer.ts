@@ -59,6 +59,10 @@ export function validateConsumerOptions(options: Partial<ConsumerOptions>): void
   }
 }
 
+/** How soon an empty fetch is retried when get_next_visible_time reports a
+ *  row that is already due (see scheduleNextFetch). */
+const DUE_HINT_BACKOFF_MS = 100;
+
 /**
  * Consumer class for consuming messages from a queue.
  *
@@ -115,6 +119,11 @@ export class Consumer {
 
   /** Flag indicating if the consumer is actively fetching messages */
   private fetching: boolean = false;
+
+  /** A NOTIFY arrived while a fetch was in flight. That fetch's snapshot may
+   *  predate the event (e.g. the ack of a group's head, which is what makes
+   *  its successor claimable), so one more fetch follows it. */
+  private wokeDuringFetch: boolean = false;
 
   /** Promise that resolves when the currently in-flight fetch completes
    *  (success or error), or null when no fetch is running. Set
@@ -212,6 +221,7 @@ export class Consumer {
    */
   private handleNotification(): void {
     if (!this.running) return;
+    if (this.fetching) this.wokeDuringFetch = true;
     this.triggerFetch();
   }
 
@@ -277,6 +287,7 @@ export class Consumer {
 
         // On error, retry in one second
         if (this.running) {
+          if (this.nextFetchTimer) clearTimeout(this.nextFetchTimer);
           this.nextFetchTimer = setTimeout(() => this.triggerFetch(), 1000);
         }
       } finally {
@@ -358,7 +369,10 @@ export class Consumer {
             nack: this.connection.nackMessage.bind(this.connection),
             release: this.connection.releaseMessage.bind(this.connection),
             setVt: this.connection.setMessageVt.bind(this.connection),
-          }
+          },
+          rawMessage.group_key === null || rawMessage.group_key === undefined
+            ? null
+            : { key: rawMessage.group_key, seq: rawMessage.group_seq }
         );
 
         // Add to buffer and in-flight tracking
@@ -383,6 +397,15 @@ export class Consumer {
       }
     } finally {
       this.fetching = false;
+      if (this.wokeDuringFetch) {
+        this.wokeDuringFetch = false;
+        if (this.running) {
+          // After the current fetchInFlight settles (a timer, not a direct
+          // call, so triggerFetch's own bookkeeping is not clobbered).
+          if (this.nextFetchTimer) clearTimeout(this.nextFetchTimer);
+          this.nextFetchTimer = setTimeout(() => this.triggerFetch(), 0);
+        }
+      }
     }
   }
 
@@ -404,6 +427,13 @@ export class Consumer {
 
         // Use the shorter of the two wait times
         waitTime = Math.min(timeUntilNextVisible, this.options.pollingIntervalMs);
+        if (timeUntilNextVisible === 0) {
+          // A visible-but-unclaimable row: locked by another transaction (a
+          // claim in progress, or an ackWithTransaction whose transaction is
+          // still open past the lease). Refetching at once would spin; back
+          // off briefly. NOTIFYs still wake the consumer immediately.
+          waitTime = Math.min(DUE_HINT_BACKOFF_MS, this.options.pollingIntervalMs);
+        }
       }
 
       // Schedule the next fetch

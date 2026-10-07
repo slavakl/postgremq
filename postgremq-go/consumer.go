@@ -117,6 +117,11 @@ func (c *Consumer) run() {
 	outbox := make([]*Message, 0, c.batchSize)
 	inflight := make(map[string]*Message)
 	fetching := false
+	// wokeDuringFetch latches a NOTIFY that arrives while a fetch is in flight.
+	// That fetch's snapshot may predate the event (e.g. the ack of a group's
+	// head, which is what makes its successor claimable), so its result must
+	// not overwrite the wake with a later fetchAfter.
+	wokeDuringFetch := false
 	shutting := false
 	cancelledInflight := false
 	closedMessages := false
@@ -192,6 +197,7 @@ func (c *Consumer) run() {
 				break
 			}
 			fetchAfter = time.Now()
+			wokeDuringFetch = fetching
 			armFetch()
 
 		case _, ok := <-queueCh:
@@ -200,10 +206,13 @@ func (c *Consumer) run() {
 				break
 			}
 			fetchAfter = time.Now()
+			wokeDuringFetch = fetching
 			armFetch()
 
 		case fr := <-c.fetched:
 			fetching = false
+			woke := wokeDuringFetch
+			wokeDuringFetch = false
 			if fr.fatal && !shutting {
 				// The queue is gone (consume returned PMQ02). Record the reason
 				// (so NotifyClose delivers it), begin our own drain, and notify
@@ -223,6 +232,9 @@ func (c *Consumer) run() {
 				}
 			} else {
 				fetchAfter = fr.nextAt
+				if woke {
+					fetchAfter = time.Now()
+				}
 				for _, m := range fr.msgs {
 					inflight[m.trackingID] = m // book BEFORE it becomes deliverable
 					if !c.noAutoExtension {
@@ -343,6 +355,10 @@ func (c *Consumer) fetchInto() {
 	c.fetched <- fetchResult{msgs: msgs, nextAt: c.computeNextAt(len(msgs), err)}
 }
 
+// dueHintBackoff bounds how soon an empty fetch is retried when
+// get_next_visible_time reports a row that is already due.
+const dueHintBackoff = 100 * time.Millisecond
+
 // computeNextAt mirrors the old fetch-loop scheduling: retry soon on error,
 // refetch immediately after a full batch (drain a backlog), wait for the next
 // visible message when the queue is empty, otherwise leave it to checkTimeout.
@@ -360,6 +376,13 @@ func (c *Consumer) computeNextAt(n int, err error) time.Time {
 			return time.Now().Add(1 * time.Second)
 		}
 		c.logger.Debugf("Consumer - next available message in %d ms", time.Until(nextVisible).Milliseconds())
+		if !nextVisible.IsZero() && !nextVisible.After(time.Now()) {
+			// A visible-but-unclaimable row: locked by another transaction
+			// (a claim in progress, or an AckWithTx whose transaction is
+			// still open past the lease). Refetching at once would spin;
+			// back off briefly. NOTIFYs still wake the loop immediately.
+			return time.Now().Add(dueHintBackoff)
+		}
 		return nextVisible
 	}
 	return time.Time{} // partial batch → no specific time; checkTimeout governs

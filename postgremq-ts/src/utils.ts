@@ -218,6 +218,16 @@ export function messageId(value: unknown): number {
   return id;
 }
 
+/** Converts a nullable BIGINT group sequence (a string from node-pg) to a
+ *  number, or null for an ungrouped message. */
+export function groupSeq(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const seq = Number(value);
+  if (!Number.isSafeInteger(seq) || seq < 1)
+    throw new RangeError('group sequence must be a positive safe integer');
+  return seq;
+}
+
 /** One deadline shared by all phases of a drain. The losing work is observed. */
 export async function untilDeadline(work: Promise<unknown>, deadline: number): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;

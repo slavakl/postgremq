@@ -31,6 +31,10 @@ export interface Message {
   readonly consumerToken: string;
   readonly deliveryAttempts: number;
   readonly publishedAt: Date;
+  /** Message group (see PublishOptions.groupKey); null if ungrouped. */
+  readonly groupKey: string | null;
+  /** Dense 1-based position in the group, in publish commit order; null if ungrouped. */
+  readonly groupSeq: number | null;
   vt: Date;
   /** Fires when the lease is lost or the consumer is shutting down. */
   readonly signal: AbortSignal;
@@ -226,6 +230,25 @@ export interface RetryPolicy {
 export interface PublishOptions {
   /** Time at which the message should be delivered (defaults to immediate) */
   deliverAfter?: Date;
+  /**
+   * Message group (1..255 characters; empty is rejected with ValidationError).
+   * Omit for an ungrouped message.
+   *
+   * Within one queue, deliveries of one group are claimed strictly in publish
+   * commit order, one at a time: a message is not delivered while an earlier
+   * message of its group is pending or being processed (head-of-line
+   * blocking, as in SQS FIFO). A head nacked with a delay blocks its group
+   * until the delay passes; a head that exhausts its delivery attempts moves
+   * to the dead letter queue, which unblocks the group. A consume batch holds
+   * at most one message per group.
+   *
+   * Publishers of one group are serialised by the database until their
+   * transaction commits, so a group should be a session, an order or an
+   * account — never a hot key shared by unrelated work. A transaction that
+   * publishes to several groups should take them in a consistent order to
+   * avoid deadlocks.
+   */
+  groupKey?: string;
 }
 
 /**
@@ -371,6 +394,10 @@ export interface QueueMessage {
   vt: Date;
   /** Timestamp when the message was processed (if completed) */
   processedAt: Date | null;
+  /** Message group; null if ungrouped */
+  groupKey: string | null;
+  /** Position in the group; null if ungrouped */
+  groupSeq: number | null;
 }
 
 /**
@@ -385,6 +412,10 @@ export interface PublishedMessage {
   payload: any;
   /** Timestamp when the message was published */
   publishedAt: Date;
+  /** Message group; null if ungrouped */
+  groupKey: string | null;
+  /** Position in the group; null if ungrouped */
+  groupSeq: number | null;
 }
 
 /**

@@ -2611,3 +2611,636 @@ def test_queue_metrics_transaction_visibility(cur, conn, db_config, test_db):
         assert cur.fetchone()[0] == 1
     finally:
         writer.close()
+
+
+# ---------------------------------------------------------------------------
+# Message groups (ordered delivery)
+# ---------------------------------------------------------------------------
+
+import random
+import threading
+
+
+def _connect(db_config, test_db):
+    c = psycopg2.connect(**{**db_config, 'dbname': test_db})
+    c.autocommit = True
+    return c
+
+
+def _wait_until(predicate, timeout=5.0, interval=0.01):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+def _backend_waits_on_lock(cur, conn):
+    cur.execute("""SELECT count(*) FROM pg_stat_activity
+                   WHERE pid = %s AND wait_event_type = 'Lock'""", (conn.get_backend_pid(),))
+    return cur.fetchone()[0] == 1
+
+
+def _drain_notifies(conn):
+    conn.poll()
+    conn.notifies.clear()
+
+
+def _queue_notifies(conn, queue):
+    conn.poll()
+    got = [n for n in conn.notifies if n.channel == f'pmq:q:{queue}']
+    conn.notifies.clear()
+    return got
+
+
+def _publish(cur, topic, payload, group=None, deliver_after=None):
+    cur.execute(
+        "SELECT postgremq.publish_message(%s, %s::jsonb, COALESCE(%s::timestamptz, clock_timestamp()), %s)",
+        (topic, json.dumps(payload), deliver_after, group))
+    return cur.fetchone()[0]
+
+
+def _consume(cur, queue, vt=30, limit=1):
+    cur.execute(
+        "SELECT message_id, consumer_token, group_key, group_seq, delivery_attempts "
+        "FROM postgremq.consume_message(%s, %s, %s)", (queue, vt, limit))
+    return [dict(id=r[0], token=r[1], group=r[2], seq=r[3], attempts=r[4]) for r in cur.fetchall()]
+
+
+def _ack(cur, queue, m):
+    cur.execute("SELECT postgremq.ack_message(%s, %s, %s)", (queue, m['id'], m['token']))
+
+
+def test_group_publish_assigns_dense_sequence_and_ungrouped_is_unchanged(cur):
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt')")
+    a1 = _publish(cur, 'gt', {'n': 1}, 'A')
+    b1 = _publish(cur, 'gt', {'n': 2}, 'B')
+    a2 = _publish(cur, 'gt', {'n': 3}, 'A')
+    # The three-argument form keeps working and stays ungrouped.
+    cur.execute("SELECT postgremq.publish_message('gt', '{}'::jsonb, clock_timestamp())")
+    u = cur.fetchone()[0]
+    cur.execute("SELECT postgremq.publish_message('gt', '{}'::jsonb)")
+    u2 = cur.fetchone()[0]
+
+    cur.execute("SELECT id, group_key, group_seq FROM postgremq.messages ORDER BY id")
+    assert [tuple(r) for r in cur.fetchall()] == [
+        (a1, 'A', 1), (b1, 'B', 1), (a2, 'A', 2), (u, None, None), (u2, None, None)]
+    cur.execute("SELECT message_id, group_key, group_seq FROM postgremq.list_messages('gq') ORDER BY message_id")
+    assert [tuple(r) for r in cur.fetchall()] == [
+        (a1, 'A', 1), (b1, 'B', 1), (a2, 'A', 2), (u, None, None), (u2, None, None)]
+    cur.execute("SELECT group_key, group_seq FROM postgremq.get_message(%s)", (a2,))
+    assert tuple(cur.fetchone()) == ('A', 2)
+    cur.execute("SELECT topic_name, group_key, last_seq FROM postgremq.message_groups ORDER BY group_key")
+    assert [tuple(r) for r in cur.fetchall()] == [('gt', 'A', 2), ('gt', 'B', 1)]
+
+
+def test_group_key_validation(cur):
+    cur.execute("SELECT postgremq.create_topic('gt')")
+    for bad in ('', 'x' * 256):
+        with pytest.raises(psycopg2.Error) as exc:
+            _publish(cur, 'gt', {}, bad)
+        assert exc.value.pgcode == 'PMQ03'
+    assert _publish(cur, 'gt', {}, 'x' * 255) > 0
+    with pytest.raises(psycopg2.Error) as exc:
+        cur.execute("INSERT INTO postgremq.messages(topic_name, payload, group_key) VALUES ('gt', '{}', 'A')")
+    assert exc.value.pgcode == '23514'  # group_key and group_seq must be paired
+
+
+def test_group_order_under_concurrency(cur, db_config, test_db):
+    """Spec test 1: 4 consumers, 8 groups, 200 interleaved grouped publishes
+    published concurrently with consumption, plus ungrouped traffic in the same
+    queue. Every group is claimed and acked in sequence order, every message
+    is acked exactly once, and ungrouped rows flow."""
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt')")
+    groups = [f'g{i}' for i in range(8)]
+    plan = [random.choice(groups) for _ in range(200)] + [None] * 50
+    random.shuffle(plan)
+
+    lock = threading.Lock()
+    claims = []          # (group, seq) in claim order
+    acked = {}           # message_id -> ack count
+    errors = []
+    publishing_done = threading.Event()
+
+    def publisher():
+        try:
+            c = _connect(db_config, test_db)
+            with c.cursor() as pc:
+                for i, g in enumerate(plan):
+                    _publish(pc, 'gt', {'i': i}, g)
+                    if i % 10 == 0:
+                        time.sleep(0.002)
+            c.close()
+        except Exception as e:  # pragma: no cover - surfaced below
+            errors.append(e)
+        finally:
+            publishing_done.set()
+
+    def consumer():
+        try:
+            c = _connect(db_config, test_db)
+            with c.cursor() as cc:
+                idle = 0
+                while True:
+                    batch = _consume(cc, 'gq', vt=30, limit=3)
+                    if not batch:
+                        with lock:
+                            finished = publishing_done.is_set() and sum(acked.values()) >= len(plan)
+                        if finished or (publishing_done.is_set() and idle > 400):
+                            break
+                        idle += 1
+                        time.sleep(0.005)
+                        continue
+                    idle = 0
+                    seen = [m['group'] for m in batch if m['group'] is not None]
+                    assert len(seen) == len(set(seen)), f'batch holds two rows of a group: {batch}'
+                    with lock:
+                        claims.extend((m['group'], m['seq']) for m in batch)
+                    for m in batch:
+                        time.sleep(random.uniform(0, 0.003))
+                        _ack(cc, 'gq', m)
+                        with lock:
+                            acked[m['id']] = acked.get(m['id'], 0) + 1
+            c.close()
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=publisher)] + [threading.Thread(target=consumer) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    assert not errors, errors
+
+    assert len(acked) == len(plan)
+    assert all(n == 1 for n in acked.values()), 'a message was acked more than once'
+    for g in groups:
+        seqs = [s for (gk, s) in claims if gk == g]
+        assert seqs == list(range(1, plan.count(g) + 1)), f'group {g} claimed out of order: {seqs}'
+    assert sum(1 for (gk, _) in claims if gk is None) == plan.count(None)
+
+    # Commit order of the acks themselves (DB clock) follows the sequence.
+    cur.execute("""
+        SELECT group_key, array_agg(group_seq ORDER BY processed_at, group_seq)
+        FROM postgremq.queue_messages
+        WHERE queue_name = 'gq' AND group_key IS NOT NULL
+        GROUP BY group_key""")
+    for g, seqs in cur.fetchall():
+        assert seqs == sorted(seqs), f'group {g} acked out of order: {seqs}'
+
+
+def test_group_ungrouped_flows_while_head_leased(cur):
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt')")
+    _publish(cur, 'gt', {}, 'A')
+    _publish(cur, 'gt', {}, 'A')
+    [head] = _consume(cur, 'gq')
+    assert (head['group'], head['seq']) == ('A', 1)
+    u1 = _publish(cur, 'gt', {})
+    u2 = _publish(cur, 'gt', {})
+    got = _consume(cur, 'gq', limit=10)
+    assert sorted(m['id'] for m in got) == sorted([u1, u2])
+
+
+def test_group_leased_head_blocks_successor_and_ack_notifies(cur):
+    """Spec test 2."""
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt')")
+    _publish(cur, 'gt', {}, 'A')
+    a2 = _publish(cur, 'gt', {}, 'A')
+    cur.execute('LISTEN "pmq:q:gq"')
+    [head] = _consume(cur, 'gq')
+    assert head['seq'] == 1
+    assert _consume(cur, 'gq', limit=10) == []
+    _drain_notifies(cur.connection)
+
+    _ack(cur, 'gq', head)
+    notes = _queue_notifies(cur.connection, 'gq')
+    assert len(notes) == 1 and notes[0].payload == ''
+    [succ] = _consume(cur, 'gq', limit=10)
+    assert (succ['id'], succ['seq']) == (a2, 2)
+
+    # Ungrouped acks stay silent (nothing new to consume).
+    u = _publish(cur, 'gt', {})
+    [m] = _consume(cur, 'gq')
+    assert m['id'] == u
+    _drain_notifies(cur.connection)
+    _ack(cur, 'gq', m)
+    assert _queue_notifies(cur.connection, 'gq') == []
+
+
+def test_group_ack_in_caller_transaction_notifies_on_commit(cur, db_config, test_db):
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt')")
+    _publish(cur, 'gt', {}, 'A')
+    _publish(cur, 'gt', {}, 'A')
+    [head] = _consume(cur, 'gq')
+    cur.execute('LISTEN "pmq:q:gq"')
+    _drain_notifies(cur.connection)
+    tx = psycopg2.connect(**{**db_config, 'dbname': test_db})
+    try:
+        with tx.cursor() as t:
+            _ack(t, 'gq', head)
+            # Uncommitted ack: no wake-up yet, and the successor is still blocked.
+            assert _queue_notifies(cur.connection, 'gq') == []
+            assert _consume(cur, 'gq') == []
+            tx.rollback()
+        assert _queue_notifies(cur.connection, 'gq') == []
+        assert _consume(cur, 'gq') == []
+        with tx.cursor() as t:
+            _ack(t, 'gq', head)
+        tx.commit()
+        got = []
+        assert _wait_until(lambda: got.extend(_queue_notifies(cur.connection, 'gq')) or len(got) >= 1)
+        assert len(got) == 1
+        [succ] = _consume(cur, 'gq')
+        assert succ['seq'] == 2
+    finally:
+        tx.close()
+
+
+def test_group_nack_with_delay_blocks_group(cur):
+    """Spec test 3."""
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt')")
+    a1 = _publish(cur, 'gt', {}, 'A')
+    _publish(cur, 'gt', {}, 'A')
+    b1 = _publish(cur, 'gt', {}, 'B')
+    [head] = _consume(cur, 'gq')
+    assert head['id'] == a1
+    cur.execute("SELECT postgremq.nack_message('gq', %s, %s, clock_timestamp() + interval '1 second')",
+                (a1, head['token']))
+    # Group A is blocked by its delayed head; group B is unaffected.
+    got = _consume(cur, 'gq', limit=10)
+    assert [m['id'] for m in got] == [b1]
+    time.sleep(1.1)
+    got = _consume(cur, 'gq', limit=10)
+    assert [(m['id'], m['attempts']) for m in got] == [(a1, 2)]
+
+
+def test_group_lease_expiry_redelivers_head(cur):
+    """Spec test 4."""
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt')")
+    a1 = _publish(cur, 'gt', {}, 'A')
+    _publish(cur, 'gt', {}, 'A')
+    [head] = _consume(cur, 'gq', vt=1)
+    assert head['id'] == a1
+    time.sleep(1.1)
+    got = _consume(cur, 'gq', limit=10)
+    assert [(m['id'], m['seq'], m['attempts']) for m in got] == [(a1, 1, 2)]
+    # The stale token is fenced; the successor is still blocked.
+    with pytest.raises(psycopg2.Error) as exc:
+        _ack(cur, 'gq', head)
+    assert exc.value.pgcode == 'PMQ01'
+    assert _consume(cur, 'gq', limit=10) == []
+
+
+def test_group_next_visible_time_ignores_blocked_successors(cur):
+    """Clients schedule their next fetch at get_next_visible_time. A blocked
+    successor's vt is in the past; reporting it would make them refetch in a
+    tight loop while the head is leased."""
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt')")
+    _publish(cur, 'gt', {}, 'A')
+    _publish(cur, 'gt', {}, 'A')
+    [head] = _consume(cur, 'gq', vt=60)
+    cur.execute("SELECT postgremq.get_next_visible_time('gq') - clock_timestamp()")
+    assert cur.fetchone()[0] > timedelta(seconds=55)
+    _ack(cur, 'gq', head)
+    cur.execute("SELECT postgremq.get_next_visible_time('gq') <= clock_timestamp()")
+    assert cur.fetchone()[0] is True
+
+
+def test_group_final_attempt_nack_retires_head_and_notifies(cur):
+    """Spec test 5, inline nack path."""
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt', 1)")
+    a1 = _publish(cur, 'gt', {}, 'A')
+    a2 = _publish(cur, 'gt', {}, 'A')
+    cur.execute('LISTEN "pmq:q:gq"')
+    [head] = _consume(cur, 'gq')
+    _drain_notifies(cur.connection)
+    cur.execute("SELECT postgremq.nack_message('gq', %s, %s)", (a1, head['token']))
+    cur.execute("SELECT message_id FROM postgremq.dead_letter_queue WHERE queue_name = 'gq'")
+    assert [r[0] for r in cur.fetchall()] == [a1]
+    assert len(_queue_notifies(cur.connection, 'gq')) == 1
+    [succ] = _consume(cur, 'gq', limit=10)
+    assert succ['id'] == a2
+
+    # An ungrouped final-attempt retirement stays silent.
+    u = _publish(cur, 'gt', {})
+    [m] = _consume(cur, 'gq')
+    assert m['id'] == u
+    _drain_notifies(cur.connection)
+    cur.execute("SELECT postgremq.nack_message('gq', %s, %s)", (u, m['token']))
+    assert _queue_notifies(cur.connection, 'gq') == []
+
+
+def test_group_maintenance_retirement_unblocks_and_notifies_once_per_queue(cur):
+    """Spec test 5, maintenance path: a crashed final attempt holds its group
+    until pmq_maintenance_fast retires it; one NOTIFY per affected queue."""
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt', 1)")
+    cur.execute("SELECT postgremq.create_queue('quiet', 'gt', 0)")
+    a1 = _publish(cur, 'gt', {}, 'A')
+    a2 = _publish(cur, 'gt', {}, 'A')
+    b1 = _publish(cur, 'gt', {}, 'B')
+    b2 = _publish(cur, 'gt', {}, 'B')
+    got = _consume(cur, 'gq', vt=1, limit=10)
+    assert sorted(m['id'] for m in got) == [a1, b1]
+    time.sleep(1.1)
+    # Exhausted heads are neither claimable nor do they let successors pass.
+    assert _consume(cur, 'gq', limit=10) == []
+
+    cur.execute('LISTEN "pmq:q:gq"; LISTEN "pmq:q:quiet"')
+    _drain_notifies(cur.connection)
+    cur.execute("SELECT retired_to_dlq FROM postgremq.pmq_maintenance_fast()")
+    assert cur.fetchone()[0] == 2
+    cur.connection.poll()
+    chans = [n.channel for n in cur.connection.notifies]
+    cur.connection.notifies.clear()
+    assert chans == ['pmq:q:gq']
+    got = _consume(cur, 'gq', limit=10)
+    assert sorted(m['id'] for m in got) == [a2, b2]
+
+
+def test_group_batch_claim_returns_one_row_per_group(cur):
+    """Spec test 6."""
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt')")
+    for _ in range(5):
+        for g in ('A', 'B', 'C'):
+            _publish(cur, 'gt', {}, g)
+    u1 = _publish(cur, 'gt', {})
+    u2 = _publish(cur, 'gt', {})
+    got = _consume(cur, 'gq', limit=100)
+    grouped = sorted((m['group'], m['seq']) for m in got if m['group'])
+    assert grouped == [('A', 1), ('B', 1), ('C', 1)]
+    assert sorted(m['id'] for m in got if not m['group']) == [u1, u2]
+
+
+def test_group_order_is_per_queue(cur):
+    """Spec test 7: two queues on one topic keep order independently."""
+    cur.execute("SELECT postgremq.create_topic('gt')")
+    cur.execute("SELECT postgremq.create_queue('q1', 'gt'); SELECT postgremq.create_queue('q2', 'gt')")
+    a1 = _publish(cur, 'gt', {}, 'A')
+    a2 = _publish(cur, 'gt', {}, 'A')
+    a3 = _publish(cur, 'gt', {}, 'A')
+    [h1] = _consume(cur, 'q1')
+    assert h1['id'] == a1
+    # q1's leased head does not block q2's copy of the group.
+    for expected in (a1, a2, a3):
+        [m] = _consume(cur, 'q2', limit=10)
+        assert m['id'] == expected
+        _ack(cur, 'q2', m)
+    assert _consume(cur, 'q1', limit=10) == []
+    _ack(cur, 'q1', h1)
+    [m] = _consume(cur, 'q1', limit=10)
+    assert m['id'] == a2
+
+
+def test_group_concurrent_publishers_serialise_in_commit_order(cur, db_config, test_db):
+    """Spec test 8: a second publisher of the group blocks until the first
+    commits; sequences are dense and in commit order (also across a rollback)."""
+    cur.execute("SELECT postgremq.create_topic('gt')")
+    first = psycopg2.connect(**{**db_config, 'dbname': test_db})
+    second = _connect(db_config, test_db)
+    try:
+        with first.cursor() as f:
+            m1 = _publish(f, 'gt', {'who': 'first'}, 'A')
+            m2 = _publish(f, 'gt', {'who': 'first'}, 'A')
+        result = {}
+        errors = []
+
+        def publish_second():
+            try:
+                with second.cursor() as s:
+                    result['id'] = _publish(s, 'gt', {'who': 'second'}, 'A')
+            except Exception as e:
+                errors.append(e)
+
+        t = threading.Thread(target=publish_second)
+        t.start()
+        try:
+            assert _wait_until(lambda: _backend_waits_on_lock(cur, second)), \
+                'second publisher of the group must wait for the first to commit'
+            assert t.is_alive()
+            # Another group is not serialised behind it.
+            _publish(cur, 'gt', {}, 'B')
+        finally:
+            first.commit()
+            t.join(timeout=10)
+        assert not t.is_alive() and not errors, errors
+
+        cur.execute("SELECT id, group_seq FROM postgremq.messages WHERE group_key = 'A' ORDER BY group_seq")
+        assert [tuple(r) for r in cur.fetchall()] == [(m1, 1), (m2, 2), (result['id'], 3)]
+
+        # A rolled-back publish leaves no gap: the next publisher reuses the sequence.
+        with first.cursor() as f:
+            _publish(f, 'gt', {}, 'A')
+        t = threading.Thread(target=publish_second)
+        t.start()
+        try:
+            assert _wait_until(lambda: _backend_waits_on_lock(cur, second))
+        finally:
+            first.rollback()
+            t.join(timeout=10)
+        assert not t.is_alive() and not errors, errors
+        cur.execute("SELECT group_seq FROM postgremq.messages WHERE group_key = 'A' ORDER BY group_seq")
+        assert [r[0] for r in cur.fetchall()] == [1, 2, 3, 4]
+    finally:
+        first.close()
+        second.close()
+
+
+def test_group_requeued_dlq_row_reenters_as_head(cur):
+    """Spec test 9."""
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt', 1)")
+    a1 = _publish(cur, 'gt', {}, 'A')
+    a2 = _publish(cur, 'gt', {}, 'A')
+    a3 = _publish(cur, 'gt', {}, 'A')
+    [m] = _consume(cur, 'gq')
+    cur.execute("SELECT postgremq.nack_message('gq', %s, %s)", (a1, m['token']))  # -> DLQ
+    [m] = _consume(cur, 'gq')
+    assert m['id'] == a2
+    _ack(cur, 'gq', m)
+
+    cur.execute("SELECT postgremq.requeue_dlq_messages('gq')")
+    cur.execute("SELECT group_key, group_seq FROM postgremq.queue_messages WHERE queue_name='gq' AND message_id=%s", (a1,))
+    assert tuple(cur.fetchone()) == ('A', 1)
+    got = _consume(cur, 'gq', limit=10)
+    assert [(m['id'], m['seq']) for m in got] == [(a1, 1)]  # a3 is blocked behind it
+    _ack(cur, 'gq', got[0])
+    [m] = _consume(cur, 'gq', limit=10)
+    assert m['id'] == a3
+
+
+def test_group_cleanup_prunes_only_empty_groups(cur, db_config, test_db):
+    """Spec test 10: cleanup removes only empty groups, never a group with a
+    publish in flight, and the next publish to a pruned group restarts at 1."""
+    cur.execute("SELECT postgremq.create_topic('gt')")  # no queues: payloads are unreferenced
+    for g in ('A', 'B', 'C'):
+        _publish(cur, 'gt', {}, g)
+    _publish(cur, 'gt', {}, 'B')
+    cur.execute("UPDATE postgremq.messages SET published_at = clock_timestamp() - interval '2 days'")
+    cur.execute("SELECT postgremq.create_queue('gq', 'gt')")
+    b_live = _publish(cur, 'gt', {}, 'B')   # fresh and referenced: group B stays
+
+    writer = psycopg2.connect(**{**db_config, 'dbname': test_db})
+    try:
+        with writer.cursor() as w:
+            _publish(w, 'gt', {}, 'C')       # in flight: holds group C's row lock
+        cur.execute("SET statement_timeout = '2s'")
+        cur.execute("SELECT postgremq.cleanup_unreferenced_messages(24, 100)")
+        assert cur.fetchone()[0] == 4      # A1, B1, B2, C1 payloads
+        cur.execute("SELECT group_key, last_seq FROM postgremq.message_groups ORDER BY group_key")
+        assert [tuple(r) for r in cur.fetchall()] == [('B', 3), ('C', 1)]  # A pruned; C skipped
+        writer.commit()
+        cur.execute("SELECT group_key, last_seq FROM postgremq.message_groups ORDER BY group_key")
+        assert [tuple(r) for r in cur.fetchall()] == [('B', 3), ('C', 2)]
+        assert _publish(cur, 'gt', {}, 'C') and True
+        cur.execute("SELECT group_seq FROM postgremq.messages WHERE group_key='C' ORDER BY group_seq")
+        assert [r[0] for r in cur.fetchall()] == [2, 3]
+        _publish(cur, 'gt', {}, 'A')
+        cur.execute("SELECT group_seq FROM postgremq.messages WHERE group_key='A'")
+        assert [r[0] for r in cur.fetchall()] == [1]
+        cur.execute("SELECT group_seq FROM postgremq.messages WHERE id=%s", (b_live,))
+        assert cur.fetchone()[0] == 3
+    finally:
+        cur.execute("SET statement_timeout = 0")
+        writer.close()
+
+
+def test_group_prune_keeps_group_that_regained_a_message(cur, db_config, test_db):
+    """prune_message_groups re-checks emptiness before deleting: a group whose
+    message committed after the caller computed its candidate list survives.
+    (The narrower race the two-statement design exists for — a publish that
+    commits between the lock statement's snapshot and its lock acquisition —
+    cannot be scheduled deterministically from a test; it was reproduced
+    against the single-statement variants during design review.)"""
+    cur.execute("SELECT postgremq.create_topic('gt')")
+    _publish(cur, 'gt', {}, 'A')
+    cur.execute("DELETE FROM postgremq.messages")
+    other = _connect(db_config, test_db)
+    try:
+        with other.cursor() as o:
+            _publish(o, 'gt', {}, 'A')    # committed: group A is not empty any more
+        cur.execute("SELECT postgremq.prune_message_groups(ARRAY['gt'], ARRAY['A'])")
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT last_seq FROM postgremq.message_groups WHERE group_key='A'")
+        assert cur.fetchone()[0] == 2
+    finally:
+        other.close()
+
+
+def test_group_rows_follow_topic_lifecycle(cur):
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_topic('other')")
+    _publish(cur, 'gt', {}, 'A')
+    _publish(cur, 'other', {}, 'A')
+    cur.execute("SELECT postgremq.clean_up_topic('gt')")
+    cur.execute("SELECT topic_name FROM postgremq.message_groups")
+    assert [r[0] for r in cur.fetchall()] == ['other']
+    cur.execute("SELECT postgremq.delete_topic('gt')")
+    cur.execute("SELECT postgremq.purge_all_messages()")
+    cur.execute("SELECT count(*) FROM postgremq.message_groups")
+    assert cur.fetchone()[0] == 0
+
+
+def _plan_nodes(node):
+    yield node
+    for child in node.get('Plans', []):
+        yield from _plan_nodes(child)
+
+
+def _captured_plans(conn, needle):
+    """Plans auto_explain sent as notices (JSON format) whose query text
+    contains `needle`, as lists of plan nodes."""
+    plans = []
+    for notice in conn.notices:
+        if 'plan:' not in notice:
+            continue
+        doc = json.loads(notice.split('plan:', 1)[1])
+        if needle in doc['Query Text']:
+            plans.append(list(_plan_nodes(doc['Plan'])))
+    return plans
+
+
+def test_group_consume_plan_uses_group_head_index(cur):
+    """Spec test 11: on a 100k-row backlog in 1k groups consume_message walks
+    the queue's vt-ordered index (stopping at LIMIT), probes
+    idx_queue_messages_group_head for the head check, and never sorts or
+    seq-scans the backlog. Plans of the statements inside the plpgsql function
+    are captured with auto_explain (log_nested_statements) as notices; both the
+    first (custom) and the steady-state (cached) plan are checked."""
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt')")
+    cur.execute("SELECT postgremq.create_queue('other', 'gt')")  # rows of another queue in the table
+    cur.execute("""
+        INSERT INTO postgremq.messages(topic_name, payload, published_at, deliver_after, group_key, group_seq)
+        SELECT 'gt', '{}'::jsonb, ts, ts, 'g' || (i % 1000), i / 1000 + 1
+        FROM generate_series(0, 99999) AS i,
+             LATERAL (SELECT clock_timestamp() - interval '1 hour' + i * interval '1 millisecond' AS ts) t""")
+    cur.execute("""INSERT INTO postgremq.message_groups(topic_name, group_key, last_seq)
+                   SELECT 'gt', 'g' || g, 100 FROM generate_series(0, 999) g""")
+    cur.execute("ANALYZE postgremq.queue_messages; ANALYZE postgremq.messages")
+    # Lease some heads so the scan has to step over blocked successors too.
+    _consume(cur, 'gq', vt=300, limit=200)
+
+    conn = cur.connection
+    cur.execute("LOAD 'auto_explain'")
+    cur.execute("""SET auto_explain.log_min_duration = 0;
+                   SET auto_explain.log_analyze = on;
+                   SET auto_explain.log_nested_statements = on;
+                   SET auto_explain.log_format = 'json';
+                   SET auto_explain.log_level = 'notice';
+                   SET client_min_messages = 'notice'""")
+    try:
+        for attempt in range(8):
+            # Check both the per-call custom plan and the cached generic plan
+            # plpgsql switches to after repeated executions.
+            mode = 'force_custom_plan' if attempt % 2 == 0 else 'force_generic_plan'
+            cur.execute(f"SET plan_cache_mode = {mode}")
+            del conn.notices[:]
+            got = _consume(cur, 'gq', vt=30, limit=10)
+            assert len(got) == 10
+            assert len({m['group'] for m in got}) == 10, 'one row per group'
+            assert all(m['seq'] == 1 for m in got), 'only heads are claimable'
+
+            plans = _captured_plans(conn, 'next_msg')
+            assert len(plans) == 1, conn.notices
+            nodes = plans[0]
+            types = [n['Node Type'] for n in nodes]
+            assert 'Sort' not in types, types
+            assert not any(n['Node Type'] == 'Seq Scan' and n.get('Relation Name') == 'queue_messages'
+                           for n in nodes), types
+            indexes = {n.get('Index Name') for n in nodes}
+            assert 'idx_queue_messages_group_head' in indexes, indexes
+            assert indexes & {'idx_queue_messages_consume', 'idx_queue_messages_next_visible'}, indexes
+            # The vt-ordered walk stops early: it never reads the backlog.
+            outer = [n for n in nodes if n.get('Index Name') in
+                     ('idx_queue_messages_consume', 'idx_queue_messages_next_visible')]
+            assert all(n['Actual Rows'] + n.get('Rows Removed by Filter', 0) < 1000 for n in outer), outer
+
+        # Every remaining head leased: the claim now has to step over the
+        # blocked successors, still via the group-head index and still
+        # without a Sort or a Seq Scan.
+        cur.execute("SET plan_cache_mode = force_custom_plan; SET auto_explain.log_min_duration = -1")
+        _consume(cur, 'gq', vt=300, limit=1000)
+        cur.execute("SET auto_explain.log_min_duration = 0")
+        for mode in ('force_custom_plan', 'force_generic_plan'):
+            cur.execute(f"SET plan_cache_mode = {mode}")
+            del conn.notices[:]
+            assert _consume(cur, 'gq', vt=30, limit=10) == []
+            [nodes] = _captured_plans(conn, 'next_msg')
+            types = [n['Node Type'] for n in nodes]
+            assert 'Sort' not in types, types
+            assert not any(n['Node Type'] == 'Seq Scan' and n.get('Relation Name') == 'queue_messages'
+                           for n in nodes), types
+            probes = [n for n in nodes if n.get('Index Name') == 'idx_queue_messages_group_head']
+            assert probes and max(n['Actual Loops'] for n in probes) > 1000, probes
+    finally:
+        cur.execute("SET auto_explain.log_min_duration = -1; RESET client_min_messages; RESET plan_cache_mode")
+
+
+def test_group_delete_queue_message_wakes_successor(cur):
+    cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt')")
+    a1 = _publish(cur, 'gt', {}, 'A')
+    a2 = _publish(cur, 'gt', {}, 'A')
+    cur.execute('LISTEN "pmq:q:gq"')
+    _drain_notifies(cur.connection)
+    cur.execute("SELECT postgremq.delete_queue_message('gq', %s)", (a1,))
+    assert len(_queue_notifies(cur.connection, 'gq')) == 1
+    [m] = _consume(cur, 'gq')
+    assert m['id'] == a2

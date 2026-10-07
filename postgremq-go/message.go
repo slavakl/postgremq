@@ -35,6 +35,12 @@ type Message struct {
 	// VT is the visibility timeout expiration timestamp. If the message is not
 	// acknowledged by this time, it becomes visible to other consumers.
 	VT time.Time
+	// GroupKey is the message group the message was published into (see
+	// WithGroupKey); empty for an ungrouped message.
+	GroupKey string
+	// GroupSeq is the message's dense, 1-based position in its group, in
+	// publish commit order; 0 for an ungrouped message.
+	GroupSeq int64
 
 	// StoppedCtx is a context that is cancelled when Consumer.Stop() or
 	// Connection.Close() is called. Applications can monitor this context

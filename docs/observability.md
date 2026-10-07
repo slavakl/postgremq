@@ -73,7 +73,8 @@ The existing `get_queue_statistics()` API remains available for raw status count
 
 All are gauges, with `queue_name` and `topic_name` attributes. Count units are
 `{message}`, age is `s`, and active is `1`. `ready` describes eligibility; a row
-may still be locked by an in-progress transaction. `delayed`, `processing`,
+may still be locked by an in-progress transaction, or be a message-group
+successor waiting behind its group's head (see `mq/README.md`, Message groups). `delayed`, `processing`,
 `exhausted` and DLQ counts describe retained state even in an expired queue;
 `active` identifies that queue's unavailable state. They are not counts of active
 application handlers.
