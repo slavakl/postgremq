@@ -31,6 +31,12 @@ export class Message {
   /** Published timestamp */
   public readonly publishedAt: Date;
 
+  /** Message group (see PublishOptions.groupKey); null if ungrouped */
+  public readonly groupKey: string | null;
+
+  /** Dense 1-based position in the group, in publish commit order; null if ungrouped */
+  public readonly groupSeq: number | null;
+
   /** Visibility timeout expiration */
   public vt: Date;
 
@@ -87,6 +93,7 @@ export class Message {
    * @param publishedAt - Published timestamp
    * @param onComplete - Callback when message is completed
    * @param dbOperations - Database operations for this message
+   * @param group - Message group key and sequence; null if ungrouped
    */
   constructor(
     id: number,
@@ -117,9 +124,12 @@ export class Message {
         consumerToken: string,
         vt: number
       ) => Promise<Date>;
-    }
+    },
+    group: { key: string; seq: number } | null = null
   ) {
     this.id = messageId(id);
+    this.groupKey = group?.key ?? null;
+    this.groupSeq = group?.seq ?? null;
     this.queueName = queueName;
     this.payload = payload;
     this.consumerToken = consumerToken;

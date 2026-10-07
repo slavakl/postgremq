@@ -139,6 +139,14 @@ for msg := range consumer.Messages() {
 }
 ```
 
+### Ordered delivery (message groups)
+
+```go
+// Within each queue, a group's messages are delivered one at a time in
+// publish commit order (msg.GroupKey / msg.GroupSeq). See mq/README.md.
+_, err = conn.Publish(ctx, "session-events", payload, postgremq.WithGroupKey(sessionID))
+```
+
 ### Using Transactions
 
 You can use transactions to ensure that message publishing and acknowledgment operations are performed atomically with other database operations:

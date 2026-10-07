@@ -8,9 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Message groups (ordered delivery): `publish_message(..., p_group_key)` assigns a
+  dense per-(topic, group) sequence in commit order; within each queue a group is
+  claimed strictly in order, one delivery at a time (head-of-line blocking, at most
+  one row per group per batch). Successors are woken by NOTIFY when a grouped head
+  is acked, retired to the DLQ or deleted. Go `WithGroupKey` / `Message.GroupKey`,
+  `GroupSeq`; TypeScript `{ groupKey }` / `message.groupKey`, `groupSeq`.
 - Initial open source release preparation
 - Comprehensive documentation (README, CONTRIBUTING, SECURITY)
 - CI/CD workflows for automated testing
+
+### Fixed
+- `consume_message` no longer seq-scans every queue's rows and sorts the whole
+  visible backlog on each claim: the queue filter is now an index condition, so a
+  claim walks the queue's vt-ordered index and stops at the batch size.
+- `get_next_visible_time` ignores blocked group successors, and both clients back
+  off briefly when it reports an already-due (locked) row instead of refetching in
+  a tight loop; a NOTIFY received during an in-flight fetch now triggers a follow-up
+  fetch instead of being dropped.
 
 ## [0.1.0] - 2025-02-XX
 

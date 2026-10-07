@@ -34,6 +34,7 @@ import {
   sleep,
   withRetry,
   messageId as checkedMessageId,
+  groupSeq as checkedGroupSeq,
   untilDeadline,
   createDeferred,
 } from './utils';
@@ -650,16 +651,19 @@ export class Connection implements IConnection {
     options: PublishOptions,
     transaction: boolean
   ): Promise<number> {
-    let query: string;
-    let params: any[];
-
+    // Optional arguments use named notation so each keeps its SQL default
+    // when omitted.
+    const params: any[] = [topic, JSON.stringify(payload)];
+    let args = '$1, $2';
     if (options.deliverAfter) {
-      query = 'SELECT postgremq.publish_message($1, $2, $3) as publish_message';
-      params = [topic, JSON.stringify(payload), options.deliverAfter];
-    } else {
-      query = 'SELECT postgremq.publish_message($1, $2) as publish_message';
-      params = [topic, JSON.stringify(payload)];
+      params.push(options.deliverAfter);
+      args += `, p_deliver_after => $${params.length}`;
     }
+    if (options.groupKey !== undefined && options.groupKey !== null) {
+      params.push(options.groupKey);
+      args += `, p_group_key => $${params.length}`;
+    }
+    const query = `SELECT postgremq.publish_message(${args}) as publish_message`;
 
     return this.telemetry.send(topic, transaction, async () => {
       const result = await queryable.query(query, params);
@@ -1142,6 +1146,8 @@ export class Connection implements IConnection {
         deliveryAttempts: row.delivery_attempts,
         vt: row.vt,
         processedAt: row.processed_at,
+        groupKey: row.group_key,
+        groupSeq: checkedGroupSeq(row.group_seq),
       }));
     });
   }
@@ -1170,6 +1176,8 @@ export class Connection implements IConnection {
         topicName: row.topic_name,
         payload: row.payload,
         publishedAt: row.published_at,
+        groupKey: row.group_key,
+        groupSeq: checkedGroupSeq(row.group_seq),
       };
     });
   }
@@ -1239,6 +1247,7 @@ export class Connection implements IConnection {
             return result.rows.map((row) => ({
               ...row,
               message_id: checkedMessageId(row.message_id),
+              group_seq: checkedGroupSeq(row.group_seq),
             }));
           },
           Math.max(1000, visibilityTimeout * 500)

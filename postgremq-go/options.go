@@ -472,6 +472,7 @@ type PublishOption func(*publishOptions)
 
 type publishOptions struct {
 	deliverAfter *time.Time
+	groupKey     *string
 }
 
 // WithDeliverAfter sets the time when a newly published message should become visible.
@@ -496,5 +497,33 @@ type publishOptions struct {
 func WithDeliverAfter(t time.Time) PublishOption {
 	return func(o *publishOptions) {
 		o.deliverAfter = &t
+	}
+}
+
+// WithGroupKey publishes the message into a message group.
+//
+// Within one queue, deliveries of one group are claimed strictly in publish
+// commit order, one at a time: a message is not delivered while an earlier
+// message of its group is pending or being processed (head-of-line blocking,
+// as in SQS FIFO). A head nacked with a delay blocks its group until the delay
+// passes; a head that exhausts its delivery attempts moves to the dead letter
+// queue, which unblocks the group. A consume batch holds at most one message
+// per group. Messages without a group key are unordered and never blocked.
+//
+// Publishers of one group are serialised by the database until their
+// transaction commits, so a group should be a session, an order or an
+// account — never a hot key shared by unrelated work. A transaction that
+// publishes to several groups should take them in a consistent order to
+// avoid deadlocks.
+//
+// The key must be 1..255 characters; an empty key is rejected with
+// ErrValidation (omit the option to publish ungrouped).
+//
+// Example:
+//
+//	conn.Publish(ctx, "session-events", payload, postgremq.WithGroupKey(sessionID))
+func WithGroupKey(key string) PublishOption {
+	return func(o *publishOptions) {
+		o.groupKey = &key
 	}
 }

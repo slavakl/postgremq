@@ -700,15 +700,23 @@ func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, pa
 		opt(options)
 	}
 
+	// Optional arguments use named notation so each keeps its SQL default
+	// when omitted.
+	query := "SELECT postgremq.publish_message($1, $2"
+	args := []any{topic, payload}
+	if options.deliverAfter != nil {
+		args = append(args, *options.deliverAfter)
+		query += fmt.Sprintf(", p_deliver_after => $%d", len(args))
+	}
+	if options.groupKey != nil {
+		args = append(args, *options.groupKey)
+		query += fmt.Sprintf(", p_group_key => $%d", len(args))
+	}
+	query += ")"
+
 	publish := func(ctx context.Context) (messageID int64, err error) {
 		defer func() { c.metrics.recordSent(ctx, topic, !retry, err) }()
-		if options.deliverAfter != nil {
-			err = tx.QueryRow(ctx, "SELECT postgremq.publish_message($1, $2, $3)",
-				topic, payload, *options.deliverAfter).Scan(&messageID)
-		} else {
-			err = tx.QueryRow(ctx, "SELECT postgremq.publish_message($1, $2)",
-				topic, payload).Scan(&messageID)
-		}
+		err = tx.QueryRow(ctx, query, args...).Scan(&messageID)
 		return messageID, err
 	}
 	var messageID int64
@@ -751,7 +759,7 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 		generation = &generations[0]
 	}
 	rows, err := c.pool.Query(ctx,
-		"SELECT message_id, payload, consumer_token, delivery_attempts, vt, published_at FROM postgremq.consume_message($1, $2, $3, $4)",
+		"SELECT message_id, payload, consumer_token, delivery_attempts, vt, published_at, group_key, group_seq FROM postgremq.consume_message($1, $2, $3, $4)",
 		queue, vt, limit, generation)
 	if err != nil {
 		return nil, mapPgError(fmt.Errorf("failed to consume messages: %w", err))
@@ -767,8 +775,10 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 			deliveryAttempts int
 			vt               time.Time
 			publishedAt      time.Time
+			groupKey         *string
+			groupSeq         *int64
 		)
-		if err := rows.Scan(&id, &payload, &consumerToken, &deliveryAttempts, &vt, &publishedAt); err != nil {
+		if err := rows.Scan(&id, &payload, &consumerToken, &deliveryAttempts, &vt, &publishedAt, &groupKey, &groupSeq); err != nil {
 			// Return successfully-scanned messages alongside the error.
 			// They're already claimed server-side; the caller can deliver
 			// them while still seeing the error and scheduling a retry.
@@ -785,6 +795,9 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 			conn:            c,     // Set connection so methods like Ack() will work.
 			queue:           queue, // Save the originating queue name.
 			VT:              vt,
+		}
+		if groupKey != nil && groupSeq != nil {
+			msg.GroupKey, msg.GroupSeq = *groupKey, *groupSeq
 		}
 		messages = append(messages, msg)
 	}
@@ -1336,6 +1349,10 @@ type QueueMessage struct {
 	VT time.Time
 	// ProcessedAt is when the message was completed (nil if not yet completed).
 	ProcessedAt *time.Time
+	// GroupKey is the message's group (empty if ungrouped).
+	GroupKey string
+	// GroupSeq is the message's position in its group (0 if ungrouped).
+	GroupSeq int64
 }
 
 // PublishedMessage represents a complete message including its payload.
@@ -1350,6 +1367,10 @@ type PublishedMessage struct {
 	Payload []byte
 	// PublishedAt is when the message was first published to the topic.
 	PublishedAt time.Time
+	// GroupKey is the message's group (empty if ungrouped).
+	GroupKey string
+	// GroupSeq is the message's position in its group (0 if ungrouped).
+	GroupSeq int64
 }
 
 // ListMessages lists all messages in a queue without consuming them.
@@ -1372,7 +1393,7 @@ func (c *Connection) ListMessages(ctx context.Context, queueName string) ([]Queu
 	var messages []QueueMessage
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		rows, err := c.pool.Query(ctx,
-			"SELECT message_id, status, published_at, delivery_attempts, vt, processed_at FROM postgremq.list_messages($1)",
+			"SELECT message_id, status, published_at, delivery_attempts, vt, processed_at, coalesce(group_key, ''), coalesce(group_seq, 0) FROM postgremq.list_messages($1)",
 			queueName)
 		if err != nil {
 			return err
@@ -1389,6 +1410,8 @@ func (c *Connection) ListMessages(ctx context.Context, queueName string) ([]Queu
 				&msg.DeliveryAttempts,
 				&msg.VT,
 				&msg.ProcessedAt,
+				&msg.GroupKey,
+				&msg.GroupSeq,
 			); err != nil {
 				return err
 			}
@@ -1418,8 +1441,8 @@ func (c *Connection) GetMessage(ctx context.Context, messageID int64) (*Publishe
 	var msg PublishedMessage
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		return c.pool.QueryRow(ctx,
-			"SELECT message_id, topic_name, payload, published_at FROM postgremq.get_message($1)",
-			messageID).Scan(&msg.MessageID, &msg.TopicName, &msg.Payload, &msg.PublishedAt)
+			"SELECT message_id, topic_name, payload, published_at, coalesce(group_key, ''), coalesce(group_seq, 0) FROM postgremq.get_message($1)",
+			messageID).Scan(&msg.MessageID, &msg.TopicName, &msg.Payload, &msg.PublishedAt, &msg.GroupKey, &msg.GroupSeq)
 	})
 	if err != nil {
 		if err == pgx.ErrNoRows {

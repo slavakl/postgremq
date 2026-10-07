@@ -103,7 +103,25 @@ CREATE TABLE postgremq.messages (
   topic_name VARCHAR(255) NOT NULL REFERENCES postgremq.topics(name) ON DELETE CASCADE,
   payload JSONB NOT NULL,
   published_at TIMESTAMPTZ DEFAULT clock_timestamp(),
-  deliver_after TIMESTAMPTZ DEFAULT clock_timestamp()  -- New column with default clock_timestamp()
+  deliver_after TIMESTAMPTZ DEFAULT clock_timestamp(),  -- New column with default clock_timestamp()
+  -- Message group (ordered delivery). NULL = ungrouped. group_seq is the
+  -- dense per-(topic, group_key) sequence allocated by publish_message under
+  -- the message_groups row lock, so group order is publish commit order.
+  group_key VARCHAR(255),
+  group_seq BIGINT,
+  CONSTRAINT messages_group_key_seq_paired
+    CHECK ((group_key IS NULL) = (group_seq IS NULL))
+);
+
+-- Per-(topic, group_key) sequence allocator. publish_message upserts the row
+-- and holds its lock until commit, which serialises publishers of one group
+-- and makes group_seq follow commit order. Rows whose group has no message
+-- left are pruned by cleanup_unreferenced_messages.
+CREATE TABLE postgremq.message_groups (
+  topic_name VARCHAR(255) NOT NULL REFERENCES postgremq.topics(name) ON DELETE CASCADE,
+  group_key VARCHAR(255) NOT NULL,
+  last_seq BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (topic_name, group_key)
 );
 
 -- Queue Messages table.
@@ -117,7 +135,13 @@ CREATE TABLE postgremq.queue_messages (
   delivery_attempts INT DEFAULT 0,
   consumer_token VARCHAR(64),
   processed_at TIMESTAMPTZ,
+  -- Denormalised from messages by distribute_message so the consume
+  -- predicate's group-head check never joins messages.
+  group_key VARCHAR(255),
+  group_seq BIGINT,
   PRIMARY KEY (queue_name, message_id),
+  CONSTRAINT queue_messages_group_key_seq_paired
+    CHECK ((group_key IS NULL) = (group_seq IS NULL)),
   CONSTRAINT queue_messages_delivery_attempts_nonneg
     CHECK (delivery_attempts >= 0),
   -- Guard against a future code path writing a typo'd status (e.g.
@@ -195,6 +219,19 @@ CREATE INDEX idx_queue_messages_processing
 ON postgremq.queue_messages(queue_name)
 WHERE status = 'processing';
 
+-- Group-head lookup for consume_message / get_next_visible_time: "is there an
+-- unsettled row of this (queue, group) with a lower sequence?" is a single
+-- index probe. Partial on unsettled grouped rows, so ungrouped traffic and the
+-- retained completed set never touch it.
+CREATE INDEX idx_queue_messages_group_head
+ON postgremq.queue_messages(queue_name, group_key, group_seq)
+WHERE status IN ('pending', 'processing') AND group_key IS NOT NULL;
+
+-- Group-row pruning: "does any message of (topic, group_key) remain?".
+CREATE INDEX idx_messages_group
+ON postgremq.messages(topic_name, group_key)
+WHERE group_key IS NOT NULL;
+
 /* Function: distribute_message
  *
  * Description:
@@ -223,8 +260,10 @@ BEGIN
    -- is treated as dead everywhere at once. Clients are responsible for sending
    -- keep-alive well before expiry (with their own safety margin) so a queue is
    -- never considered expired while still in use.
-   INSERT INTO postgremq.queue_messages(queue_name, message_id, vt)
-   SELECT q.name, NEW.id, NEW.deliver_after
+   -- group_key/group_seq are copied so each queue orders its own copy of a
+   -- group independently, without joining messages on the consume path.
+   INSERT INTO postgremq.queue_messages(queue_name, message_id, vt, group_key, group_seq)
+   SELECT q.name, NEW.id, NEW.deliver_after, NEW.group_key, NEW.group_seq
    FROM postgremq.queues q
    WHERE q.topic_name = NEW.topic_name
      AND (NOT q.exclusive OR q.keep_alive_until > clock_timestamp());
@@ -443,31 +482,65 @@ $$ LANGUAGE plpgsql;
  *   - p_topic (VARCHAR): Topic name (must exist).
  *   - p_payload (JSONB): Arbitrary JSON payload stored in `messages.payload`.
  *   - p_deliver_after (TIMESTAMPTZ, default clock_timestamp()): First visibility time.
+ *   - p_group_key (VARCHAR, default NULL): Message group. NULL publishes an
+ *     ungrouped message. With a key, the message gets the next dense
+ *     group_seq of (p_topic, p_group_key); within each queue, deliveries of
+ *     one group are claimed strictly in group_seq order.
  *
  * Returns:
  *   BIGINT: The generated message id.
  *
  * Side Effects:
  *   - Triggers `postgremq.distribute_message()` which inserts into `queue_messages` and
- *     emits NOTIFY on `postgremq_events`.
+ *     emits NOTIFY on `pmq:t:<topic>`.
+ *   - With a group key: upserts the (topic, group_key) row of `message_groups`
+ *     and holds its row lock until the caller's transaction ends. Publishers
+ *     of one group are therefore serialised, and group_seq order is commit
+ *     order: a lower sequence can never become visible after a higher one.
+ *     A transaction that publishes to several groups can deadlock (40P01)
+ *     with one that takes them in a different order; clients retry 40P01.
+ *
+ * Raises:
+ *   - PMQ02 if the topic does not exist.
+ *   - PMQ03 if p_group_key is empty or longer than 255 characters.
  */
 CREATE OR REPLACE FUNCTION postgremq.publish_message(
     p_topic VARCHAR(255),
     p_payload JSONB,
-    p_deliver_after TIMESTAMPTZ DEFAULT clock_timestamp()
+    p_deliver_after TIMESTAMPTZ DEFAULT clock_timestamp(),
+    p_group_key VARCHAR(255) DEFAULT NULL
 ) RETURNS BIGINT AS $$
 DECLARE
     v_message_id BIGINT;
+    v_group_seq BIGINT;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM postgremq.topics WHERE name = p_topic) THEN
         RAISE EXCEPTION 'Topic "%" does not exist', p_topic
           USING ERRCODE = 'PMQ02';
     END IF;
-    
-    INSERT INTO postgremq.messages(topic_name, payload, deliver_after)
-    VALUES (p_topic, p_payload, p_deliver_after)
+
+    IF p_group_key IS NOT NULL THEN
+        -- Function argument typmods are not enforced, so check the length here
+        -- rather than surfacing a raw 22001 from the INSERT.
+        IF p_group_key = '' OR char_length(p_group_key) > 255 THEN
+            RAISE EXCEPTION 'Invalid group key: must be 1..255 characters'
+              USING ERRCODE = 'PMQ03';
+        END IF;
+        -- The upsert takes the group row's lock and keeps it until commit:
+        -- that is the serialisation of a group's publishers, and why the
+        -- sequence is dense and in commit order.
+        INSERT INTO postgremq.message_groups AS g (topic_name, group_key, last_seq)
+        VALUES (p_topic, p_group_key, 1)
+        ON CONFLICT (topic_name, group_key) DO UPDATE SET last_seq = g.last_seq + 1
+        RETURNING g.last_seq INTO v_group_seq;
+    END IF;
+
+    -- COALESCE: an explicit NULL deliver_after (a positional caller passing
+    -- only a group key) means "now", not a NULL vt.
+    INSERT INTO postgremq.messages(topic_name, payload, deliver_after, group_key, group_seq)
+    VALUES (p_topic, p_payload, COALESCE(p_deliver_after, clock_timestamp()), p_group_key, v_group_seq)
     RETURNING id INTO v_message_id;
-    
+
     RETURN v_message_id;
 END;
 $$ LANGUAGE plpgsql;
@@ -484,8 +557,15 @@ $$ LANGUAGE plpgsql;
  *   - p_vt (INTEGER): The duration for which the message is locked in seconds.
  *   - p_limit (INT DEFAULT 1): Maximum number of messages to retrieve.
  *
+ * Message groups:
+ *   A grouped row is claimable only while no row of the same (queue, group_key)
+ *   with a lower group_seq is pending or processing, so a group is claimed in
+ *   order, one delivery at a time, and a batch holds at most one row per group.
+ *   Head-of-line blocking is intended: a leased or delayed head blocks its group.
+ *
  * Returns:
- *   A table of records with fields: queue_name, message_id, payload, consumer_token, delivery_attempts.
+ *   A table of records with fields: queue_name, message_id, payload, consumer_token,
+ *   delivery_attempts, vt, published_at, group_key, group_seq.
  *
  * Raises:
  *   - PMQ03 if p_vt < 0 or p_limit <= 0.
@@ -504,8 +584,14 @@ CREATE OR REPLACE FUNCTION postgremq.consume_message(
     consumer_token VARCHAR(64),
     delivery_attempts INT,
     vt TIMESTAMPTZ,
-    published_at TIMESTAMPTZ
+    published_at TIMESTAMPTZ,
+    group_key VARCHAR(255),
+    group_seq BIGINT
 ) AS $$
+DECLARE
+    v_max_attempts INT;
+    v_generation   UUID;
+    v_now          TIMESTAMPTZ;
 BEGIN
     IF p_vt < 0 THEN
         RAISE EXCEPTION 'p_vt must be >= 0' USING ERRCODE = 'PMQ03';
@@ -520,39 +606,70 @@ BEGIN
     -- silently polling an empty result forever. An existing-but-empty queue still
     -- returns zero rows with no error (the common idle case); only an ABSENT
     -- queue row raises here.
-    PERFORM 1 FROM postgremq.queues WHERE name = p_queue_name AND (p_generation IS NULL OR generation = p_generation)
-      AND (NOT exclusive OR keep_alive_until > clock_timestamp());
+    -- The generation is captured with the limit and pinned in the claim below,
+    -- so a queue deleted and recreated in between (possible when the caller
+    -- passes no generation) cannot be served with the old incarnation's limit.
+    SELECT q.max_delivery_attempts, q.generation INTO v_max_attempts, v_generation
+    FROM postgremq.queues q
+    WHERE q.name = p_queue_name AND (p_generation IS NULL OR q.generation = p_generation)
+      AND (NOT q.exclusive OR q.keep_alive_until > clock_timestamp());
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Queue "%" does not exist', p_queue_name
           USING ERRCODE = 'PMQ02';
     END IF;
+    v_now := clock_timestamp();
 
     -- Queue lifetime belongs to the keep-alive protocol, not message polling.
     -- Consumption never locks the shared queue row to refresh its lease.
+    --
+    -- Plan shape matters here. The queue filter is the parameter itself
+    -- (qm.queue_name = p_queue_name), so it is an index condition and
+    -- idx_queue_messages_consume yields rows in vt order: the LIMIT stops the
+    -- walk early and there is no Sort. (Joining a CTE that calls the volatile
+    -- clock_timestamp() instead materialises the CTE, turns the queue match
+    -- into a join filter, and degrades every consume to a Seq Scan over all
+    -- queues' rows plus a Sort of the whole visible backlog.) The queue's
+    -- liveness/generation guard stays in this statement as an uncorrelated
+    -- one-time filter, so a queue deleted or replaced after the check above
+    -- still serves nothing.
     RETURN QUERY
-    WITH target_queue AS (
-        SELECT name, max_delivery_attempts
-        FROM postgremq.queues
-        WHERE name = p_queue_name AND (p_generation IS NULL OR generation = p_generation)
-            -- Strict clock_timestamp() cutoff, symmetric with distribute_message and the
-            -- reaper: an expired exclusive queue serves nothing. No grace window.
-            AND (NOT exclusive OR keep_alive_until > clock_timestamp())
-    ),
-    next_msg AS (
+    WITH next_msg AS (
         SELECT qm.queue_name,
                qm.message_id,
                qm.status,
                qm.delivery_attempts,
                qm.published_at
         FROM postgremq.queue_messages qm
-        CROSS JOIN target_queue tq
-        WHERE qm.queue_name = tq.name
-            AND (tq.max_delivery_attempts = 0 OR qm.delivery_attempts < tq.max_delivery_attempts)
+        WHERE qm.queue_name = p_queue_name
+            AND EXISTS (
+                SELECT 1 FROM postgremq.queues q
+                WHERE q.name = p_queue_name
+                  AND q.generation = v_generation
+                  -- Strict clock_timestamp() cutoff, symmetric with distribute_message and the
+                  -- reaper: an expired exclusive queue serves nothing. No grace window.
+                  AND (NOT q.exclusive OR q.keep_alive_until > clock_timestamp()))
+            AND (v_max_attempts = 0 OR qm.delivery_attempts < v_max_attempts)
             AND (qm.status = 'pending' OR qm.status = 'processing' )
-            AND qm.vt <= clock_timestamp()
+            -- A captured cutoff (not clock_timestamp() itself, which is
+            -- volatile and cannot be an index condition) bounds the index
+            -- range to rows that are already visible, so an under-filled
+            -- batch never walks the queue's future-vt rows.
+            AND qm.vt <= v_now
+            -- Group head only. A head another consumer has locked (and is
+            -- claiming right now) is still 'pending' in this snapshot, so its
+            -- successor stays blocked: SKIP LOCKED never falls through to the
+            -- next row of a group. Two rows of one group cannot both pass in
+            -- one statement (the lower one is unsettled in the snapshot).
+            AND (qm.group_key IS NULL OR NOT EXISTS (
+                SELECT 1 FROM postgremq.queue_messages h
+                WHERE h.queue_name = qm.queue_name
+                  AND h.group_key = qm.group_key
+                  AND h.group_key IS NOT NULL
+                  AND h.group_seq < qm.group_seq
+                  AND h.status IN ('pending', 'processing')))
         -- Order by vt, not published_at, to match idx_queue_messages_consume
-        -- (queue_name, vt, published_at). The leading `vt <= clock_timestamp()` range scan
-        -- already walks the index in vt order, so ordering by vt eliminates the
+        -- (queue_name, vt, published_at). The `qm.queue_name = p_queue_name` /
+        -- `vt <= v_now` range scan already walks the index in vt order, so ordering by vt eliminates the
         -- Sort node that ORDER BY published_at forced over the whole visible set
         -- (an O(n log n) cliff on a deep backlog). At distribution time vt equals
         -- published_at, so fresh messages keep FIFO order. Tradeoff: REDELIVERED
@@ -579,7 +696,9 @@ BEGIN
               queue_messages.consumer_token,
               queue_messages.delivery_attempts,
               queue_messages.vt,
-              queue_messages.published_at;
+              queue_messages.published_at,
+              queue_messages.group_key,
+              queue_messages.group_seq;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -596,10 +715,14 @@ $$ LANGUAGE plpgsql;
  *
  * Returns: VOID.
  *
- * Note: The actual implementation is assumed to exist elsewhere if not defined here.
+ * Side Effects:
+ *   - Acking a grouped row NOTIFYs `pmq:q:<queue>`: the group's successor was
+ *     unclaimable until this head settled. Ungrouped acks stay silent.
  */
 CREATE OR REPLACE FUNCTION postgremq.ack_message(p_queue_name VARCHAR(255), p_message_id BIGINT, p_consumer_token VARCHAR(64))
 RETURNS VOID AS $$
+DECLARE
+  v_group_key VARCHAR(255);
 BEGIN
   UPDATE postgremq.queue_messages
   SET status = 'completed',
@@ -608,10 +731,18 @@ BEGIN
   WHERE queue_name = p_queue_name
     AND message_id = p_message_id
     AND status = 'processing'
-    AND consumer_token = p_consumer_token;
+    AND consumer_token = p_consumer_token
+  RETURNING group_key INTO v_group_key;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'Ack failed: message not found, not in processing state, or token mismatch'
       USING ERRCODE = 'PMQ01';
+  END IF;
+  -- Unconditional for grouped rows (no "does a successor exist?" probe): a
+  -- successor committed after this statement but before our commit would be
+  -- missed by the probe while its own publish NOTIFY found the head still
+  -- unsettled.
+  IF v_group_key IS NOT NULL THEN
+    PERFORM pg_notify('pmq:q:' || p_queue_name, '');
   END IF;
 END;
 $$ LANGUAGE plpgsql;
@@ -640,6 +771,7 @@ CREATE OR REPLACE FUNCTION postgremq.nack_message(
 DECLARE
     v_attempts     INT;
     v_max_attempts INT;
+    v_group_key    VARCHAR(255);
 BEGIN
     -- Look up the queue's retry limit. We need this to decide between the
     -- "reset to pending" path and the "inline DLQ retirement" path.
@@ -661,7 +793,7 @@ BEGIN
         AND message_id = p_message_id
         AND status = 'processing'
         AND consumer_token = p_consumer_token
-    RETURNING delivery_attempts INTO v_attempts;
+    RETURNING delivery_attempts, group_key INTO v_attempts, v_group_key;
 
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Nack failed: message not in processing state or token mismatch'
@@ -677,7 +809,11 @@ BEGIN
         DELETE FROM postgremq.queue_messages
         WHERE queue_name = p_queue_name
           AND message_id = p_message_id;
-        -- No NOTIFY here: there's nothing to consume on this queue any more.
+        -- An ungrouped retirement leaves nothing new to consume. A grouped one
+        -- retires its group's head, which unblocks the successor: wake it.
+        IF v_group_key IS NOT NULL THEN
+            PERFORM pg_notify('pmq:q:' || p_queue_name, '');
+        END IF;
     ELSE
         -- Wake up consumers of this queue so redelivery is prompt.
         -- Payload empty; channel name is the signal.
@@ -796,6 +932,8 @@ $$ LANGUAGE plpgsql;
  *      delivery_attempts >= max_delivery_attempts). The retire predicate is
  *      gated on status='processing' AND vt <= clock_timestamp() so we never yank a
  *      healthy in-flight row out from under a still-running consumer.
+ *      Retiring a grouped row unblocks its group's successor, so every queue
+ *      that had a grouped row retired gets one NOTIFY on `pmq:q:<queue>`.
  *   2. Reap exclusive queues whose keep_alive_until has expired.
  *
  *   Intended to run every 30-60 seconds (≤ ½ × the shortest
@@ -818,6 +956,7 @@ RETURNS TABLE (
 DECLARE
     v_retired BIGINT;
     v_dropped BIGINT;
+    v_grouped_queues VARCHAR[];
 BEGIN
     WITH deleted_messages AS (
         DELETE FROM postgremq.queue_messages qm
@@ -832,7 +971,7 @@ BEGIN
           -- message also lands in DLQ. Restrict to expired processing rows.
           AND qm.status = 'processing'
           AND qm.vt <= clock_timestamp()
-        RETURNING qm.queue_name, qm.message_id, qm.delivery_attempts
+        RETURNING qm.queue_name, qm.message_id, qm.delivery_attempts, qm.group_key
     ),
     inserted AS (
         -- ON CONFLICT for parity with nack_message's inline retirement.
@@ -846,7 +985,15 @@ BEGIN
         ON CONFLICT (queue_name, message_id) DO NOTHING
         RETURNING 1
     )
-    SELECT count(*) INTO v_retired FROM inserted;
+    SELECT (SELECT count(*) FROM inserted),
+           (SELECT array_agg(DISTINCT d.queue_name) FROM deleted_messages d
+             WHERE d.group_key IS NOT NULL)
+    INTO v_retired, v_grouped_queues;
+
+    -- Once per queue that had a grouped head retired (its successor is now
+    -- claimable). Ungrouped retirements leave nothing new to consume.
+    PERFORM pg_notify('pmq:q:' || gq, '')
+    FROM unnest(v_grouped_queues) AS gq;
 
     -- Skip queues that have DLQ entries. dead_letter_queue.queue_name
     -- has ON DELETE RESTRICT so deleting them would error and abort
@@ -1061,6 +1208,11 @@ $$ LANGUAGE plpgsql;
  *   Moves messages from the dead letter queue back to their original queues.
  *   The delivery_attempts counter is reset to 0 for these messages.
  *
+ *   A grouped message re-enters with its original group_key/group_seq, so it
+ *   becomes the head of its group again (blocking later pending rows of the
+ *   group). Rows of the group that already ran while it sat in the DLQ are not
+ *   re-ordered: ordering across a DLQ detour is not promised.
+ *
  *   Emits one NOTIFY per requeued message on `pmq:q:<queue>` so consumers
  *   that are LISTENing wake up immediately rather than waiting for their
  *   poll-fallback (1s in TS, 10s in Go).
@@ -1086,15 +1238,19 @@ BEGIN
         WHERE dlq.queue_name = p_queue_name
         RETURNING dlq.queue_name, dlq.message_id
     )
-    INSERT INTO postgremq.queue_messages(queue_name, message_id, status, delivery_attempts, vt)
-    SELECT queue_name, message_id, 'pending', 0, clock_timestamp()
-    FROM moved_messages
+    INSERT INTO postgremq.queue_messages(queue_name, message_id, status, delivery_attempts, vt,
+                                         group_key, group_seq)
+    SELECT mm.queue_name, mm.message_id, 'pending', 0, clock_timestamp(), m.group_key, m.group_seq
+    FROM moved_messages mm
+    JOIN postgremq.messages m ON m.id = mm.message_id
     ON CONFLICT (queue_name, message_id) DO UPDATE
       SET status = 'pending',
           delivery_attempts = 0,
           consumer_token = NULL,
           vt = clock_timestamp(),
-          processed_at = NULL;
+          processed_at = NULL,
+          group_key = EXCLUDED.group_key,
+          group_seq = EXCLUDED.group_seq;
 
     -- Reads ROW_COUNT of the immediately-preceding INSERT (which counts
     -- both inserted and ON-CONFLICT-updated rows). If a future change
@@ -1138,6 +1294,9 @@ BEGIN
   DELETE FROM postgremq.dead_letter_queue;
   DELETE FROM postgremq.queue_messages;
   DELETE FROM postgremq.messages;
+  PERFORM postgremq.prune_message_groups(array_agg(g.topic_name ORDER BY g.topic_name, g.group_key),
+                                         array_agg(g.group_key ORDER BY g.topic_name, g.group_key))
+  FROM postgremq.message_groups g;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1197,7 +1356,9 @@ $$ LANGUAGE plpgsql;
 /* Function: delete_queue_message
  *
  * Description:
- *   Deletes a specific message from an active queue.
+ *   Deletes a specific message from an active queue. Deleting an unsettled
+ *   grouped row may unblock its group's successor, so that case NOTIFYs
+ *   `pmq:q:<queue>`.
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): The name of the queue.
@@ -1207,10 +1368,17 @@ $$ LANGUAGE plpgsql;
  */
 CREATE OR REPLACE FUNCTION postgremq.delete_queue_message(p_queue_name VARCHAR(255), p_message_id BIGINT)
 RETURNS VOID AS $$
+DECLARE
+  v_group_key VARCHAR(255);
+  v_status    VARCHAR(16);
 BEGIN
   DELETE FROM postgremq.queue_messages
   WHERE queue_name = p_queue_name
-    AND message_id = p_message_id;
+    AND message_id = p_message_id
+  RETURNING group_key, status INTO v_group_key, v_status;
+  IF v_group_key IS NOT NULL AND v_status <> 'completed' THEN
+    PERFORM pg_notify('pmq:q:' || p_queue_name, '');
+  END IF;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1258,6 +1426,9 @@ BEGIN
       USING ERRCODE = 'PMQ03';
   END IF;
   DELETE FROM postgremq.messages WHERE topic_name = p_topic;
+  PERFORM postgremq.prune_message_groups(array_agg(g.topic_name ORDER BY g.group_key),
+                                         array_agg(g.group_key ORDER BY g.group_key))
+  FROM postgremq.message_groups g WHERE g.topic_name = p_topic;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1344,7 +1515,9 @@ RETURNS TABLE(
     published_at TIMESTAMPTZ,
     delivery_attempts INT,
     vt TIMESTAMPTZ,
-    processed_at TIMESTAMPTZ
+    processed_at TIMESTAMPTZ,
+    group_key VARCHAR(255),
+    group_seq BIGINT
 ) AS $$
 BEGIN
     RETURN QUERY
@@ -1354,7 +1527,9 @@ BEGIN
         qm.published_at,
         qm.delivery_attempts,
         qm.vt,
-        qm.processed_at
+        qm.processed_at,
+        qm.group_key,
+        qm.group_seq
     FROM postgremq.queue_messages qm
     WHERE qm.queue_name = p_queue_name
     ORDER BY qm.published_at;
@@ -1377,7 +1552,9 @@ RETURNS TABLE(
     message_id BIGINT,
     topic_name VARCHAR(255),
     payload JSONB,
-    published_at TIMESTAMPTZ
+    published_at TIMESTAMPTZ,
+    group_key VARCHAR(255),
+    group_seq BIGINT
 ) AS $$
 BEGIN
     RETURN QUERY
@@ -1385,7 +1562,9 @@ BEGIN
         m.id,
         m.topic_name,
         m.payload,
-        m.published_at
+        m.published_at,
+        m.group_key,
+        m.group_seq
     FROM postgremq.messages m
     WHERE m.id = p_message_id;
 END;
@@ -1398,6 +1577,12 @@ $$ LANGUAGE plpgsql;
  *   in the specified queue. Only considers messages in 'pending' or 'processing' state
  *   that haven't exceeded their max delivery attempts.
  *   Optimized to use an index-only scan with LIMIT 1 instead of MIN() aggregation.
+ *
+ *   Applies consume_message's group-head predicate: a blocked successor's vt
+ *   is usually already in the past, and clients schedule their next fetch at
+ *   the returned time, so counting it would make them refetch in a tight loop
+ *   while the head is leased. The head's own vt (lease end or nack delay) is
+ *   the time the group can move.
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue.
@@ -1416,6 +1601,13 @@ BEGIN
     WHERE qm.queue_name = p_queue_name
       AND (qm.status = 'pending' OR qm.status = 'processing')
       AND (q.max_delivery_attempts = 0 OR qm.delivery_attempts < q.max_delivery_attempts)
+      AND (qm.group_key IS NULL OR NOT EXISTS (
+          SELECT 1 FROM postgremq.queue_messages h
+          WHERE h.queue_name = qm.queue_name
+            AND h.group_key = qm.group_key
+            AND h.group_key IS NOT NULL
+            AND h.group_seq < qm.group_seq
+            AND h.status IN ('pending', 'processing')))
     ORDER BY qm.vt ASC
     LIMIT 1;
 
@@ -1449,11 +1641,81 @@ CREATE INDEX idx_queue_messages_message_id ON postgremq.queue_messages(message_i
 CREATE INDEX idx_dlq_message_id ON postgremq.dead_letter_queue(message_id);
 CREATE INDEX idx_messages_retention ON postgremq.messages(published_at, id);
 
+/* Function: prune_message_groups
+ *
+ * Description:
+ *   Deletes the given message_groups rows whose group has no message left.
+ *   The next publish to a pruned group restarts at group_seq 1, which is safe
+ *   only if no message of the group exists anywhere — including one a
+ *   publisher is about to commit. Two statements make that hold:
+ *     1. Lock the candidate rows, SKIPPING rows a publisher holds (it is
+ *        about to add a message, so the group is not empty).
+ *     2. A separate DELETE re-checks emptiness. Under READ COMMITTED it runs
+ *        with a fresh snapshot taken after step 1's locks, so it sees every
+ *        message whose publisher held the lock before us; while we hold the
+ *        locks no publisher can add one. (A single DELETE … WHERE NOT EXISTS
+ *        is NOT enough: when it waits on a publisher's row lock, the
+ *        EvalPlanQual recheck evaluates the NOT EXISTS against the statement's
+ *        original snapshot, which cannot see the just-committed message.)
+ *   Under REPEATABLE READ / SERIALIZABLE step 1 raises a serialization
+ *   failure instead of locking a concurrently updated row, so the caller
+ *   retries rather than corrupting a sequence.
+ *
+ * Parameters:
+ *   - p_topics, p_keys (VARCHAR[]): Candidate (topic_name, group_key) pairs,
+ *     element-wise.
+ *
+ * Returns:
+ *   INT - number of group rows deleted.
+ */
+CREATE OR REPLACE FUNCTION postgremq.prune_message_groups(p_topics VARCHAR[], p_keys VARCHAR[])
+RETURNS INT AS $$
+DECLARE
+    v_topics  VARCHAR[];
+    v_keys    VARCHAR[];
+    v_deleted INT;
+BEGIN
+    IF cardinality(p_topics) IS DISTINCT FROM cardinality(p_keys) THEN
+        RAISE EXCEPTION 'invalid group batch' USING ERRCODE = 'PMQ03';
+    END IF;
+    IF coalesce(cardinality(p_topics), 0) = 0 THEN
+        RETURN 0;
+    END IF;
+
+    SELECT array_agg(l.topic_name), array_agg(l.group_key) INTO v_topics, v_keys
+    FROM (
+        SELECT g.topic_name, g.group_key
+        FROM postgremq.message_groups g
+        JOIN unnest(p_topics, p_keys) AS c(topic_name, group_key)
+          ON g.topic_name = c.topic_name AND g.group_key = c.group_key
+        ORDER BY g.topic_name, g.group_key
+        FOR UPDATE OF g SKIP LOCKED
+    ) l;
+    IF v_topics IS NULL THEN
+        RETURN 0;
+    END IF;
+
+    DELETE FROM postgremq.message_groups g
+    USING unnest(v_topics, v_keys) AS c(topic_name, group_key)
+    WHERE g.topic_name = c.topic_name AND g.group_key = c.group_key
+      AND NOT EXISTS (
+          SELECT 1 FROM postgremq.messages m
+          WHERE m.topic_name = g.topic_name AND m.group_key = g.group_key);
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RETURN v_deleted;
+END;
+$$ LANGUAGE plpgsql;
+
 -- Run regularly, including when there are no completed deliveries (unrouted
 -- publications and queue/DLQ deletion also leave unreferenced payloads).
+-- Also prunes the message_groups rows of groups whose last message this call
+-- deleted (bounded by the batch size; see prune_message_groups).
 CREATE OR REPLACE FUNCTION postgremq.cleanup_unreferenced_messages(p_older_than_hours INT DEFAULT 24, p_batch_size INT DEFAULT 1000)
 RETURNS INT AS $$
-DECLARE deleted INT;
+DECLARE
+    deleted  INT;
+    v_topics VARCHAR[];
+    v_keys   VARCHAR[];
 BEGIN
     IF p_older_than_hours < 0 OR p_batch_size <= 0 THEN
         RAISE EXCEPTION 'invalid retention or batch size' USING ERRCODE = 'PMQ03';
@@ -1464,8 +1726,17 @@ BEGIN
           AND NOT EXISTS (SELECT 1 FROM postgremq.queue_messages qm WHERE qm.message_id = m.id)
           AND NOT EXISTS (SELECT 1 FROM postgremq.dead_letter_queue d WHERE d.message_id = m.id)
         ORDER BY m.published_at, m.id LIMIT p_batch_size FOR UPDATE SKIP LOCKED
-    ) DELETE FROM postgremq.messages m USING candidates c WHERE m.id = c.id;
-    GET DIAGNOSTICS deleted = ROW_COUNT;
+    ), removed AS (
+        DELETE FROM postgremq.messages m USING candidates c WHERE m.id = c.id
+        RETURNING m.topic_name, m.group_key
+    ), touched AS (
+        SELECT DISTINCT r.topic_name, r.group_key FROM removed r WHERE r.group_key IS NOT NULL
+    )
+    SELECT (SELECT count(*) FROM removed),
+           (SELECT array_agg(g.topic_name ORDER BY g.topic_name, g.group_key) FROM touched g),
+           (SELECT array_agg(g.group_key ORDER BY g.topic_name, g.group_key) FROM touched g)
+    INTO deleted, v_topics, v_keys;
+    PERFORM postgremq.prune_message_groups(v_topics, v_keys);
     RETURN deleted;
 END;
 $$ LANGUAGE plpgsql;

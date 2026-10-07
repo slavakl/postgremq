@@ -29,7 +29,7 @@ The migration CLI/Go API stores its version table at `postgremq.postgremq_migrat
 
 ## Delivery contract
 
-`postgremq.publish_message(topic, jsonb, deliver_after DEFAULT clock_timestamp())` returns a BIGINT ID and distributes the message transactionally to all live queues currently subscribed to that topic. Queues do not receive publications from before their creation. A publication with no live subscribers creates a payload with no delivery references.
+`postgremq.publish_message(topic, jsonb, deliver_after DEFAULT clock_timestamp(), group_key DEFAULT NULL)` returns a BIGINT ID and distributes the message transactionally to all live queues currently subscribed to that topic. Queues do not receive publications from before their creation. A publication with no live subscribers creates a payload with no delivery references.
 
 `postgremq.create_queue(name, topic, max_attempts DEFAULT 0, exclusive DEFAULT false, keep_alive_interval DEFAULT '5 minutes')` returns the queue's UUID generation. Redeclaration requires matching configuration. An expired exclusive queue cannot be revived: explicitly delete it and create a new generation. Exclusive means lease-expiring, not ownership restricted to one connection. Only keepalive renews queue lifetime; consuming messages does not.
 
@@ -41,6 +41,81 @@ The migration CLI/Go API stores its version table at `postgremq.postgremq_migrat
 - `postgremq.set_vt(queue, message_id, token, seconds)` extends a live lease and returns its deadline. Contention raises retryable SQLSTATE `55P03`; the function never waits on the delivery row.
 
 A token fences a superseded delivery. Ack can succeed after the visibility deadline if another consumer has not claimed the message yet. Extension requires a live lease. External side effects remain at least once: applications must handle redelivery and use application idempotency keys where necessary. An ambiguous publish response is not proof of failure; clients retry publication automatically only for SQLSTATE `40001` and `40P01`, which establish transaction abortion.
+
+## Message groups
+
+- A message MAY carry a `group_key` (text, ≤255). `NULL` means ungrouped,
+  and ungrouped behaviour is byte-for-byte today's.
+- **Within one queue, deliveries of one group are claimed in group order.**
+  A row is claimable only if no row of the same `(queue, group_key)` with a
+  lower `group_seq` is `pending` or `processing`. Completed, dead-lettered
+  and deleted rows are settled.
+- **Group order is publish commit order.** `publish_message` serialises
+  publishers of the same `(topic, group_key)` and allocates a dense
+  `group_seq` under a row lock held to commit, so a lower sequence can never
+  become visible after a higher one. Consequence to document: publishers of
+  one group are serialised at the database; a group is a session, an order,
+  an account — never a hot shared key.
+- **Head-of-line blocking is by design** (the SQS FIFO model): a head that is
+  leased, or nacked with a delay, blocks its group until it is settled or
+  visible again. A poison head is retired to the DLQ on its final attempt,
+  which unblocks the group. Redelivery after lease expiry is the same head.
+- A batch claim (`p_limit > 1`) returns at most one row per group.
+- Fan-out: `group_seq` is a property of the topic message, copied to every
+  queue row; each queue orders its own copy independently.
+- Not promised: ordering across queues; ordering across a DLQ detour (a
+  requeued row re-enters as the head of its group although later rows may
+  have run); exactly-once external effects; per-group priority.
+
+Operational notes:
+
+- The empty string is not a group key (`PMQ03`); omit the key to publish ungrouped.
+- A head delayed by `deliver_after` blocks its group like a nack delay does.
+- A publish holds its group's `postgremq.message_groups` row lock until the
+  caller's transaction ends. A transaction publishing to several groups can
+  deadlock (`40P01`) with another taking the same groups in a different order;
+  take groups in a consistent order, and retry the whole transaction on
+  `40P01`. The clients retry `40P01` only for their own non-transactional publish.
+  Under `REPEATABLE READ`/`SERIALIZABLE`, a grouped publish fails with `40001`
+  if another publisher of the same group committed after the transaction's
+  snapshot was taken; retry the whole transaction.
+- `ack_message`, a final-attempt `nack_message`, `pmq_maintenance_fast` and
+  `delete_queue_message` NOTIFY `pmq:q:<queue>` when they settle or remove a
+  grouped row, because its successor has just become claimable.
+- `get_next_visible_time` skips blocked successors, so a consumer waiting on a
+  leased head polls at the head's lease end rather than spinning.
+- Claim cost: the consume scan walks the queue's visible rows in `vt` order and
+  checks each grouped row against `idx_queue_messages_group_head` until it has
+  the batch, so every visible row queued behind a leased or delayed head is
+  stepped over on every claim (and again by `get_next_visible_time` after an
+  empty claim) — roughly 5 µs per blocked row, e.g. ~50 ms per claim with 10k
+  rows waiting behind in-flight heads. Free heads are found without scanning
+  the backlog. A group should therefore not accumulate a deep backlog behind a
+  long-running or repeatedly failing head: use `max_delivery_attempts > 0` and
+  nack delays so a poison head reaches the DLQ. With `max_delivery_attempts = 0`
+  a head that always fails blocks its group indefinitely. A consumer that crashes
+  on a final attempt blocks the group until the lease expires and
+  `pmq_maintenance_fast` retires the row.
+  Potential future optimization: *park* successors — distribute a grouped row
+  whose group already has an unsettled row with a far-future `vt`, and restore
+  its `deliver_after` when the head settles (ack, final-attempt nack,
+  maintenance retirement, `delete_queue_message`). The claim's `vt` range would
+  then never reach blocked rows, making claim cost independent of the blocked
+  backlog; ungrouped traffic would be unaffected. The open design point is the
+  race between a publish's "park?" check and a concurrent settle's release
+  (both may run in caller-owned transactions): it needs either a
+  `message_groups` row lock taken by grouped settles (coupling acks to that
+  group's in-flight publishers) or a maintenance sweep that releases stranded
+  parked rows (bounded stalls, liveness depends on maintenance).
+- `queue_metrics()` counts a blocked successor as `ready` (it is visible and
+  within its attempt limit), so `ready`/`oldest_ready_age_seconds` include work
+  waiting behind a group head.
+- `postgremq.message_groups` keeps one row per group that still has messages.
+  `cleanup_unreferenced_messages` prunes the group rows of groups whose last
+  payload it deleted (and `clean_up_topic`/`purge_all_messages` prune theirs);
+  a pruned group's next publish starts again at `group_seq` 1. A group row
+  whose in-flight publisher rolls back while cleanup is pruning it is left
+  behind (harmless; it is reused by the next publish to that group).
 
 ## Heartbeats
 
@@ -73,7 +148,7 @@ Lagging queues and retained DLQ entries intentionally retain their payloads. Mon
 
 ## Notifications and pooling
 
-Publications emit `NOTIFY` on `pmq:t:<topic>`. Nack, release and DLQ requeue emit on `pmq:q:<queue>`. Payloads are empty; notifications are hints to fetch, with polling as fallback. Topic/queue names are limited to 57 ASCII bytes because PostgreSQL channel names are limited to 63 bytes including the prefix.
+Publications emit `NOTIFY` on `pmq:t:<topic>`. Nack, release and DLQ requeue emit on `pmq:q:<queue>`, as do settlements and removals of grouped rows (see Message groups). Payloads are empty; notifications are hints to fetch, with polling as fallback. Topic/queue names are limited to 57 ASCII bytes because PostgreSQL channel names are limited to 63 bytes including the prefix.
 
 Each client Connection shares a dedicated LISTEN session across its consumers. LISTEN requires session affinity; transaction pooling cannot carry that session. Allow additional pool connections for publish, consume, settlement and heartbeats.
 
@@ -84,7 +159,7 @@ cd mq
 python3 -m pytest tests/tests.py -q
 ```
 
-Docker is required. Tests cover fan-out, ownership, delayed delivery, DLQ, queue expiry/recreation, row-lock contention, fresh lease clocks and bounded payload collection.
+Docker is required. Tests cover fan-out, ownership, delayed delivery, DLQ, queue expiry/recreation, row-lock contention, fresh lease clocks, bounded payload collection, and message-group ordering (including concurrent publishers/consumers and a consume plan guard).
 
 
 ## Observability
