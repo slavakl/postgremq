@@ -139,11 +139,15 @@ async fn dropping_a_consumer_releases_its_buffered_rows() {
         .unwrap();
     drop(consumer);
 
+    // Settled once every buffered row is back, unclaimed: a prefetch still in
+    // flight at the drop may re-claim rows between releases (its rows are
+    // released too), so "nothing processing" alone can be momentary.
     within(5, async {
-        while rows(&db, &queue)
+        while !rows(&db, &queue)
             .await
             .iter()
-            .any(|(s, _)| s == "processing")
+            .skip(1)
+            .all(|row| row == &("pending".to_owned(), 0))
         {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

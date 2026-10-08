@@ -1,8 +1,9 @@
-"""End-to-end: real pinned Collector + PostgreSQL + both SDK examples.
+"""End-to-end: real pinned Collector + PostgreSQL + the three client examples.
 
 Run from the repository root:
   .venv/bin/pytest observability/test_collector.py -v
-Requires mq/tests/requirements.txt, Docker, Go and npm ci in postgremq-ts.
+Requires mq/tests/requirements.txt, Docker, Go, npm ci in postgremq-ts, and a
+Rust toolchain (the Rust example is built on first run if not built already).
 All containers, networks and databases are isolated and removed on exit.
 """
 import os
@@ -108,16 +109,17 @@ def test_collector_sql_and_client_examples():
             finally:
                 limited.close()
             env = {**os.environ, 'DATABASE_URL': dsn, 'OTEL_EXPORTER_OTLP_ENDPOINT': endpoint}
-            for directory, command in [
-                ('postgremq-go', ['go', 'run', './examples/metrics']),
-                ('postgremq-ts', ['npm', 'exec', '--', 'ts-node', 'examples/metrics.ts']),
+            for directory, command, timeout in [
+                ('postgremq-go', ['go', 'run', './examples/metrics'], 120),
+                ('postgremq-ts', ['npm', 'exec', '--', 'ts-node', 'examples/metrics.ts'], 120),
+                ('postgremq-rs', ['cargo', 'run', '--locked', '--example', 'metrics', '--features', 'otel'], 900),
             ]:
                 result = subprocess.run(command, cwd=ROOT / directory, env=env, text=True,
-                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
                 assert result.returncode == 0, result.stdout
             def check_clients():
                 text = fetch()
-                for service in ('postgremq-go-example', 'postgremq-ts-example'):
+                for service in ('postgremq-go-example', 'postgremq-ts-example', 'postgremq-rs-example'):
                     for metric in ('messaging_client_operation_duration_seconds_count', 'messaging_process_duration_seconds_count',
                                    'messaging_client_sent_messages_total', 'messaging_client_consumed_messages_total', 'postgremq_client_handlers_active'):
                         assert any(l.startswith(metric + '{') and f'service_name="{service}"' in l for l in text.splitlines()), (metric, service, text)

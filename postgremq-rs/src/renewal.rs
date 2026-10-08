@@ -26,6 +26,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::checkout::Checkout;
+use crate::metrics::{Metrics, Operation, sqlx_error_type};
 use crate::options::RetryConfig;
 use crate::retry::{is_retryable, with_retry};
 use crate::scheduler::{Heartbeat, Schedule};
@@ -316,7 +317,7 @@ impl Schedule for RenewalSchedule {
     type Batch = Vec<Item>;
     type Claim = Vec<(DeliveryKey, u64)>;
     type Outcome = Outcome;
-    type Lost = LeaseSink;
+    type Lost = LostLease;
 
     fn earliest(&self) -> Option<Instant> {
         self.heap.peek().map(|Reverse((at, _, _))| *at)
@@ -377,7 +378,7 @@ impl Schedule for RenewalSchedule {
         }
     }
 
-    fn apply(&mut self, outcome: Outcome, lost: &mut Vec<LeaseSink>) {
+    fn apply(&mut self, outcome: Outcome, lost: &mut Vec<LostLease>) {
         let now = Instant::now();
         let sent = outcome.sent;
         for item in outcome.items {
@@ -434,7 +435,10 @@ impl Schedule for RenewalSchedule {
                             message_id = %item.key.id,
                             "delivery lease lost"
                         );
-                        lost.push(entry.sink);
+                        lost.push(LostLease {
+                            queue: Arc::clone(&item.key.queue),
+                            sink: entry.sink,
+                        });
                     }
                 }
             }
@@ -447,8 +451,12 @@ pub(crate) async fn flush(
     pool: PgPool,
     retry: RetryConfig,
     abort: CancellationToken,
+    metrics: Metrics,
     items: Vec<Item>,
 ) -> Outcome {
+    // One sample per batch, including retries and batches with no eligible
+    // rows.
+    let timer = metrics.operation(Operation::ExtendBatch, None, false);
     let started = Instant::now();
     let deadline = items
         .iter()
@@ -493,13 +501,16 @@ pub(crate) async fn flush(
     // Dropping a renewal mid-flight is harmless: extending is idempotent, and
     // an unknown outcome is retried within the confirmed lease.
     // Checked first: nothing is sent once the shutdown deadline passed.
-    let rows = tokio::select! {
+    let (rows, mut error) = tokio::select! {
         biased;
-        () = abort.cancelled() => Err(None),
+        () = abort.cancelled() => (Err(None), Some("cancelled")),
         result = tokio::time::timeout_at(deadline, call) => match result {
-            Ok(Ok(rows)) => Ok(rows),
-            Ok(Err(err)) => Err(Some(err)),
-            Err(_elapsed) => Err(None),
+            Ok(Ok(rows)) => (Ok(rows), None),
+            Ok(Err(err)) => {
+                let category = sqlx_error_type(&err);
+                (Err(Some(err)), Some(category))
+            }
+            Err(_elapsed) => (Err(None), Some("deadline_exceeded")),
         },
     };
     let (sent, renewals) = match rows {
@@ -510,6 +521,7 @@ pub(crate) async fn flush(
                     error = &err as &dyn std::error::Error,
                     "undecodable renewal result"
                 );
+                error = Some("other");
                 Renewals::Unknown
             }),
         ),
@@ -525,6 +537,7 @@ pub(crate) async fn flush(
             (started, Renewals::Unknown)
         }
     };
+    timer.finish(error);
     Outcome {
         items,
         sent,
@@ -555,9 +568,18 @@ fn decode(rows: &[sqlx::postgres::PgRow]) -> Result<Renewals, sqlx::Error> {
     Ok(Renewals::Known(renewals))
 }
 
-/// Cancels the token of a delivery whose lease was lost.
-pub(crate) fn on_lost(sink: LeaseSink) {
-    sink.stopped.cancel();
+/// A delivery whose lease the renewal found lost (handled after the
+/// schedule's lock is released).
+#[derive(Debug)]
+pub(crate) struct LostLease {
+    pub(crate) queue: Arc<str>,
+    pub(crate) sink: LeaseSink,
+}
+
+/// Cancels a lost delivery's token, after recording the loss.
+pub(crate) fn on_lost(metrics: &Metrics, lost: LostLease) {
+    metrics.renewal_lost(&lost.queue);
+    lost.sink.stopped.cancel();
 }
 
 #[cfg(test)]

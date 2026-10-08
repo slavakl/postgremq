@@ -19,6 +19,7 @@ use crate::consumer::{Consumer, ConsumerShared, Task};
 use crate::error::{Error, Result};
 use crate::keepalive::{self, KeepAliveSchedule};
 use crate::listener::Listener;
+use crate::metrics::{Metrics, Operation, sqlx_error_type};
 use crate::options::{ConnectionOptions, ConsumeOptions, PublishOptions, QueueOptions};
 use crate::renewal::{self, DeliveryKey, Registration, RenewalSchedule, SharedLease};
 use crate::retry::{is_aborted_transaction, is_retryable, is_rolled_back, with_retry};
@@ -68,6 +69,8 @@ pub(crate) struct Inner {
     /// The runtime the connection was created on: queue-fatal hooks are
     /// dispatched there even when signalled outside a runtime context.
     pub(crate) runtime: tokio::runtime::Handle,
+    /// Client metrics (a no-op unless enabled).
+    pub(crate) metrics: Metrics,
     pub(crate) options: ConnectionOptions,
     /// Cancelled when `close` begins: new work is rejected and consumers stop.
     pub(crate) draining: CancellationToken,
@@ -342,25 +345,48 @@ impl Connection {
             ));
         };
         let io = CancellationToken::new();
+        #[cfg(feature = "otel")]
+        let metrics = Metrics::new(options.meter.as_ref());
+        #[cfg(not(feature = "otel"))]
+        let metrics = Metrics::default();
         let inner = Arc::new_cyclic(|weak: &Weak<Inner>| {
             let schedule = RenewalSchedule::new(options.renewal_batch_size);
             let retired_leases = schedule.retired_counter();
             let renewals = {
                 let (pool, retry, io) = (pool.clone(), options.retry.clone(), io.clone());
+                let (flushes, losses) = (metrics.clone(), metrics.clone());
                 spawn_scheduler(
                     "renewal",
                     schedule,
-                    move |batch| renewal::flush(pool.clone(), retry.clone(), io.clone(), batch),
-                    renewal::on_lost,
+                    move |batch| {
+                        renewal::flush(
+                            pool.clone(),
+                            retry.clone(),
+                            io.clone(),
+                            flushes.clone(),
+                            batch,
+                        )
+                    },
+                    // After the schedule's lock is released.
+                    move |lost| renewal::on_lost(&losses, lost),
                 )
             };
             let keepalive = {
                 let (pool, retry, io) = (pool.clone(), options.retry.clone(), io.clone());
+                let metrics = metrics.clone();
                 let weak = weak.clone();
                 spawn_scheduler(
                     "keepalive",
                     KeepAliveSchedule::default(),
-                    move |batch| keepalive::flush(pool.clone(), retry.clone(), io.clone(), batch),
+                    move |batch| {
+                        keepalive::flush(
+                            pool.clone(),
+                            retry.clone(),
+                            io.clone(),
+                            metrics.clone(),
+                            batch,
+                        )
+                    },
                     move |lost: keepalive::LostQueue| {
                         if let Some(inner) = weak.upgrade() {
                             inner.queue_fatal(&lost.queue, lost.generation, FatalSource::KeepAlive);
@@ -373,6 +399,7 @@ impl Connection {
                 pool,
                 owns_pool,
                 runtime,
+                metrics,
                 options,
                 draining: CancellationToken::new(),
                 io,
@@ -571,22 +598,35 @@ impl Connection {
             .and_then(|()| options.validate())
             .and_then(|()| to_json(payload));
         async move {
-            let payload = prepared?;
-            // Re-checked when first polled: the future may outlive `close`.
-            inner.check_open()?;
-            let id = inner
-                .bounded(with_retry(
-                    &inner.options.retry,
-                    &inner.io,
-                    is_aborted_transaction,
-                    || {
-                        checked_out(&inner.pool, async |conn| {
-                            publish_on(conn, topic, &payload, &options).await
-                        })
-                    },
-                ))
-                .await?;
-            Ok(MessageId::new(id))
+            let timer = inner
+                .metrics
+                .operation(Operation::Publish, Some(topic), false);
+            let published = async {
+                let payload = prepared?;
+                // Re-checked when first polled: the future may outlive `close`.
+                inner.check_open()?;
+                let id = inner
+                    .bounded(with_retry(
+                        &inner.options.retry,
+                        &inner.io,
+                        is_aborted_transaction,
+                        || {
+                            checked_out(&inner.pool, async |conn| {
+                                // Each attempt counts, failed or not, and
+                                // also if dropped mid-query.
+                                let counted = inner.metrics.send_attempt(topic, false);
+                                let attempt = publish_on(conn, topic, &payload, &options).await;
+                                counted.finish(attempt.as_ref().err().map(sqlx_error_type));
+                                attempt
+                            })
+                        },
+                    ))
+                    .await?;
+                Ok(MessageId::new(id))
+            }
+            .await;
+            timer.finish_with(&published);
+            published
         }
     }
 
@@ -612,11 +652,21 @@ impl Connection {
             .and_then(|()| options.validate())
             .and_then(|()| to_json(payload));
         async move {
-            let payload = prepared?;
-            // Re-checked when first polled: the future may outlive `close`.
-            inner.check_open()?;
-            let id = publish_on(conn, topic, &payload, &options).await?;
-            Ok(MessageId::new(id))
+            let timer = inner
+                .metrics
+                .operation(Operation::Publish, Some(topic), true);
+            let published = async {
+                let payload = prepared?;
+                // Re-checked when first polled: the future may outlive `close`.
+                inner.check_open()?;
+                let counted = inner.metrics.send_attempt(topic, true);
+                let attempt = publish_on(conn, topic, &payload, &options).await;
+                counted.finish(attempt.as_ref().err().map(sqlx_error_type));
+                Ok(MessageId::new(attempt?))
+            }
+            .await;
+            timer.finish_with(&published);
+            published
         }
     }
 
@@ -1072,7 +1122,59 @@ impl Inner {
         }
     }
 
+    /// Runs one settlement or extension as a measured logical operation
+    /// (one sample, retries included; nothing if never polled).
+    ///
+    /// `run` builds the operation's future only once the timer started, so
+    /// the future is held once (not also as an argument).
+    async fn measured<T, F>(
+        &self,
+        operation: Operation,
+        key: &DeliveryKey,
+        transaction: bool,
+        run: impl FnOnce() -> F,
+    ) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let timer = self
+            .metrics
+            .operation(operation, Some(&key.queue), transaction);
+        let result = run().await;
+        timer.finish_with(&result);
+        result
+    }
+
     pub(crate) async fn ack(&self, key: &DeliveryKey) -> Result<()> {
+        self.measured(Operation::Ack, key, false, || self.ack_sql(key))
+            .await
+    }
+
+    pub(crate) async fn ack_tx(&self, conn: &mut PgConnection, key: &DeliveryKey) -> Result<()> {
+        self.measured(Operation::Ack, key, true, move || {
+            self.ack_tx_sql(conn, key)
+        })
+        .await
+    }
+
+    pub(crate) async fn nack(&self, key: &DeliveryKey, delay: Option<Duration>) -> Result<()> {
+        self.measured(Operation::Nack, key, false, || self.nack_sql(key, delay))
+            .await
+    }
+
+    pub(crate) async fn release(&self, key: &DeliveryKey) -> Result<()> {
+        self.measured(Operation::Release, key, false, || self.release_sql(key))
+            .await
+    }
+
+    /// Extends a lease and returns the new deadline (Unix µs). Independent
+    /// of automatic renewal, as in the Go and TypeScript clients.
+    pub(crate) async fn set_vt(&self, key: &DeliveryKey, secs: i32) -> Result<i64> {
+        self.measured(Operation::Extend, key, false, || self.set_vt_sql(key, secs))
+            .await
+    }
+
+    async fn ack_sql(&self, key: &DeliveryKey) -> Result<()> {
         self.check_not_closed()?;
         self.retry(|| {
             checked_out(&self.pool, async |conn| {
@@ -1088,7 +1190,7 @@ impl Inner {
         Ok(())
     }
 
-    pub(crate) async fn ack_tx(&self, conn: &mut PgConnection, key: &DeliveryKey) -> Result<()> {
+    async fn ack_tx_sql(&self, conn: &mut PgConnection, key: &DeliveryKey) -> Result<()> {
         self.check_not_closed()?;
         sqlx::query("SELECT postgremq.ack_message($1, $2, $3)")
             .bind(&*key.queue)
@@ -1099,7 +1201,7 @@ impl Inner {
         Ok(())
     }
 
-    pub(crate) async fn nack(&self, key: &DeliveryKey, delay: Option<Duration>) -> Result<()> {
+    async fn nack_sql(&self, key: &DeliveryKey, delay: Option<Duration>) -> Result<()> {
         self.check_not_closed()?;
         match delay.filter(|delay| !delay.is_zero()) {
             // The delay is applied with the server's clock.
@@ -1138,7 +1240,7 @@ impl Inner {
         Ok(())
     }
 
-    pub(crate) async fn release(&self, key: &DeliveryKey) -> Result<()> {
+    async fn release_sql(&self, key: &DeliveryKey) -> Result<()> {
         self.check_not_closed()?;
         self.retry(|| {
             checked_out(&self.pool, async |conn| {
@@ -1154,9 +1256,7 @@ impl Inner {
         Ok(())
     }
 
-    /// Extends a lease and returns the new deadline (Unix µs). Independent
-    /// of automatic renewal, as in the Go and TypeScript clients.
-    pub(crate) async fn set_vt(&self, key: &DeliveryKey, secs: i32) -> Result<i64> {
+    async fn set_vt_sql(&self, key: &DeliveryKey, secs: i32) -> Result<i64> {
         self.check_not_closed()?;
         let vt_micros = self
             .retry(|| {

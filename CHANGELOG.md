@@ -21,7 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queue-gone teardown, graceful drain on `close`, message groups, and maintenance
   passthroughs. CI job `rust-tests` (fmt, clippy `-D warnings`, docs, tests, MSRV).
   Integration tests use `POSTGREMQ_TEST_DATABASE_URL` when set, otherwise a reusable
-  `postgres:15` testcontainer.
+  `postgres:15` testcontainer. Optional OpenTelemetry client metrics (contract v1 of
+  `docs/observability.md`) behind the `otel` cargo feature via
+  `ConnectionOptions::meter_provider`, with `examples/metrics.rs`; the Collector
+  end-to-end test now also runs the Rust example.
 - Initial open source release preparation
 - Comprehensive documentation (README, CONTRIBUTING, SECURITY)
 - CI/CD workflows for automated testing
