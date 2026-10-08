@@ -179,7 +179,7 @@ impl Delivery {
     /// deadline abandoned the call, with an unknown outcome); other database
     /// errors after the retry policy is exhausted.
     pub async fn ack(&self) -> Result<()> {
-        self.settle(self.inner.conn.ack(&self.inner.key)).await
+        self.settle(|| self.inner.conn.ack(&self.inner.key)).await
     }
 
     /// Marks the message completed inside the caller's transaction.
@@ -212,7 +212,7 @@ impl Delivery {
     /// server-reported `LeaseLost`) leaves the caller's transaction aborted;
     /// the source-less "already settled" `LeaseLost` and `Closed` run no SQL.
     pub async fn ack_tx(&self, conn: &mut PgConnection) -> Result<()> {
-        self.settle(self.inner.conn.ack_tx(conn, &self.inner.key))
+        self.settle(move || self.inner.conn.ack_tx(conn, &self.inner.key))
             .await
     }
 
@@ -241,7 +241,7 @@ impl Delivery {
         if delay.is_some_and(|delay| delay > MAX_HORIZON) {
             return Err(Error::invalid("nack delay must be at most 100 years"));
         }
-        self.settle(self.inner.conn.nack(&self.inner.key, delay))
+        self.settle(|| self.inner.conn.nack(&self.inner.key, delay))
             .await
     }
 
@@ -252,7 +252,8 @@ impl Delivery {
     ///
     /// As for [`ack`](Self::ack).
     pub async fn release(&self) -> Result<()> {
-        self.settle(self.inner.conn.release(&self.inner.key)).await
+        self.settle(|| self.inner.conn.release(&self.inner.key))
+            .await
     }
 
     /// Extends the lease to `secs` from now and returns the new deadline
@@ -297,7 +298,12 @@ impl Delivery {
         Ok(from_unix_micros(vt_micros))
     }
 
-    async fn settle(&self, operation: impl Future<Output = Result<()>>) -> Result<()> {
+    /// Claims the settlement, then runs `operation` (built only after the
+    /// claim, so its future is held once and a lost claim builds none).
+    async fn settle<F>(&self, operation: impl FnOnce() -> F) -> Result<()>
+    where
+        F: Future<Output = Result<()>>,
+    {
         if self
             .inner
             .settled
@@ -308,7 +314,7 @@ impl Delivery {
         }
         self.inner.lease.begin_settling();
         let _complete = CompleteOnDrop(&self.inner);
-        operation.await
+        operation().await
     }
 
     /// A second handle to the same delivery (crate-internal: the handler

@@ -221,6 +221,7 @@ PostgreMQ emits empty notifications on `pmq:t:<topic>` for publications and `pmq
 | Retry with backoff | ✅ | ✅ | ✅ |
 | LISTEN/NOTIFY | ✅ | ✅ | ✅ |
 | Keep-alive for exclusive queues | ✅ | ✅ | ✅ |
+| OpenTelemetry client metrics | ✅ | ✅ | ✅ (`otel` feature) |
 
 ## Documentation
 

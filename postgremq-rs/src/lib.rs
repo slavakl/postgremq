@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod admin;
 mod checkout;
@@ -9,6 +10,7 @@ mod error;
 mod handler;
 mod keepalive;
 mod listener;
+mod metrics;
 mod options;
 mod renewal;
 mod retry;
@@ -27,6 +29,11 @@ pub use options::{
 };
 pub use types::{Generation, MessageId};
 
+/// Re-exported so applications use the same version as
+/// [`ConnectionOptions::meter_provider`].
+#[cfg(feature = "otel")]
+#[cfg_attr(docsrs, doc(cfg(feature = "otel")))]
+pub use opentelemetry;
 /// Re-exported so applications use the same versions as this crate's API.
 pub use serde_json;
 /// Re-exported so applications use the same versions as this crate's API.

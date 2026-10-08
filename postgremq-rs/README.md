@@ -93,6 +93,34 @@ The crate logs through `tracing` and never installs a subscriber. Timestamps
 are `std::time::SystemTime`; lease scheduling uses deadlines measured on the
 database server, so client clock skew does not shorten leases.
 
+## Metrics
+
+With the `otel` cargo feature, the client records the shared client metrics
+of `docs/observability.md` (operation and processing durations, sent and
+consumed messages, active handlers, renewal loss) through an application-owned
+OpenTelemetry meter provider:
+
+```toml
+[dependencies]
+postgremq = { path = "postgremq-rs", features = ["otel"] }
+```
+
+```rust,ignore
+let options = ConnectionOptions::default().meter_provider(&meter_provider);
+```
+
+Nothing is recorded without `meter_provider`, even when a global provider is
+set. The crate depends only on the `opentelemetry` API; the SDK, readers,
+exporters and their flush and shutdown belong to the application (close the
+connection first). `postgremq::opentelemetry` re-exports the API version the
+option takes; the `otel` feature follows `opentelemetry`'s minor releases.
+`examples/metrics.rs` exports to the Collector of
+`observability/compose.yaml`:
+
+```sh
+cargo run --example metrics --features otel
+```
+
 ## Testing
 
 `cargo test` starts (or reuses) a `postgres:15` container named
@@ -104,6 +132,8 @@ instead, whose user can create databases:
 export POSTGREMQ_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
 cargo test
 ```
+
+`cargo test --all-features` also runs the metrics contract tests.
 
 ## Pools
 

@@ -17,6 +17,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::checkout::Checkout;
+use crate::metrics::{Metrics, Operation, sqlx_error_type};
 use crate::options::RetryConfig;
 use crate::retry::{is_retryable, with_retry};
 use crate::scheduler::{Heartbeat, Schedule};
@@ -223,8 +224,12 @@ pub(crate) async fn flush(
     pool: PgPool,
     retry: RetryConfig,
     abort: CancellationToken,
+    metrics: Metrics,
     items: Vec<Item>,
 ) -> Outcome {
+    // One sample per batch, including retries and batches with no eligible
+    // rows.
+    let timer = metrics.operation(Operation::KeepAlive, None, false);
     let started = Instant::now();
     let deadline = items
         .iter()
@@ -260,13 +265,16 @@ pub(crate) async fn flush(
         }
     });
     // Checked first: nothing is sent once the shutdown deadline passed.
-    let rows = tokio::select! {
+    let (rows, mut error) = tokio::select! {
         biased;
-        () = abort.cancelled() => Err(None),
+        () = abort.cancelled() => (Err(None), Some("cancelled")),
         result = tokio::time::timeout_at(deadline, call) => match result {
-            Ok(Ok(rows)) => Ok(rows),
-            Ok(Err(err)) => Err(Some(err)),
-            Err(_elapsed) => Err(None),
+            Ok(Ok(rows)) => (Ok(rows), None),
+            Ok(Err(err)) => {
+                let category = sqlx_error_type(&err);
+                (Err(Some(err)), Some(category))
+            }
+            Err(_elapsed) => (Err(None), Some("deadline_exceeded")),
         },
     };
     let (sent, leases) = match rows {
@@ -277,6 +285,7 @@ pub(crate) async fn flush(
                     error = &err as &dyn std::error::Error,
                     "undecodable keep-alive result"
                 );
+                error = Some("other");
                 Leases::Unknown
             }),
         ),
@@ -292,6 +301,7 @@ pub(crate) async fn flush(
             (started, Leases::Unknown)
         }
     };
+    timer.finish(error);
     Outcome {
         items,
         sent,

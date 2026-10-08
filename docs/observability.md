@@ -3,12 +3,12 @@
 PostgreMQ exposes queue state through `postgremq.queue_metrics()` and client
 activity through optional OpenTelemetry metrics. SQL is the authority for queue
 state across all languages and application replicas. Clients record observations
-that require application context. Neither client creates an SDK, exporter,
+that require application context. No client creates an SDK, exporter,
 collection timer or global provider; your application owns those resources.
 
 ## Run the complete example
 
-From the repository root, with Docker, Go, and Node.js 18.19+ installed:
+From the repository root, with Docker, Go, Node.js 18.19+ and Rust 1.94+ installed:
 
 ```sh
 docker compose -f observability/compose.yaml up -d
@@ -30,6 +30,11 @@ go run ./examples/metrics
 cd postgremq-ts
 npm ci
 npm exec -- ts-node examples/metrics.ts
+```
+
+```sh
+cd postgremq-rs
+cargo run --example metrics --features otel
 ```
 
 Each example publishes and handles a message, drains the connection, and flushes
@@ -151,9 +156,17 @@ conn, err := postgremq.Dial(ctx, poolConfig,
 const connection = await connect({ connectionString, meterProvider });
 ```
 
-Metrics are disabled when the provider is omitted. To use a global provider, pass
+```rust
+// Cargo.toml: postgremq = { ..., features = ["otel"] }
+let conn = Connection::connect(url,
+    ConnectionOptions::default().meter_provider(&meter_provider)).await?;
+```
+
+Metrics are disabled when the provider is omitted. In Rust, instrumentation is
+compiled only with the `otel` cargo feature (an `opentelemetry` API dependency,
+no SDK); without it every recorder is a no-op. To use a global provider, pass
 it explicitly. Close/drain the queue connection before flushing and shutting down
-the provider. Neither client shuts down or flushes a supplied provider. They obtain
+the provider. No client shuts down or flushes a supplied provider. They obtain
 a library-scoped meter from it and create instruments; this is different from
 constructing an SDK meter provider. The API-only runtime dependencies are separate
 from SDK dependencies used by tests/examples. This follows [OTel library guidance](https://opentelemetry.io/docs/specs/otel/library-guidelines/#requirements).
@@ -169,12 +182,17 @@ postgremq.WithMeterProvider(otel.GetMeterProvider())
 const connection = await connect({ connectionString, meterProvider: metrics.getMeterProvider() });
 ```
 
+```rust
+ConnectionOptions::default().meter_provider(&opentelemetry::global::meter_provider())
+```
+
 Omitting the option stays a no-op even if another library has configured a global
 provider. Complete SDK and OTLP exporter setup is in the
-[Go example](../postgremq-go/examples/metrics/main.go) and
-[TypeScript example](../postgremq-ts/examples/metrics.ts).
+[Go example](../postgremq-go/examples/metrics/main.go),
+[TypeScript example](../postgremq-ts/examples/metrics.ts) and
+[Rust example](../postgremq-rs/examples/metrics.rs).
 
-Both clients use instrumentation scope `postgremq`, version `1`. The
+All clients use instrumentation scope `postgremq`, version `1`. The
 `messaging.*` names follow the OTel messaging conventions (1.44.0, still in
 Development); the shared PostgreMQ contract is versioned separately and is not
 silently changed when dependencies update.
@@ -220,7 +238,10 @@ counters; use SQL gauges for database state.
 using bounded categories:
 `lease_lost`, `queue_not_found`, `validation`, `connection_closed`, `cancelled`,
 `deadline_exceeded` (where the client exposes it), or `other`. Raw error text,
-SQL, message IDs, tokens, and payloads are never metric attributes.
+SQL, message IDs, tokens, and payloads are never metric attributes. In Rust,
+`cancelled` means the operation's future was dropped before it completed (or a
+batch was abandoned at the shutdown deadline), and `deadline_exceeded` marks a
+renewal or keep-alive batch cut off by its own time bound.
 
 Sent counts follow the attempted-send definition in the [OTel conventions](https://opentelemetry.io/docs/specs/semconv/messaging/messaging-metrics/#producer-metrics).
 A send attempt begins when the client invokes its driver's publish query API.
@@ -269,12 +290,14 @@ From the repository root:
 
 The Collector test starts isolated Docker containers with the pinned image, runs
 the exact shipped configuration using a restricted database login, verifies SQL
-metric values and changes after a scrape, runs both client examples, and verifies
-their exported OTLP metrics. It uses dynamic host ports and removes all containers
-and networks on exit. Dependencies: `mq/tests/requirements.txt`, Go, and `npm ci`
-in `postgremq-ts`. The dedicated observability CI job runs this test.
+metric values and changes after a scrape, runs the three client examples, and
+verifies their exported OTLP metrics. It uses dynamic host ports and removes all
+containers and networks on exit. Dependencies: `mq/tests/requirements.txt`, Go,
+`npm ci` in `postgremq-ts`, and a Rust toolchain. The dedicated observability CI
+job runs this test.
 
-The normal Go and TypeScript suites include in-memory SDK tests. Both read
+The normal Go, TypeScript and Rust (`cargo test --features otel`) suites include
+in-memory SDK tests. All read
 [`client-contract.json`](../observability/client-contract.json) to check names,
 units, scope, buckets, operation types and an identical sequence of transactional publish/ack,
 rollback, redelivery, empty receive and failed settlement. Additional tests verify

@@ -32,6 +32,7 @@ use crate::connection::{FatalSource, Inner};
 use crate::delivery::{Delivery, DeliveryInner};
 use crate::error::{Error, ErrorKind, Result};
 use crate::listener::Subscription;
+use crate::metrics::Operation;
 use crate::options::ConsumeSettings;
 use crate::renewal::{Confirmation, DeliveryKey, LeaseSink, Registration, SharedLease};
 use crate::sync::lock;
@@ -594,11 +595,30 @@ async fn fetch(
     // Only a hung connection reaches this net (the server bounds the claim
     // first); a claim abandoned here may have committed, so its rows expire.
     let net = claim_timeout(settings) + CLAIM_SAFETY_MARGIN;
+    // One `consume` operation per claim, empty claims included.
+    let timer = conn
+        .metrics
+        .operation(Operation::Consume, Some(&queue), false);
     let claimed = tokio::time::timeout(net, claim(&conn, &queue, generation, settings)).await;
     let Ok(claimed) = claimed else {
+        timer.finish(Some("deadline_exceeded"));
         tracing::warn!(queue = %queue, "claim did not return; its outcome is unknown");
         return FetchOutcome::Failed;
     };
+    // A server-side cancellation (SQLSTATE 57014, from the claim's own
+    // `statement_timeout` or an operator) cannot be told apart: like any
+    // database error it counts as `other`, as in Go. Only the client's own
+    // net above is known to be a deadline.
+    timer.finish_with(&claimed);
+    if let Ok(deliveries) = &claimed {
+        let redelivered = deliveries.iter().filter(|row| row.attempts > 1).count();
+        let first = deliveries.len() - redelivered;
+        conn.metrics.consumed(
+            &queue,
+            u64::try_from(first).unwrap_or(u64::MAX),
+            u64::try_from(redelivered).unwrap_or(u64::MAX),
+        );
+    }
     let rows = match claimed {
         Ok(rows) => rows,
         Err(err) if err.kind() == ErrorKind::QueueNotFound => {

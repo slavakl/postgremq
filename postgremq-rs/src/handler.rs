@@ -250,9 +250,27 @@ where
 {
     let tracker = delivery.share();
     let message_id = delivery.message_id();
+    let metrics = delivery.inner.conn.metrics.clone();
+    let queue = Arc::clone(&delivery.inner.key.queue);
+    let stopped = delivery.stopped();
     // The handler is called *inside* a nested task, so a panic — while
     // building its future or while running it — becomes a JoinError here.
-    let task = tokio::spawn(async move { handler(delivery).await }.in_current_span());
+    let task = tokio::spawn(
+        async move {
+            // Processing is the callback alone, measured inside its task from
+            // invocation to return (a panic is recorded as the timer
+            // unwinds); automatic settlement is its own operation.
+            let processing = metrics.handler(&queue);
+            let result = handler(delivery).await;
+            processing.finish(match &result {
+                Err(_) => Some("handler_error"),
+                Ok(()) if stopped.is_cancelled() => Some("cancelled"),
+                Ok(()) => None,
+            });
+            result
+        }
+        .in_current_span(),
+    );
     let failed = match task.await {
         Ok(Ok(())) => false,
         Ok(Err(err)) => {

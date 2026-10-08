@@ -20,6 +20,17 @@ tokio = { version = "1.47", features = ["rt", "sync", "time", "macros"] }
 tokio-util = "0.7"
 tracing = "0.1"
 uuid = "1"
+# Optional client metrics (docs/observability.md): the API only; the
+# application owns the SDK, readers and exporters.
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"], optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+## Client metrics through an application-supplied OpenTelemetry meter provider.
+otel = ["dep:opentelemetry"]
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +38,16 @@ uuid = { version = "1", features = ["v4"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 testcontainers = { version = "0.27", features = ["reusable-containers"] }
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "testing"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "metrics"] }
+
+[[example]]
+name = "metrics"
+required-features = ["otel"]
+
+[[test]]
+name = "metrics"
+required-features = ["otel"]
 
 [lints.rust]
 unsafe_code = "forbid"

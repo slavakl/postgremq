@@ -156,6 +156,10 @@ pub struct ConnectionOptions {
     /// Called once when a queue becomes fatal. This is the only signal for an
     /// exclusive queue without consumers. Without a hook the event is logged.
     pub on_queue_fatal: Option<QueueFatalHook>,
+    /// The meter client metrics are recorded with; see
+    /// [`meter_provider`](Self::meter_provider).
+    #[cfg(feature = "otel")]
+    pub(crate) meter: Option<opentelemetry::metrics::Meter>,
 }
 
 impl Default for ConnectionOptions {
@@ -166,13 +170,16 @@ impl Default for ConnectionOptions {
             renewal_batch_size: DEFAULT_RENEWAL_BATCH,
             notifications: true,
             on_queue_fatal: None,
+            #[cfg(feature = "otel")]
+            meter: None,
         }
     }
 }
 
 impl fmt::Debug for ConnectionOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConnectionOptions")
+        let mut debug = f.debug_struct("ConnectionOptions");
+        let debug = debug
             .field("shutdown_timeout", &self.shutdown_timeout)
             .field("retry", &self.retry)
             .field("renewal_batch_size", &self.renewal_batch_size)
@@ -180,8 +187,10 @@ impl fmt::Debug for ConnectionOptions {
             .field(
                 "on_queue_fatal",
                 &self.on_queue_fatal.as_ref().map(|_| ".."),
-            )
-            .finish()
+            );
+        #[cfg(feature = "otel")]
+        let debug = debug.field("metrics", &self.meter.is_some());
+        debug.finish()
     }
 }
 
@@ -211,6 +220,48 @@ impl ConnectionOptions {
     #[must_use]
     pub fn notifications(mut self, enabled: bool) -> Self {
         self.notifications = enabled;
+        self
+    }
+
+    /// Enables client metrics (requires the `otel` feature), recorded through
+    /// `provider` under the instrumentation scope `postgremq`, version `1`:
+    /// the shared contract in `docs/observability.md`.
+    ///
+    /// Without this, no metrics are recorded, even if a global provider is
+    /// set; pass `opentelemetry::global::meter_provider()` to use that one.
+    /// The application owns the provider: close the connection, then flush
+    /// and shut the provider down.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(provider: opentelemetry_sdk::metrics::SdkMeterProvider)
+    /// #     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// use postgremq::{Connection, ConnectionOptions};
+    ///
+    /// let conn = Connection::connect(
+    ///     "postgres://localhost/app",
+    ///     ConnectionOptions::default().meter_provider(&provider),
+    /// )
+    /// .await?;
+    /// // ... publish and consume ...
+    /// conn.close().await;
+    /// // The SDK's flush blocks: run it off the async workers.
+    /// tokio::task::spawn_blocking(move || provider.force_flush()).await??;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "otel")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "otel")))]
+    #[must_use]
+    pub fn meter_provider<P>(mut self, provider: &P) -> Self
+    where
+        P: opentelemetry::metrics::MeterProvider + ?Sized,
+    {
+        let scope = opentelemetry::InstrumentationScope::builder(crate::metrics::SCOPE)
+            .with_version(crate::metrics::CONTRACT_VERSION)
+            .build();
+        self.meter = Some(provider.meter_with_scope(scope));
         self
     }
 
