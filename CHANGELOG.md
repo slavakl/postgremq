@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one row per group per batch). Successors are woken by NOTIFY when a grouped head
   is acked, retired to the DLQ or deleted. Go `WithGroupKey` / `Message.GroupKey`,
   `GroupSeq`; TypeScript `{ groupKey }` / `message.groupKey`, `groupSeq`.
+- Rust client (`postgremq-rs/`, crate `postgremq`) on sqlx 0.9 and Tokio: publish and
+  transactional `publish_tx`, `Stream` consumers and handler consumers, `ack`/`ack_tx`/
+  `nack`/`release`/`extend` with first-settlement-wins, connection-level batched lease
+  renewal and exclusive-queue keep-alive, a dedicated LISTEN session with poll fallback,
+  queue-gone teardown, graceful drain on `close`, message groups, and maintenance
+  passthroughs. CI job `rust-tests` (fmt, clippy `-D warnings`, docs, tests, MSRV).
+  Integration tests use `POSTGREMQ_TEST_DATABASE_URL` when set, otherwise a reusable
+  `postgres:15` testcontainer.
 - Initial open source release preparation
 - Comprehensive documentation (README, CONTRIBUTING, SECURITY)
 - CI/CD workflows for automated testing

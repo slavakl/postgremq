@@ -116,3 +116,5 @@ postgremq-ts/coverage/
 .scratch/
 
 tmp/
+# Rust client build output
+postgremq-rs/target/

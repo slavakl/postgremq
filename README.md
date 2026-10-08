@@ -13,6 +13,7 @@ PostgreMQ is a message queue system that leverages PostgreSQL's reliability and 
 - **mq** - Core PostgreSQL implementation (SQL schema and functions)
 - **postgremq-go** - Go client library
 - **postgremq-ts** - TypeScript/Node.js client library
+- **postgremq-rs** - Rust client library (crate `postgremq`, sqlx + Tokio)
 
 ## Key Features
 
@@ -68,6 +69,13 @@ npm install postgremq
 
 ```typescript
 import { connect } from 'postgremq';
+```
+
+#### Rust Client
+
+```toml
+[dependencies]
+postgremq = { path = "postgremq-rs" }
 ```
 
 ## Usage Examples
@@ -201,22 +209,24 @@ PostgreMQ emits empty notifications on `pmq:t:<topic>` for publications and `pmq
 
 ## Client Libraries
 
-| Feature | Go Client | TypeScript Client |
-|---------|-----------|-------------------|
-| Connection pooling | ✅ | ✅ |
-| Auto visibility timeout extension | ✅ | ✅ |
-| Transaction support | ✅ | ✅ |
-| Async iteration | ✅ | ✅ |
-| Delayed delivery | ✅ | ✅ |
-| Dead letter queue | ✅ | ✅ |
-| Retry with backoff | ✅ | ✅ |
-| LISTEN/NOTIFY | ✅ | ✅ |
-| Keep-alive for exclusive queues | ✅ | ✅ |
+| Feature | Go Client | TypeScript Client | Rust Client |
+|---------|-----------|-------------------|-------------|
+| Connection pooling | ✅ | ✅ | ✅ |
+| Auto visibility timeout extension | ✅ | ✅ | ✅ |
+| Transaction support | ✅ | ✅ | ✅ |
+| Async iteration | ✅ | ✅ | ✅ (`Stream`) |
+| Delayed delivery | ✅ | ✅ | ✅ |
+| Message groups (ordered delivery) | ✅ | ✅ | ✅ |
+| Dead letter queue | ✅ | ✅ | ✅ |
+| Retry with backoff | ✅ | ✅ | ✅ |
+| LISTEN/NOTIFY | ✅ | ✅ | ✅ |
+| Keep-alive for exclusive queues | ✅ | ✅ | ✅ |
 
 ## Documentation
 
 - [Go Client Documentation](./postgremq-go/README.md)
 - [TypeScript Client Documentation](./postgremq-ts/README.md)
+- [Rust Client Documentation](./postgremq-rs/README.md)
 - [SQL Implementation](./mq/README.md)
 - [Contributing Guidelines](./CONTRIBUTING.md)
 - [Security Policy](./SECURITY.md)
@@ -237,6 +247,16 @@ go test -v ./...
 ```bash
 cd postgremq-ts
 npm test
+```
+
+### Rust Tests
+
+```bash
+cd postgremq-rs
+# Uses a reusable postgres:15 testcontainer (Docker) by default, or a
+# PostgreSQL 15+ server whose user can create databases:
+# export POSTGREMQ_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
+cargo test
 ```
 
 ### SQL Tests
