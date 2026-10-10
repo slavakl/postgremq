@@ -53,10 +53,14 @@ Install the schema into your database. It creates everything in the
 `postgremq` schema:
 
 ```bash
-psql "$DATABASE_URL" -f mq/sql/latest.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f mq/sql/latest.sql   # fresh installs only
 # or, with versioned migrations:
 postgremq migrate --dsn "$DATABASE_URL"
 ```
+
+Each client can also apply the migrations itself at start-up (`Migrate` in Go,
+`migrate` in TypeScript and Rust). Either way, later releases upgrade the
+schema with the migrations: `latest.sql` records the version it installs.
 
 Then schedule the maintenance functions (see
 [Maintenance and retention](./mq/README.md#maintenance-and-retention)).
@@ -164,7 +168,7 @@ where they differ.
 | Graceful shutdown with deadline | ✅ | ✅ | ✅ |
 | Retry of transient errors | ✅ | ✅ | ✅ |
 | OpenTelemetry metrics | ✅ | ✅ | ✅ (`otel` feature) |
-| Schema migrations | ✅ | — | — |
+| Schema migrations | ✅ | ✅ | ✅ |
 
 ## When to use it
 

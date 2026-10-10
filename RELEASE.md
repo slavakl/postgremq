@@ -31,20 +31,35 @@ heading in `CHANGELOG.md`.
 `mq/sql/latest.sql` is the complete current schema, used for fresh installs.
 `mq/migrations/` holds the same schema as numbered
 [golang-migrate](https://github.com/golang-migrate/migrate) migrations, used to
-upgrade existing installs (the Go client's `Migrate` and the CLI's `migrate`
-command apply them).
+upgrade existing installs. Every client applies them (Go `Migrate`, TypeScript
+`migrate`, Rust `migrate`), as does the CLI's `migrate` command. Each embeds the
+files at build time:
 
-- Until the first release, `000001_initial_schema.up.sql` is edited in place
-  and must stay byte-identical to `latest.sql`.
+- Go: the `mq` module, with `go:embed`.
+- TypeScript: `scripts/embed-migrations.js` generates
+  `src/migrations.generated.ts` (not committed) on `npm ci` / `npm install`
+  (`prepare`), before `tsc` (`npm run build`) and before Jest.
+- Rust: `postgremq-rs/migrations` is a symlink to `mq/migrations`, which
+  `cargo package` follows. A new migration also needs an entry in `MIGRATIONS`
+  in `postgremq-rs/src/migrate.rs`; a unit test fails until it has one.
+
+- `latest.sql` is a fresh-install script: a guard at the top refuses to run
+  when `postgremq.postgremq_migrations` exists, and the end creates that table
+  and records the latest migration's version. Until the first release,
+  `000001_initial_schema.up.sql` is edited in place and equals `latest.sql`
+  without the guard and the version stamp. The SQL test suite checks that a
+  fresh `latest.sql` install and a database migrated through every migration
+  have identical schema dumps and version rows.
 - After a release, published migrations are never edited. Each schema change
   adds a new `0000NN_<name>.up.sql` and the same change is applied to
   `latest.sql`, so that a fresh `latest.sql` install equals the result of
-  running every migration. The SQL test suite should verify this.
-- Down migrations are not supported: each `.down.sql` is a comment-only
-  placeholder. `Migrate` / `postgremq migrate --target` do not check the
-  direction, so a target below the current version would run those
-  placeholders and record the lower version without changing the schema.
-  Removing an installation is `DROP SCHEMA postgremq CASCADE`.
+  running every migration, and the version `latest.sql` records at its end is
+  raised to the new migration's number (both checked by the SQL test suite).
+- Migrations only go up, always to the latest migration the client embeds;
+  there is no target version. A database already at a newer version (migrated
+  by a newer release) is left unchanged. Each `.down.sql` is a comment-only
+  placeholder that no client runs. Removing an installation is
+  `DROP SCHEMA postgremq CASCADE`.
 - A schema change that existing clients cannot work with is a breaking
   change for every component.
 

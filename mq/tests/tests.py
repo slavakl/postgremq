@@ -3239,3 +3239,73 @@ def test_group_delete_queue_message_wakes_successor(cur):
     assert len(_queue_notifies(cur.connection, 'gq')) == 1
     [m] = _consume(cur, 'gq')
     assert m['id'] == a2
+
+
+MIGRATIONS_DIR = Path(__file__).parent.parent / 'migrations'
+
+
+def test_latest_sql_records_the_latest_migration_version(cur):
+    """A latest.sql install is recognised by the migrators as current."""
+    latest = max(int(p.name.split('_', 1)[0]) for p in MIGRATIONS_DIR.glob('*.up.sql'))
+    cur.execute('SELECT version, dirty FROM postgremq.postgremq_migrations')
+    assert [tuple(row) for row in cur.fetchall()] == [(latest, False)]
+
+
+def test_latest_sql_refuses_an_existing_installation(cur):
+    """latest.sql is for fresh installs only; upgrades go through the migrations."""
+    cur.execute("SELECT postgremq.create_topic('kept')")
+    with pytest.raises(psycopg2.errors.RaiseException) as err:
+        cur.execute(SQL_FILE.read_text())
+    assert 'only for fresh installs' in str(err.value)
+    assert 'migrat' in err.value.diag.message_hint
+    cur.execute("SELECT name FROM postgremq.topics")
+    assert [row[0] for row in cur.fetchall()] == ['kept']
+
+
+def _fresh_database(admin_conn, name: str) -> None:
+    with admin_conn.cursor() as cur:
+        cur.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
+        cur.execute(f"CREATE DATABASE {name}")
+
+
+def _schema_dump(postgres_container, db_config, dbname: str) -> str:
+    code, out = postgres_container.get_wrapped_container().exec_run(
+        ['pg_dump', '-U', db_config['user'], '--schema-only', '--schema', 'postgremq', dbname])
+    assert code == 0, out.decode()
+    return out.decode()
+
+
+def test_latest_sql_install_equals_the_migrations(postgres_container, db_config, admin_conn):
+    """A fresh latest.sql install equals running every migration as a migrator does."""
+    by_script, by_migrations = f"mq_latest_{uuid.uuid4().hex[:8]}", f"mq_migrated_{uuid.uuid4().hex[:8]}"
+    for name in (by_script, by_migrations):
+        _fresh_database(admin_conn, name)
+    try:
+        with psycopg2.connect(**{**db_config, 'dbname': by_script}) as c, c.cursor() as cur:
+            cur.execute(SQL_FILE.read_text())
+        # The migrators' protocol (golang-migrate): version table first, then
+        # each migration between a dirty and a clean version row.
+        migrations = sorted(MIGRATIONS_DIR.glob('*.up.sql'))
+        with psycopg2.connect(**{**db_config, 'dbname': by_migrations}) as c:
+            c.autocommit = True
+            with c.cursor() as cur:
+                cur.execute('CREATE SCHEMA postgremq; CREATE TABLE postgremq.postgremq_migrations '
+                            '(version bigint not null primary key, dirty boolean not null)')
+                for path in migrations:
+                    version = int(path.name.split('_', 1)[0])
+                    cur.execute('TRUNCATE postgremq.postgremq_migrations; '
+                                'INSERT INTO postgremq.postgremq_migrations VALUES (%s, true)', (version,))
+                    cur.execute(path.read_text())
+                    cur.execute('UPDATE postgremq.postgremq_migrations SET dirty = false')
+        assert _schema_dump(postgres_container, db_config, by_script) == \
+            _schema_dump(postgres_container, db_config, by_migrations)
+        rows = []
+        for name in (by_script, by_migrations):
+            with psycopg2.connect(**{**db_config, 'dbname': name}) as c, c.cursor() as cur:
+                cur.execute('SELECT version, dirty FROM postgremq.postgremq_migrations')
+                rows.append(cur.fetchall())
+        assert rows[0] == rows[1]
+    finally:
+        with admin_conn.cursor() as cur:
+            for name in (by_script, by_migrations):
+                cur.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")

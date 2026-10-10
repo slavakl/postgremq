@@ -15,7 +15,8 @@ module.exports = {
     'src/**/*.ts',
     '!src/**/*.d.ts',
     '!src/__tests__/**',
-    '!src/index.ts'
+    '!src/index.ts',
+    '!src/migrations.generated.ts'
   ],
   coverageDirectory: 'coverage',
   coverageReporters: ['text', 'lcov', 'html'],
@@ -32,6 +33,8 @@ module.exports = {
   // which defeats maxWorkers. Re-enable it temporarily (or run
   // `jest --detectOpenHandles`) only when debugging a leaked handle.
   forceExit: false,
+  // Generates src/migrations.generated.ts (see scripts/embed-migrations.js).
+  globalSetup: '<rootDir>/scripts/embed-migrations.js',
   setupFilesAfterEnv: ['<rootDir>/src/__tests__/setup.ts'],
   // Each test runs in its own freshly-created database (createIsolatedTestConnection),
   // and each worker process reuses a single shared container (getSharedTestDatabase),

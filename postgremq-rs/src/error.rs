@@ -126,6 +126,18 @@ pub enum Error {
     #[error("payload serialization failed")]
     Payload(#[source] serde_json::Error),
 
+    /// [`migrate`](crate::migrate) found the schema version marked dirty: a
+    /// migration failed partway, so the schema needs manual repair before
+    /// the dirty flag in `postgremq.postgremq_migrations` is cleared.
+    #[error(
+        "database schema is dirty at version {version}; a migration failed partway and needs manual repair"
+    )]
+    #[non_exhaustive]
+    DirtySchema {
+        /// The version whose migration did not finish.
+        version: u64,
+    },
+
     /// Any other database or driver error.
     #[error(transparent)]
     Sqlx(sqlx::Error),
@@ -150,6 +162,7 @@ pub enum Error {
 ///         postgremq::ErrorKind::Busy => "busy",
 ///         postgremq::ErrorKind::QueueGone => "gone",
 ///         postgremq::ErrorKind::Payload => "payload",
+///         postgremq::ErrorKind::DirtySchema => "dirty schema",
 ///         postgremq::ErrorKind::Sqlx => "database",
 ///         postgremq::ErrorKind::Closed => "closed",
 ///     }
@@ -170,6 +183,8 @@ pub enum ErrorKind {
     QueueGone,
     /// See [`Error::Payload`].
     Payload,
+    /// See [`Error::DirtySchema`].
+    DirtySchema,
     /// See [`Error::Sqlx`].
     Sqlx,
     /// See [`Error::Closed`].
@@ -226,6 +241,7 @@ impl Error {
             Self::Busy { .. } => ErrorKind::Busy,
             Self::QueueGone { .. } => ErrorKind::QueueGone,
             Self::Payload(_) => ErrorKind::Payload,
+            Self::DirtySchema { .. } => ErrorKind::DirtySchema,
             Self::Sqlx(_) => ErrorKind::Sqlx,
             Self::Closed => ErrorKind::Closed,
         }
@@ -239,7 +255,9 @@ impl Error {
             Self::LeaseLost { source }
             | Self::QueueNotFound { source, .. }
             | Self::Validation { source, .. } => source.as_ref().and_then(sqlstate_of),
-            Self::QueueGone { .. } | Self::Payload(_) | Self::Closed => None,
+            Self::QueueGone { .. } | Self::Payload(_) | Self::DirtySchema { .. } | Self::Closed => {
+                None
+            }
         }
     }
 

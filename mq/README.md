@@ -18,9 +18,15 @@ layer.
 
 The installation creates the `postgremq` schema and everything inside it. Install
 into a database that does not already contain a PostgreMQ installation.
-Application data may already exist in other schemas. `sql/latest.sql` and
-`migrations/000001_initial_schema.up.sql` are identical. Both are fresh-install
-scripts: loading either one over an existing installation is not an upgrade.
+Application data may already exist in other schemas.
+
+`sql/latest.sql` is for fresh installs only. It refuses to run, before changing
+anything, when the migrations' version table `postgremq.postgremq_migrations`
+already exists: upgrade an existing installation with the migrations instead.
+It ends by creating that table and recording the migration version it is
+equivalent to, so the migrators upgrade a database installed from it like one
+they installed. Run it with `ON_ERROR_STOP` (as below), so psql stops at the
+first error instead of running the rest of the file.
 
 **psql**
 
@@ -29,9 +35,15 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f mq/sql/latest.sql
 ```
 
 **Migrations.** `mq/migrations/` uses the golang-migrate file layout. The
-[PostgreMQ CLI](../cmd/postgremq/README.md) (`postgremq migrate --dsn …`) and the
-Go client's `postgremq_go.Migrate(pool, MigrateOptions{})` apply the files and keep
-the version table at `postgremq.postgremq_migrations`. `GetMigrationStatus` and
+[PostgreMQ CLI](../cmd/postgremq/README.md) (`postgremq migrate --dsn …`) and
+every client apply the files: Go `postgremq_go.Migrate(pool)`, TypeScript
+`migrate(pool)` and Rust `postgremq::migrate(&pool)`. They share one protocol,
+golang-migrate's: the version table `postgremq.postgremq_migrations` (one row,
+`version` and `dirty`), the same advisory lock, and a `dirty` flag set while a
+migration runs. Any of them can therefore upgrade a database another one
+installed. Migrations only go up, to the latest version the client embeds; a
+database already at a newer version is left unchanged, and a dirty one is an
+error. `GetMigrationStatus` / `getMigrationStatus` / `migration_status` and
 `postgremq status` only read, and work before installation too. To use the
 golang-migrate CLI directly, create the schema first and point it at the same
 version table:

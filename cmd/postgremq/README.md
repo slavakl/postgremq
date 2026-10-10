@@ -62,29 +62,24 @@ postgremq migrate --dsn "$DATABASE_URL"
 
 ### `migrate`
 
-Applies pending migrations. It creates the `postgremq` schema if it does not exist yet.
+Applies pending migrations, up to the latest version embedded in the CLI. It creates the `postgremq` schema if it does not exist yet. Migrations only go up; there is no target version.
 
 ```bash
-postgremq migrate --dsn <connection-string> [--target <version>]
+postgremq migrate --dsn <connection-string>
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--dsn` | string | none (required) | Database connection string |
-| `--target` | int | `0` | Version to migrate to. A value below 1 means the latest version |
 
 `migrate` first prints the current and latest versions. It then:
 
 - exits with an error if the database is in a dirty state (see [Dirty state](#dirty-state));
-- prints `✓ Database is up to date` and exits if no migration is pending and `--target` is `0`;
-- otherwise prints `Running migrations...`, creates the `postgremq` schema if needed, and runs the migrator: up to the latest version when `--target` is below 1, or to exactly `--target`. When there is nothing to apply (for example `--target` equal to the current version, or a negative `--target` on an up-to-date database) it still prints `✓ Migration completed successfully`. A target above the latest embedded version fails with `no migration found for version <n>`. A target below the current version runs the down migrations in between; the embedded down migration contains no SQL statements (only a note that `DROP SCHEMA postgremq CASCADE` removes an installation), so that lowers the recorded version without changing the schema.
+- prints `✓ Database is up to date` and exits if no migration is pending. This includes a database already at a newer version than the CLI's latest (migrated by a newer release), which is left unchanged;
+- otherwise prints `Running migrations...`, creates the `postgremq` schema if needed, and applies the pending migrations up to the latest version.
 
 ```bash
-# Apply all pending migrations
 postgremq migrate --dsn "postgres://postgres:postgres@localhost:5432/mydb"
-
-# Migrate to a specific version
-postgremq migrate --dsn "postgres://postgres:postgres@localhost:5432/mydb" --target 1
 ```
 
 Output on a fresh database:
@@ -161,7 +156,7 @@ Migrations are applied with [golang-migrate](https://github.com/golang-migrate/m
 
 ## Required privileges
 
-Whenever `migrate` runs the migrator (any pending migration, or a non-zero `--target`), it first runs `CREATE SCHEMA IF NOT EXISTS postgremq`. PostgreSQL checks the database's `CREATE` privilege before it checks whether the schema exists, so the role needs that privilege even if the schema has already been created:
+When the `postgremq` schema does not exist yet, `migrate` creates it, which needs the `CREATE` privilege on the database:
 
 ```sql
 GRANT CREATE ON DATABASE mydb TO myuser;
@@ -173,7 +168,7 @@ Without it, `migrate` fails with:
 Error: migration failed: failed to create queue schema: ERROR: permission denied for database mydb (SQLSTATE 42501)
 ```
 
-`status`, and `migrate` on an up-to-date database without `--target`, only need to connect, use the `postgremq` schema, and read `postgremq.postgremq_migrations` (if the schema does not exist yet, connecting is enough). Without `USAGE` on an existing `postgremq` schema both commands fail with `failed to get migration status: ERROR: permission denied for schema postgremq (SQLSTATE 42501)`.
+Applying migrations to an existing schema needs the privileges the migrations' DDL needs (normally: own the `postgremq` schema). `status`, and `migrate` on an up-to-date database, only need to connect, use the `postgremq` schema, and read `postgremq.postgremq_migrations` (if the schema does not exist yet, connecting is enough). Without `USAGE` on an existing `postgremq` schema both commands fail with `failed to get migration status: ERROR: permission denied for schema postgremq (SQLSTATE 42501)`.
 
 ## Errors and exit codes
 
@@ -205,7 +200,7 @@ Common messages:
 | `failed to get migration status: failed to connect to ...` | The server cannot be reached, or authentication failed |
 | `failed to get migration status: ERROR: permission denied for schema postgremq ...` | The role cannot use the `postgremq` schema |
 | `database is in dirty state - manual intervention required` | See [Dirty state](#dirty-state) |
-| `migration failed: migration failed: ...` | A migration failed, or `--target` names a version that does not exist (`... no migration found for version <n>: read down for version <n> migrations: file does not exist`) |
+| `migration failed: migration failed: ...` | A migration failed |
 | `migration failed: failed to create queue schema: ...` | The role lacks `CREATE` on the database |
 
 ### Dirty state
@@ -288,7 +283,7 @@ func main() {
 		log.Fatal(err)
 	}
 	if status.NeedsMigration {
-		if err := postgremq.Migrate(pool, postgremq.MigrateOptions{}); err != nil {
+		if err := postgremq.Migrate(pool); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -302,7 +297,7 @@ func main() {
 }
 ```
 
-`MigrateOptions.TargetVersion` corresponds to `--target`. See [`postgremq-go/examples/migration/`](../../postgremq-go/examples/migration/) for a complete example.
+See [`postgremq-go/examples/migration/`](../../postgremq-go/examples/migration/) for a complete example.
 
 ## See also
 

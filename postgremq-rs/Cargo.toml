@@ -11,7 +11,8 @@ readme = "README.md"
 keywords = ["postgres", "queue", "messaging", "sqlx"]
 categories = ["database", "asynchronous"]
 # The integration tests load ../mq/sql/latest.sql, which is outside the crate.
-exclude = ["tests/"]
+# `migrations` is a symlink to ../mq/migrations; cargo packages its files.
+exclude = ["tests/", "migrations/*.down.sql"]
 
 [dependencies]
 futures-core = "0.3"

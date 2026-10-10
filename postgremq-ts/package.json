@@ -5,7 +5,8 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc",
+    "prepare": "node scripts/embed-migrations.js",
+    "build": "node scripts/embed-migrations.js && tsc",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run build",
     "example": "ts-node examples/basic-usage.ts",

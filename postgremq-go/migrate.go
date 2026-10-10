@@ -1,12 +1,16 @@
 package postgremq_go
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
 	migratepgx "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -16,12 +20,6 @@ import (
 
 const MigrationsTable = "postgremq_migrations"
 
-// MigrateOptions configures migration behavior
-type MigrateOptions struct {
-	// TargetVersion to migrate to. 0 means latest
-	TargetVersion int
-}
-
 // MigrationStatus represents the current state of migrations
 type MigrationStatus struct {
 	CurrentVersion uint
@@ -30,13 +28,16 @@ type MigrationStatus struct {
 	NeedsMigration bool
 }
 
-// Migrate runs database migrations using the provided pool.
+// Migrate applies the embedded migrations the database has not applied yet,
+// up to the latest embedded version. It only migrates up: a database already
+// at a newer version (migrated by a newer client) is left unchanged and Migrate
+// returns nil. A dirty database (a migration failed partway) is an error.
 // This is a standalone function for schema management, separate from
 // the Connection type which is used for message queue operations.
 //
 // No ctx parameter: golang-migrate's API doesn't accept one, so a ctx
 // would be ignored anyway.
-func Migrate(pool *pgxpool.Pool, opts MigrateOptions) error {
+func Migrate(pool *pgxpool.Pool) error {
 	source, err := iofs.New(mq.MigrationsFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("failed to create migration source: %w", err)
@@ -47,7 +48,7 @@ func Migrate(pool *pgxpool.Pool, opts MigrateOptions) error {
 	defer db.Close()
 
 	// The driver creates its version table before executing migration SQL.
-	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS postgremq"); err != nil {
+	if err := ensureSchema(db); err != nil {
 		return fmt.Errorf("failed to create queue schema: %w", err)
 	}
 
@@ -66,19 +67,62 @@ func Migrate(pool *pgxpool.Pool, opts MigrateOptions) error {
 	}
 	defer m.Close()
 
-	// Apply migration (only up migrations are supported)
-	var migErr error
-	if opts.TargetVersion > 0 {
-		migErr = m.Migrate(uint(opts.TargetVersion))
-	} else {
-		migErr = m.Up()
+	migErr := m.Up()
+	if migErr == nil || errors.Is(migErr, migrate.ErrNoChange) {
+		return nil
 	}
-
-	if migErr != nil && migErr != migrate.ErrNoChange {
-		return fmt.Errorf("migration failed: %w", migErr)
+	// golang-migrate fails when the recorded version is not one of the
+	// embedded migrations. A clean version above ours means a newer client
+	// already migrated the database: nothing to do.
+	if errors.Is(migErr, os.ErrNotExist) {
+		if version, dirty, err := m.Version(); err == nil && !dirty && version > getLatestMigrationVersion() {
+			return nil
+		}
 	}
+	return fmt.Errorf("migration failed: %w", migErr)
+}
 
-	return nil
+// ensureSchema creates the postgremq schema if it is missing, under the
+// migration lock (the advisory lock golang-migrate takes for the version
+// table, shared with the other clients). CREATE SCHEMA IF NOT EXISTS is not
+// safe against a concurrent creator, and it needs the CREATE privilege on the
+// database even when the schema exists, so it only runs when the schema is
+// missing.
+func ensureSchema(db *sql.DB) (err error) {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	// db is private to Migrate and closed when it returns, which ends the
+	// session (and the lock) even if the unlock below fails.
+	defer conn.Close()
+
+	var dbName string
+	if err := conn.QueryRowContext(ctx, "SELECT current_database()").Scan(&dbName); err != nil {
+		return err
+	}
+	lockID, err := database.GenerateAdvisoryLockId(dbName, "postgremq", MigrationsTable)
+	if err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", lockID); err != nil {
+		return err
+	}
+	defer func() {
+		if _, unlockErr := conn.ExecContext(ctx, "SELECT pg_advisory_unlock($1)", lockID); unlockErr != nil && err == nil {
+			err = unlockErr
+		}
+	}()
+
+	var missing bool
+	if err := conn.QueryRowContext(ctx, "SELECT to_regnamespace('postgremq') IS NULL").Scan(&missing); err != nil {
+		return err
+	}
+	if missing {
+		_, err = conn.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS postgremq")
+	}
+	return err
 }
 
 // GetMigrationStatus returns current migration status using the provided pool.

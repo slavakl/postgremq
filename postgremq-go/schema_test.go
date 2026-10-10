@@ -39,7 +39,7 @@ func TestSchemaIsolationWithApplicationTransactions(t *testing.T) {
 	var exists bool
 	require.NoError(t, pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname='postgremq')").Scan(&exists))
 	require.False(t, exists, "status must not create the queue schema")
-	require.NoError(t, postgremq.Migrate(pool, postgremq.MigrateOptions{}))
+	require.NoError(t, postgremq.Migrate(pool))
 	status, err = postgremq.GetMigrationStatus(pool)
 	require.NoError(t, err)
 	require.Equal(t, uint(1), status.CurrentVersion)

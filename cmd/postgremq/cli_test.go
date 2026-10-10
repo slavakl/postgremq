@@ -218,20 +218,6 @@ func TestCLI_MigrateIdempotent(t *testing.T) {
 	assert.Contains(t, stdout, "Database is up to date")
 }
 
-func TestCLI_MigrateTargetVersion(t *testing.T) {
-	dsn := createTestDatabase(t)
-
-	stdout, stderr, err := runCLI("migrate", "--dsn", dsn, "--target", "1")
-	require.NoError(t, err, "migrate stderr: %s", stderr)
-
-	assert.Contains(t, stdout, "Migration completed successfully")
-
-	// Verify with status
-	stdout, stderr, err = runCLI("status", "--dsn", dsn)
-	require.NoError(t, err, "status stderr: %s", stderr)
-	assert.Contains(t, stdout, "Current version: 1")
-}
-
 func TestCLI_MissingDSN(t *testing.T) {
 	_, stderr, err := runCLI("migrate")
 	require.Error(t, err)
@@ -264,7 +250,7 @@ func TestCLI_MigrateHelp(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Contains(t, stdout, "--dsn")
-	assert.Contains(t, stdout, "--target")
+	assert.NotContains(t, stdout, "--target")
 }
 
 func TestCLI_StatusHelp(t *testing.T) {

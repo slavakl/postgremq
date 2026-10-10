@@ -9,21 +9,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var (
-	dsn       string
-	targetVer int
-)
+var dsn string
 
 var migrateCmd = &cobra.Command{
 	Use:   "migrate",
 	Short: "Run database migrations",
-	Long:  "Apply pending database migrations to the latest or specified version",
+	Long:  "Apply pending database migrations up to the latest version",
 	RunE:  runMigrate,
 }
 
 func init() {
 	migrateCmd.Flags().StringVar(&dsn, "dsn", "", "Database connection string (required)")
-	migrateCmd.Flags().IntVar(&targetVer, "target", 0, "Target version (0 = latest)")
 	migrateCmd.MarkFlagRequired("dsn")
 	rootCmd.AddCommand(migrateCmd)
 }
@@ -50,16 +46,14 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("database is in dirty state - manual intervention required")
 	}
 
-	if !status.NeedsMigration && targetVer == 0 {
+	if !status.NeedsMigration {
 		fmt.Println("✓ Database is up to date")
 		return nil
 	}
 
 	// Run migration
 	fmt.Println("Running migrations...")
-	if err := postgremq.Migrate(pool, postgremq.MigrateOptions{
-		TargetVersion: targetVer,
-	}); err != nil {
+	if err := postgremq.Migrate(pool); err != nil {
 		return fmt.Errorf("migration failed: %w", err)
 	}
 

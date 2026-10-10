@@ -1,3 +1,14 @@
+-- Fresh installs only. An existing installation (it has the migrations'
+-- version table) is upgraded with the migrations, never by reloading this file.
+DO $$
+BEGIN
+    IF to_regclass('postgremq.postgremq_migrations') IS NOT NULL THEN
+        RAISE EXCEPTION 'PostgreMQ is already installed in this database; latest.sql is only for fresh installs'
+            USING HINT = 'Upgrade an existing installation with the migrations: postgremq migrate, or Migrate / migrate in a client.';
+    END IF;
+END
+$$;
+
 -- PostgreMQ uses a fixed schema, independent of the caller's search_path.
 CREATE SCHEMA IF NOT EXISTS postgremq;
 
@@ -1801,3 +1812,15 @@ LANGUAGE sql STABLE AS $$
     LEFT JOIN live l ON l.queue_name = q.name
     LEFT JOIN dead d ON d.queue_name = q.name;
 $$;
+
+/*
+ * Schema version
+ * --------------
+ * Records the migration version this script is equivalent to, in the version
+ * table the migrators use (golang-migrate's layout: every client's migrate and
+ * the CLI), so they upgrade a database installed from this script like one
+ * they installed. Must name the latest migration in mq/migrations.
+ */
+CREATE TABLE postgremq.postgremq_migrations (version bigint not null primary key, dirty boolean not null);
+
+INSERT INTO postgremq.postgremq_migrations (version, dirty) VALUES (1, false);

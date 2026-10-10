@@ -15,7 +15,8 @@ First public release, to be published as 0.2.0.
 
 - Schema and functions in a dedicated `postgremq` schema, installed from
   `mq/sql/latest.sql` or as golang-migrate migrations (embedded in the Go `mq`
-  module). PostgreSQL 15+, no extensions.
+  module). Both record the schema version, so either install can be upgraded
+  by later migrations. PostgreSQL 15+, no extensions.
 - Topics with fan-out to any number of queues through a distribution trigger.
 - Visibility-timeout leases with a per-delivery ownership token; ack, nack
   (optionally delayed), release, and lease extension, single or batched across
@@ -44,7 +45,8 @@ First public release, to be published as 0.2.0.
 - Queue-loss teardown (`Consumer.NotifyClose`, `WithQueueFatalHandler`,
   `ErrQueueGone`), graceful shutdown with a configurable deadline, retry with
   exponential backoff for transient errors.
-- Schema migrations (`Migrate`, `GetMigrationStatus`).
+- Schema migrations (`Migrate`, `GetMigrationStatus`), up only, to the latest
+  embedded version.
 - Optional OpenTelemetry metrics.
 
 ### TypeScript client (`postgremq`)
@@ -53,6 +55,8 @@ First public release, to be published as 0.2.0.
   transaction), async-iterator and handler-based consumers.
 - Connection-level batched lease renewal and exclusive-queue keep-alive.
 - Shared LISTEN session with reconnect and polling fallback.
+- Schema migrations (`migrate`, `getMigrationStatus`), compatible with the Go
+  client and the CLI.
 - Queue-loss teardown (`onClose`, `onQueueFatal` / `'queueFatal'`,
   `QueueFatalError`), graceful shutdown, retry for transient errors.
 - Optional OpenTelemetry metrics.
@@ -65,6 +69,8 @@ First public release, to be published as 0.2.0.
 - Dedicated LISTEN session with reconnect and polling fallback.
 - Queue-loss teardown (`Error::QueueGone`, `on_queue_fatal`), graceful
   shutdown, retry for transient errors, maintenance passthroughs.
+- Schema migrations (`migrate`, `migration_status`), compatible with the Go
+  client and the CLI.
 - Optional OpenTelemetry metrics behind the `otel` feature.
 
 ### CLI (`cmd/postgremq`)

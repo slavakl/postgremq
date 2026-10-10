@@ -23,7 +23,20 @@ TypeScript/Node.js client for [PostgreMQ](https://github.com/slavakl/postgremq),
 npm install postgremq
 ```
 
-The client does not create the schema. Install it once per database, either with the [PostgreMQ CLI](https://github.com/slavakl/postgremq/blob/main/cmd/postgremq/README.md) (`postgremq migrate --dsn "$DATABASE_URL"`) or directly from [`mq/sql/latest.sql`](https://github.com/slavakl/postgremq/blob/main/mq/sql/latest.sql):
+Connecting does not create the schema. Install or upgrade it once per database with `migrate`, which applies the migrations embedded in the package:
+
+```typescript
+import { Pool } from 'pg';
+import { migrate, getMigrationStatus } from 'postgremq';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+await migrate(pool); // no-op when the schema is current
+console.log(await getMigrationStatus(pool)); // { currentVersion, dirty, latestVersion, needsMigration }
+```
+
+`migrate` only goes up, to the latest version in this package. It uses the same version table and advisory lock as the Go client and the [PostgreMQ CLI](https://github.com/slavakl/postgremq/blob/main/cmd/postgremq/README.md), so concurrent callers are safe and any of them can upgrade a database another one installed. A database already at a newer version (migrated by a newer release) is left unchanged. A dirty database (a migration failed partway) throws `DirtySchemaError`. `migrate` creates the `postgremq` schema when it is missing, which needs the `CREATE` privilege on the database.
+
+You can also install the schema with the CLI (`postgremq migrate --dsn "$DATABASE_URL"`) or directly from [`mq/sql/latest.sql`](https://github.com/slavakl/postgremq/blob/main/mq/sql/latest.sql). `latest.sql` is for fresh databases only (it refuses to run on an existing installation) and records the version it installs, so `migrate` can upgrade it later.
 
 ```bash
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f mq/sql/latest.sql

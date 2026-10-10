@@ -1,6 +1,10 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+// Lets unit tests share the integration-test harness, which names the crate.
+#[cfg(test)]
+extern crate self as postgremq;
+
 mod admin;
 mod checkout;
 mod connection;
@@ -11,6 +15,7 @@ mod handler;
 mod keepalive;
 mod listener;
 mod metrics;
+mod migrate;
 mod options;
 mod renewal;
 mod retry;
@@ -24,6 +29,7 @@ pub use consumer::Consumer;
 pub use delivery::Delivery;
 pub use error::{Error, ErrorKind, Result};
 pub use handler::{HandlerConsumer, HandlerError};
+pub use migrate::{MigrationStatus, migrate, migration_status};
 pub use options::{
     ConnectionOptions, ConsumeOptions, PublishOptions, QueueFatalHook, QueueOptions, RetryConfig,
 };

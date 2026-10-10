@@ -3,6 +3,7 @@ package postgremq_go_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -75,7 +76,7 @@ func TestMigration_MigrateEmptyDatabase(t *testing.T) {
 	pool, _ := setupEmptyTestDatabase(t)
 
 	// Run migration
-	err := postgremq.Migrate(pool, postgremq.MigrateOptions{})
+	err := postgremq.Migrate(pool)
 	require.NoError(t, err)
 
 	// Verify migration succeeded
@@ -91,11 +92,11 @@ func TestMigration_Idempotency(t *testing.T) {
 	pool, _ := setupEmptyTestDatabase(t)
 
 	// Run migration first time
-	err := postgremq.Migrate(pool, postgremq.MigrateOptions{})
+	err := postgremq.Migrate(pool)
 	require.NoError(t, err)
 
 	// Run migration second time - should be idempotent
-	err = postgremq.Migrate(pool, postgremq.MigrateOptions{})
+	err = postgremq.Migrate(pool)
 	require.NoError(t, err, "Running migrate twice should not fail")
 
 	// Verify still at correct version
@@ -110,7 +111,7 @@ func TestMigration_SchemaIsUsable(t *testing.T) {
 	pool, ctx := setupEmptyTestDatabase(t)
 
 	// Run migration first
-	err := postgremq.Migrate(pool, postgremq.MigrateOptions{})
+	err := postgremq.Migrate(pool)
 	require.NoError(t, err)
 
 	// Now create a connection to test message queue operations
@@ -155,7 +156,7 @@ func TestMigration_MigrationsTableName(t *testing.T) {
 	pool, ctx := setupEmptyTestDatabase(t)
 
 	// Run migration
-	err := postgremq.Migrate(pool, postgremq.MigrateOptions{})
+	err := postgremq.Migrate(pool)
 	require.NoError(t, err)
 
 	// Verify the migrations table uses our custom name
@@ -179,16 +180,72 @@ func TestMigration_MigrationsTableName(t *testing.T) {
 	assert.Equal(t, 0, count, "Default schema_migrations table should not exist")
 }
 
-func TestMigration_TargetVersion(t *testing.T) {
-	pool, _ := setupEmptyTestDatabase(t)
+func TestMigration_NewerDatabaseIsLeftUnchanged(t *testing.T) {
+	pool, ctx := setupEmptyTestDatabase(t)
+	require.NoError(t, postgremq.Migrate(pool))
 
-	// Migrate to specific version (currently only version 1 exists)
-	err := postgremq.Migrate(pool, postgremq.MigrateOptions{
-		TargetVersion: 1,
-	})
+	// A newer client migrated this database past the embedded migrations.
+	_, err := pool.Exec(ctx, "UPDATE postgremq.postgremq_migrations SET version = 999")
 	require.NoError(t, err)
+
+	require.NoError(t, postgremq.Migrate(pool), "a newer database is not an error")
 
 	status, err := postgremq.GetMigrationStatus(pool)
 	require.NoError(t, err)
-	assert.Equal(t, uint(1), status.CurrentVersion)
+	assert.Equal(t, uint(999), status.CurrentVersion, "the version must not be lowered")
+	assert.False(t, status.Dirty)
+	assert.False(t, status.NeedsMigration)
+}
+
+func TestMigration_DirtyDatabaseFails(t *testing.T) {
+	pool, ctx := setupEmptyTestDatabase(t)
+	require.NoError(t, postgremq.Migrate(pool))
+
+	_, err := pool.Exec(ctx, "UPDATE postgremq.postgremq_migrations SET dirty = true")
+	require.NoError(t, err)
+
+	err = postgremq.Migrate(pool)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Dirty database version 1")
+}
+
+func TestMigration_Concurrent(t *testing.T) {
+	// Several instances starting together against an empty database.
+	for round := 0; round < 3; round++ {
+		pool, _ := setupEmptyTestDatabase(t)
+		const migrators = 6
+		errs := make([]error, migrators)
+		var wg sync.WaitGroup
+		for i := range migrators {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs[i] = postgremq.Migrate(pool)
+			}()
+		}
+		wg.Wait()
+		for i, err := range errs {
+			require.NoError(t, err, "round %d, migrator %d", round, i)
+		}
+		status, err := postgremq.GetMigrationStatus(pool)
+		require.NoError(t, err)
+		assert.Equal(t, status.LatestVersion, status.CurrentVersion)
+		assert.False(t, status.Dirty)
+	}
+}
+
+func TestMigration_LatestSQLInstallIsCurrent(t *testing.T) {
+	pool, _ := setupTestConnection(t) // installs latest.sql
+
+	status, err := postgremq.GetMigrationStatus(pool)
+	require.NoError(t, err)
+	assert.Equal(t, status.LatestVersion, status.CurrentVersion, "latest.sql records its version")
+	assert.False(t, status.Dirty)
+	assert.False(t, status.NeedsMigration)
+
+	require.NoError(t, postgremq.Migrate(pool), "nothing to apply")
+	status, err = postgremq.GetMigrationStatus(pool)
+	require.NoError(t, err)
+	assert.Equal(t, status.LatestVersion, status.CurrentVersion)
+	assert.False(t, status.Dirty)
 }

@@ -6,6 +6,7 @@ on:
     paths:
       - 'postgremq-rs/**'
       - 'mq/sql/**'
+      - 'mq/migrations/**'
       - 'observability/**'
       - 'docs/observability.md'
       - '.github/workflows/rust-tests.yml'
@@ -14,6 +15,7 @@ on:
     paths:
       - 'postgremq-rs/**'
       - 'mq/sql/**'
+      - 'mq/migrations/**'
       - 'observability/**'
       - 'docs/observability.md'
       - '.github/workflows/rust-tests.yml'

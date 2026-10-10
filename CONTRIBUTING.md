@@ -45,10 +45,15 @@ pytest tests/tests.py -v
 ```
 
 `mq/sql/latest.sql` is the complete schema. Until the first release,
-`mq/migrations/000001_initial_schema.up.sql` is kept byte-identical to it.
+`mq/migrations/000001_initial_schema.up.sql` is kept equal to it, minus the
+fresh-install guard at the top and the version stamp at the end.
 After a release, schema changes add a new migration and update `latest.sql`
-to match (see [RELEASE.md](./RELEASE.md)). The Go `mq` module embeds both with
-`go:embed`, so there is no code to regenerate.
+to match (see [RELEASE.md](./RELEASE.md)). Every client embeds the migrations
+at build time, so there is nothing to copy by hand: the Go `mq` module uses
+`go:embed`, `npm ci`, the TypeScript build and Jest generate
+`postgremq-ts/src/migrations.generated.ts`, and `postgremq-rs/migrations` is a
+symlink to `mq/migrations` (on Windows, clone with `git config core.symlinks
+true`). A new migration needs one entry in `postgremq-rs/src/migrate.rs`.
 
 ### Go
 

@@ -64,7 +64,7 @@ func main() {
 	fmt.Println("Applying migrations...")
 
 	// Apply migrations
-	if err := postgremq.Migrate(pool, postgremq.MigrateOptions{}); err != nil {
+	if err := postgremq.Migrate(pool); err != nil {
 		log.Fatalf("Migration failed: %v", err)
 	}
 

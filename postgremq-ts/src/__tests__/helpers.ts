@@ -275,6 +275,28 @@ export async function createIsolatedTestConnection(db: TestDatabase): Promise<{ 
 }
 
 /**
+ * Create a fresh database WITHOUT the PostgreMQ schema (for migration tests).
+ * `connectionString` lets a test open further pools, as separate processes would.
+ */
+export async function createEmptyTestDatabase(db: TestDatabase): Promise<{ pool: Pool; connectionString: string; dropDatabase: () => Promise<void> }> {
+  if (!db['pool']) throw new Error('Database pool not initialized');
+  const dbName = `pgmq_ts_empty_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+  await db['pool']!.query(`CREATE DATABASE ${dbName}`);
+  db['createdDatabases'].add(dbName);
+  const connectionString = `postgresql://postgres:postgres@${db['host']!}:${db['port']!}/${dbName}`;
+  const pool = new Pool({ connectionString, max: 10 });
+  const dropDatabase = async () => {
+    await pool.end();
+    try {
+      await db['pool']!.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`);
+    } finally {
+      db['createdDatabases'].delete(dbName);
+    }
+  };
+  return { pool, connectionString, dropDatabase };
+}
+
+/**
  * Sleep for the specified duration
  */
 export function sleep(ms: number): Promise<void> {

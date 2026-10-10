@@ -26,11 +26,32 @@ configurable. The crate re-exports the `sqlx`, `serde_json` and (with `otel`)
 `opentelemetry` versions its API uses, plus `CancellationToken` from
 `tokio-util`.
 
-The database needs the PostgreMQ schema, installed once with
+The database needs the PostgreMQ schema; PostgreSQL 15 or later is required.
+Connecting does not create it. Install or upgrade it with `migrate`, which
+applies the migrations embedded in the crate:
+
+```rust,no_run
+# async fn example(pool: sqlx::PgPool) -> postgremq::Result<()> {
+postgremq::migrate(&pool).await?; // no-op when the schema is current
+let status = postgremq::migration_status(&pool).await?;
+assert!(!status.needs_migration);
+# Ok(())
+# }
+```
+
+`migrate` only goes up, to the latest version in this crate. It uses the same
+version table and advisory lock as the Go client and the
+[migration CLI](https://github.com/slavakl/postgremq/blob/main/cmd/postgremq/README.md),
+so concurrent callers are safe and any of them can upgrade a database another
+one installed. A database already at a newer version (migrated by a newer
+release) is left unchanged. A dirty database (a migration failed partway) is
+`Error::DirtySchema`. `migrate` creates the `postgremq` schema when it is
+missing, which needs the `CREATE` privilege on the database. You can also
+install the schema from
 [`mq/sql/latest.sql`](https://github.com/slavakl/postgremq/blob/main/mq/sql/latest.sql)
-or the [migration CLI](https://github.com/slavakl/postgremq/blob/main/cmd/postgremq/README.md).
-PostgreSQL 15 or later is required. The client does not install or migrate
-the schema.
+or with the CLI. `latest.sql` is for fresh databases only (it refuses to run
+on an existing installation) and records the version it installs, so `migrate`
+can upgrade it later.
 
 ## Quick start
 

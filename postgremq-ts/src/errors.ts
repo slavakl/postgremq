@@ -98,6 +98,25 @@ export class ConnectionClosedError extends Error {
 }
 
 /**
+ * DirtySchemaError is thrown by `migrate()` when the recorded schema version
+ * is marked dirty: a migration failed partway, so the schema is in an unknown
+ * state. Fix the schema by hand, then clear the flag in
+ * `postgremq.postgremq_migrations`. Mirrors golang-migrate's ErrDirty, which
+ * the Go client returns.
+ *
+ * Pure client-side error (no SQLSTATE), so it carries no `code`.
+ */
+export class DirtySchemaError extends Error {
+  /** The version whose migration did not finish. */
+  readonly version: number;
+  constructor(version: number) {
+    super(`postgremq: database schema is dirty at version ${version}; a migration failed partway and needs manual repair`);
+    this.name = 'DirtySchemaError';
+    this.version = version;
+  }
+}
+
+/**
  * Map a database error to one of the typed errors, if its SQLSTATE matches
  * a PostgreMQ code. Otherwise returns the input unchanged. nil pass-through.
  *

@@ -33,10 +33,14 @@ export {
   ValidationError,
   ConnectionClosedError,
   QueueFatalError,
+  DirtySchemaError,
   ErrCodeLeaseLost,
   ErrCodeQueueNotFound,
   ErrCodeValidation,
 } from './errors';
+
+// Schema migrations (compatible with the Go client and the CLI).
+export { migrate, getMigrationStatus, MigrationStatus } from './migrate';
 
 // Import implementation classes
 import { Connection as ConnectionImpl } from './connection';

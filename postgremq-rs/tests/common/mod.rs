@@ -177,6 +177,32 @@ impl TestDb {
         Self { name, pool }
     }
 
+    /// A fresh database WITHOUT the PostgreMQ schema (for migration tests).
+    pub(crate) async fn empty() -> Self {
+        let name = format!("pmq_rs_empty_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = admin().await;
+        ddl(&mut admin, format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        admin.close().await.unwrap();
+        let pool = PgPoolOptions::new()
+            .test_before_acquire(false)
+            .max_connections(10)
+            .connect_with(server_options().database(&name))
+            .await
+            .unwrap();
+        Self { name, pool }
+    }
+
+    /// A separate pool on this database (as another process would have).
+    pub(crate) async fn other_pool(&self) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(server_options().database(&self.name))
+            .await
+            .unwrap()
+    }
+
     /// A connection over this database's pool.
     pub(crate) fn connect(&self, options: ConnectionOptions) -> Connection {
         Connection::from_pool(self.pool.clone(), options).unwrap()

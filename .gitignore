@@ -110,6 +110,7 @@ CLAUDE.md
 # TypeScript build and coverage
 postgremq-ts/dist/
 postgremq-ts/coverage/
+postgremq-ts/src/migrations.generated.ts
 
 # Temporary files
 *.tmp
