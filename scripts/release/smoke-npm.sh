@@ -13,7 +13,9 @@ if [ -z "$tarball" ]; then
   (cd "$root/postgremq-ts" && npm run build >/dev/null && npm pack --pack-destination "$SMOKE_WORK" >/dev/null)
   tarball=$(ls "$SMOKE_WORK"/postgremq-*.tgz)
 fi
-tar -tzf "$tarball" | grep -q '^package/dist/migrations.generated.js$' ||
+# A file, not a pipe: grep -q would close it early and fail tar under pipefail.
+tar -tzf "$tarball" > "$SMOKE_WORK/files"
+grep -qx 'package/dist/migrations.generated.js' "$SMOKE_WORK/files" ||
   { echo "smoke-npm: $tarball lacks the embedded migrations" >&2; exit 1; }
 
 mkdir -p "$SMOKE_WORK/app"

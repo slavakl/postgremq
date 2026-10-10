@@ -133,7 +133,8 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
         run: |
           branch="release-please--branches--${{ github.ref_name }}--components--mq"
-          if gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq '.[0].number' | grep -q .; then
+          number=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
             echo "branch=$branch" >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/checkout@v4
