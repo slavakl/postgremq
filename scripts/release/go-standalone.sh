@@ -26,34 +26,41 @@ shift
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 while IFS='=' read -r key value; do
-  export "$key=$value"
+  # GOFLAGS from go-proxy.sh reflects every module in the proxy; this module
+  # decides from its own requirements below.
+  [ "$key" = GOFLAGS ] || export "$key=$value"
 done < <("$root/scripts/release/go-proxy.sh" "$work/proxy")
 
 cd "$root/$dir"
+# This module's postgremq.dev requirements: released (a tag in this branch's
+# history) with the hash committed in go.sum, or not.
+unreleased=0
+missing_sum=0
+while read -r module version; do
+  tag="${module#postgremq.dev/}/$version"
+  if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null || ! git merge-base --is-ancestor "$tag" HEAD; then
+    unreleased=1
+  elif ! grep -q "^$module $version h1:" go.sum 2>/dev/null; then
+    missing_sum=1
+  fi
+done < <(awk '/^\tpostgremq\.dev\// || /^require postgremq\.dev\// { if ($1 == "require") print $2, $3; else print $1, $2 }' go.mod)
+
 if [ "$write" = 1 ]; then
-  if [ "${GOFLAGS:-}" = "-mod=mod" ]; then
-    echo "go-standalone: --write needs released postgremq.dev dependencies (tags); see the go-proxy output above" >&2
+  if [ "$unreleased" = 1 ]; then
+    echo "go-standalone: --write needs this module's postgremq.dev dependencies released (tags)" >&2
     exit 1
   fi
   unset GOFLAGS
   exec "$@"
 fi
-# A released dependency whose hash is not committed yet (the go.sum update
-# follows the dependency's release) is also resolved in temporary files;
-# verify_release.py requires the committed hash before this module's release.
-missing_sum=0
-while read -r module version; do
-  grep -q "^$module $version h1:" go.sum 2>/dev/null || missing_sum=1
-done < <(awk '/^\tpostgremq\.dev\// || /^require postgremq\.dev\// { if ($1 == "require") print $2, $3; else print $1, $2 }' go.mod)
-if [ "$missing_sum" = 1 ] && [ "${GOFLAGS:-}" != "-mod=mod" ]; then
-  echo "go-standalone: go.sum lacks a released postgremq.dev dependency's hash; not checking go.sum" >&2
-  GOFLAGS=-mod=mod
-fi
-if [ "${GOFLAGS:-}" = "-mod=mod" ]; then
+if [ "$unreleased" = 1 ] || [ "$missing_sum" = 1 ]; then
+  # No committed hash to check (unreleased, or the go.sum update that follows
+  # a dependency's release is not in yet); verify_release.py requires it
+  # before this module's release.
   cp go.mod "$work/go.mod"
   cp go.sum "$work/go.sum" 2>/dev/null || true
   export GOFLAGS="-mod=mod -modfile=$work/go.mod"
-  echo "go-standalone: unreleased postgremq.dev dependencies; using a temporary go.mod/go.sum" >&2
+  echo "go-standalone: postgremq.dev dependencies without a committed hash; using a temporary go.mod/go.sum" >&2
 else
   unset GOFLAGS
 fi
