@@ -43,7 +43,7 @@ func TestSchemaIsolationWithApplicationTransactions(t *testing.T) {
 	require.NoError(t, postgremq.Migrate(pool))
 	status, err = postgremq.GetMigrationStatus(pool)
 	require.NoError(t, err)
-	require.Equal(t, uint(1), status.CurrentVersion)
+	require.Equal(t, status.LatestVersion, status.CurrentVersion)
 	require.False(t, status.Dirty)
 	var version int
 	require.NoError(t, pool.QueryRow(ctx, "SELECT version FROM app.postgremq_migrations").Scan(&version))
