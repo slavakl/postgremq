@@ -1637,7 +1637,7 @@ dependencies = [
 
 [[package]]
 name = "postgremq"
-version = "0.1.0"
+version = "0.2.0-e2e.2"
 dependencies = [
  "futures-core",
  "opentelemetry",
