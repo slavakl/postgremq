@@ -9,13 +9,13 @@ All PostgreMQ objects live in the fixed `postgremq` schema. The CLI does not cha
 Requires Go 1.25 or later. From a release:
 
 ```bash
-go install github.com/slavakl/postgremq/cmd/postgremq@latest
+go install postgremq.dev/cmd/postgremq@latest
 ```
 
 Or build it from a clone:
 
 ```bash
-git clone https://github.com/slavakl/postgremq.git
+git clone https://github.com/postgremq/postgremq.git
 cd postgremq/cmd/postgremq
 go build -o postgremq .
 
@@ -266,7 +266,7 @@ import (
 	"log"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 )
 
 func main() {
@@ -288,7 +288,7 @@ func main() {
 		}
 	}
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(ctx, pool)
 	if err != nil {
 		log.Fatal(err)
 	}

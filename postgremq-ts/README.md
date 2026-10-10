@@ -1,6 +1,6 @@
 # PostgreMQ TypeScript Client
 
-TypeScript/Node.js client for [PostgreMQ](https://github.com/slavakl/postgremq), a message queue that runs inside PostgreSQL. Topics fan out to queues, consumers claim messages with a visibility-timeout lease, and publishing and acknowledging can join your application's own database transaction.
+TypeScript/Node.js client for [PostgreMQ](https://github.com/postgremq/postgremq), a message queue that runs inside PostgreSQL. Topics fan out to queues, consumers claim messages with a visibility-timeout lease, and publishing and acknowledging can join your application's own database transaction.
 
 - Promise-based publishing, including delayed delivery and publishing inside a caller-owned transaction
 - Two consumer styles: an async iterator (`consume`) and a handler with bounded concurrency (`consumeHandler`)
@@ -34,15 +34,15 @@ await migrate(pool); // no-op when the schema is current
 console.log(await getMigrationStatus(pool)); // { currentVersion, dirty, latestVersion, needsMigration }
 ```
 
-`migrate` only goes up, to the latest version in this package. It uses the same version table and advisory lock as the Go client and the [PostgreMQ CLI](https://github.com/slavakl/postgremq/blob/main/cmd/postgremq/README.md), so concurrent callers are safe and any of them can upgrade a database another one installed. A database already at a newer version (migrated by a newer release) is left unchanged. A dirty database (a migration failed partway) throws `DirtySchemaError`. `migrate` creates the `postgremq` schema when it is missing, which needs the `CREATE` privilege on the database.
+`migrate` only goes up, to the latest version in this package. It uses the same version table and advisory lock as the Go client and the [PostgreMQ CLI](https://github.com/postgremq/postgremq/blob/main/cmd/postgremq/README.md), so concurrent callers are safe and any of them can upgrade a database another one installed. A database already at a newer version (migrated by a newer release) is left unchanged. A dirty database (a migration failed partway) throws `DirtySchemaError`. `migrate` creates the `postgremq` schema when it is missing, which needs the `CREATE` privilege on the database.
 
-You can also install the schema with the CLI (`postgremq migrate --dsn "$DATABASE_URL"`) or directly from [`mq/sql/latest.sql`](https://github.com/slavakl/postgremq/blob/main/mq/sql/latest.sql). `latest.sql` is for fresh databases only (it refuses to run on an existing installation) and records the version it installs, so `migrate` can upgrade it later.
+You can also install the schema with the CLI (`postgremq migrate --dsn "$DATABASE_URL"`) or directly from [`mq/sql/latest.sql`](https://github.com/postgremq/postgremq/blob/main/mq/sql/latest.sql). `latest.sql` is for fresh databases only (it refuses to run on an existing installation) and records the version it installs, so `migrate` can upgrade it later.
 
 ```bash
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f mq/sql/latest.sql
 ```
 
-All queue objects live in the `postgremq` schema, and client queries are schema-qualified, so your application's `search_path` is not changed. Install the schema in the same database as your application data to use transactional publish and ack. See the [SQL reference](https://github.com/slavakl/postgremq/blob/main/mq/README.md) for the full contract.
+All queue objects live in the `postgremq` schema, and client queries are schema-qualified, so your application's `search_path` is not changed. Install the schema in the same database as your application data to use transactional publish and ack. See the [SQL reference](https://github.com/postgremq/postgremq/blob/main/mq/README.md) for the full contract.
 
 ## Quick start
 
@@ -88,7 +88,9 @@ main().catch(console.error);
 
 ## Connecting
 
-`connect(options)` creates a connection, verifies it with a round trip, and returns it.
+`connect(options)` creates a connection, checks the installation's protocol, and returns it.
+
+The check reads `postgremq.info()`: the installation must speak a protocol major this client implements (`SUPPORTED_PROTOCOL_MAJORS`, currently `[1]`). Otherwise `connect` throws a `CompatibilityError` with `dbVersion`, `protocolMajor` and `supportedMajors`; a database without `info()` (not installed, or older than discovery) throws it too, with the database error as `cause`, meaning it needs an installation or upgrade. Connection and permission errors are thrown as they are. Within a supported major, a function the installation lacks fails with the database's error (`code` `42883`) like any other.
 
 ```typescript
 import { connect } from 'postgremq';
@@ -278,7 +280,7 @@ Within one queue, a group's messages are delivered one at a time in publish comm
 - Publishers of the same group are serialized by the database until their transactions commit, so use groups such as a session, an order or an account, not a hot key shared by unrelated work. A transaction that publishes to several groups should take them in a consistent order to avoid deadlocks.
 - An empty `groupKey` is rejected with `ValidationError`.
 
-See [Message groups](https://github.com/slavakl/postgremq/blob/main/mq/README.md#message-groups) in the SQL reference for the full contract.
+See [Message groups](https://github.com/postgremq/postgremq/blob/main/mq/README.md#message-groups) in the SQL reference for the full contract.
 
 ## Exclusive queues and keep-alive
 
@@ -438,7 +440,7 @@ const { retiredToDlq, inactiveQueuesDropped } = await client.maintenanceFast();
 const deleted = await client.cleanupCompletedMessages(24);
 ```
 
-`deleteInactiveQueues()` removes expired exclusive queues on its own. See [Maintenance and retention](https://github.com/slavakl/postgremq/blob/main/mq/README.md#maintenance-and-retention) for sizing guidance.
+`deleteInactiveQueues()` removes expired exclusive queues on its own. See [Maintenance and retention](https://github.com/postgremq/postgremq/blob/main/mq/README.md#maintenance-and-retention) for sizing guidance.
 
 ## Observability
 
@@ -454,11 +456,11 @@ const client = await connect({
 });
 ```
 
-Metrics are disabled when `meterProvider` is omitted, even if a global provider is registered. Your application owns the SDK and exporters; close the connection before flushing and shutting down the provider. Queue-state metrics come from the SQL function `postgremq.queue_metrics()`. See the [observability guide](https://github.com/slavakl/postgremq/blob/main/docs/observability.md) for metric definitions and Collector setup, and the [TypeScript example](https://github.com/slavakl/postgremq/blob/main/postgremq-ts/examples/metrics.ts) for a complete SDK configuration.
+Metrics are disabled when `meterProvider` is omitted, even if a global provider is registered. Your application owns the SDK and exporters; close the connection before flushing and shutting down the provider. Queue-state metrics come from the SQL function `postgremq.queue_metrics()`. See the [observability guide](https://github.com/postgremq/postgremq/blob/main/docs/observability.md) for metric definitions and Collector setup, and the [TypeScript example](https://github.com/postgremq/postgremq/blob/main/postgremq-ts/examples/metrics.ts) for a complete SDK configuration.
 
 ## Delivery guarantees
 
-Delivery is at least once. A message can be processed more than once (after a lease expires, after a crash, or when a publish outcome was ambiguous and the application retried), so make side effects idempotent, for example with application idempotency keys. See the [delivery lifecycle](https://github.com/slavakl/postgremq/blob/main/docs/delivery-lifecycle.md) for the ownership, cancellation and shutdown contract shared by all clients.
+Delivery is at least once. A message can be processed more than once (after a lease expires, after a crash, or when a publish outcome was ambiguous and the application retried), so make side effects idempotent, for example with application idempotency keys. See the [delivery lifecycle](https://github.com/postgremq/postgremq/blob/main/docs/delivery-lifecycle.md) for the ownership, cancellation and shutdown contract shared by all clients.
 
 ## License
 

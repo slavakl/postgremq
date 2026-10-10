@@ -1,11 +1,11 @@
-module github.com/slavakl/postgremq/postgremq-go
+module postgremq.dev/postgremq-go
 
 go 1.25.0
 
 require (
 	github.com/golang-migrate/migrate/v4 v4.19.0
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/slavakl/postgremq/mq v0.0.0-20251023012409-f6969aee581c
+	postgremq.dev/mq v0.2.0
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.35.0
 	go.opentelemetry.io/otel v1.46.0
@@ -78,5 +78,3 @@ require (
 	google.golang.org/grpc v1.84.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
-
-replace github.com/slavakl/postgremq/mq => ../mq

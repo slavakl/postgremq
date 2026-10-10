@@ -49,6 +49,11 @@ fn public_futures_are_send(
     ));
     assert_send(conn.create_queue("q", "t", QueueOptions::default()));
     assert_send(conn.close());
+    assert_send(Connection::connect("", ConnectionOptions::default()));
+    assert_send(Connection::from_pool(
+        conn.pool().clone(),
+        ConnectionOptions::default(),
+    ));
     assert_send(consumer.next());
     assert_send(consumer.stop());
     assert_send(delivery.ack());
@@ -64,7 +69,7 @@ fn public_futures_compile_as_send() {
 }
 
 async fn setup(db: &TestDb) -> (Connection, String, String) {
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -336,6 +341,7 @@ async fn out_of_range_options_are_rejected_without_panicking() {
         RetryConfig::default().initial_backoff(Duration::ZERO),
     ] {
         let err = Connection::from_pool(db.pool.clone(), ConnectionOptions::default().retry(retry))
+            .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Validation);
     }
@@ -383,7 +389,9 @@ async fn out_of_range_options_are_rejected_without_panicking() {
     within(5, consumer.stop()).await;
 
     // An unrepresentably long shutdown timeout means "no deadline".
-    let patient = db.connect(ConnectionOptions::default().shutdown_timeout(Duration::MAX));
+    let patient = db
+        .connect(ConnectionOptions::default().shutdown_timeout(Duration::MAX))
+        .await;
     within(5, patient.close()).await;
     assert_eq!(
         patient.create_topic(&topic).await.unwrap_err().kind(),

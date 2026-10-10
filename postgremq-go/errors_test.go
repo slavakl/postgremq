@@ -1,12 +1,13 @@
-package postgremq_go_test
+package postgremq_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -18,7 +19,7 @@ func TestErrLeaseLost_AckTwice(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -51,7 +52,7 @@ func TestErrLeaseLost_SetVTAfterExpiry(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -92,7 +93,7 @@ func TestErrLeaseLost_NackAfterStolen(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -132,7 +133,7 @@ func TestErrLeaseLost_ReleaseAfterAck(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -161,7 +162,7 @@ func TestErrQueueNotFound_PublishUnknownTopic(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -179,7 +180,7 @@ func TestErrQueueNotFound_CreateQueueUnknownTopic(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -196,7 +197,7 @@ func TestErrValidation_SetVTNegative(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -226,7 +227,7 @@ func TestErrValidation_CreateTopicInvalidName(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -243,7 +244,7 @@ func TestErrValidation_CreateQueueInvalidName(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -263,7 +264,7 @@ func TestErrValidation_QueueParamMismatch(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -288,7 +289,7 @@ func TestCreateQueue_Idempotent(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -310,7 +311,7 @@ func TestErrValidation_DeleteTopicWithMessages(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -332,7 +333,7 @@ func TestErrValidation_SetVTBatchMismatchedArrays(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 

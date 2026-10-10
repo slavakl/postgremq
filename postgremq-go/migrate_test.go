@@ -1,4 +1,4 @@
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -115,7 +115,7 @@ func TestMigration_SchemaIsUsable(t *testing.T) {
 	require.NoError(t, err)
 
 	// Now create a connection to test message queue operations
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 

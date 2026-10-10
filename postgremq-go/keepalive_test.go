@@ -1,7 +1,7 @@
 // Keep-alive actor tests: cover the connection-level keep-alive actor that
 // batches every exclusive queue's keep-alive into one
 // extend_queue_keep_alive_multi call per tick.
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -84,6 +84,9 @@ func (generationRow) Scan(dest ...any) error {
 	return nil
 }
 func (p *keepAliveSpyPool) QueryRow(ctx context.Context, sql string, args ...interface{}) pgx.Row {
+	if sql == discoverySQL {
+		return discoveryRow{}
+	}
 	return generationRow{}
 }
 func (p *keepAliveSpyPool) Acquire(ctx context.Context) (*pgxpool.Conn, error) { return nil, nil }
@@ -132,7 +135,7 @@ func (p *keepAliveSpyPool) referencedSince(start int, queue string) bool {
 func TestKeepAliveBatchesAllQueuesInOneCall(t *testing.T) {
 	t.Parallel()
 	spy := &keepAliveSpyPool{}
-	conn, err := postgremq.DialFromPool(spy)
+	conn, err := postgremq.DialFromPool(context.Background(), spy)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -172,7 +175,7 @@ func TestKeepAlivePermanentFailureDropsAndNotifies(t *testing.T) {
 		},
 	}
 	failures := make(chan string, 8)
-	conn, err := postgremq.DialFromPool(spy,
+	conn, err := postgremq.DialFromPool(context.Background(), spy,
 		postgremq.WithQueueFatalHandler(func(queue string, err error) {
 			assert.ErrorIs(t, err, postgremq.ErrQueueGone)
 			failures <- queue
@@ -211,7 +214,7 @@ func TestKeepAliveTransientErrorRetriesNoFailure(t *testing.T) {
 	t.Parallel()
 	spy := &keepAliveSpyPool{errOnce: errors.New("transient boom")}
 	failures := make(chan string, 8)
-	conn, err := postgremq.DialFromPool(spy,
+	conn, err := postgremq.DialFromPool(context.Background(), spy,
 		postgremq.WithoutRetries(), // make the transient error reach the actor immediately
 		postgremq.WithQueueFatalHandler(func(queue string, err error) {
 			failures <- queue
@@ -240,7 +243,7 @@ func TestKeepAliveAdvancesKeepAliveUntil(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -273,7 +276,7 @@ func TestKeepAliveDeleteQueueDeregisters(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 	failures := make(chan string, 8)
-	conn, err := postgremq.DialFromPool(pool,
+	conn, err := postgremq.DialFromPool(context.Background(), pool,
 		postgremq.WithQueueFatalHandler(func(queue string, err error) {
 			failures <- queue
 		}))
@@ -297,7 +300,7 @@ func TestKeepAliveDeleteQueueDeregisters(t *testing.T) {
 func TestKeepAliveCreateCloseRace(t *testing.T) {
 	t.Parallel()
 	spy := &keepAliveSpyPool{}
-	conn, err := postgremq.DialFromPool(spy)
+	conn, err := postgremq.DialFromPool(context.Background(), spy)
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup

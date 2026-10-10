@@ -1,6 +1,6 @@
 // Integration tests exercise concurrent processing, high‑throughput delivery,
 // and recovery scenarios end‑to‑end using live PostgreSQL containers.
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,7 +27,7 @@ func TestConcurrentMessageProcessing(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -62,7 +62,7 @@ func TestConcurrentMessageProcessing(t *testing.T) {
 		go func(consumerID int) {
 			defer wg.Done()
 
-			consumerConn, err := postgremq.DialFromPool(pool)
+			consumerConn, err := postgremq.DialFromPool(context.Background(), pool)
 			require.NoError(t, err, "Failed to create consumer connection")
 			defer consumerConn.Close()
 
@@ -154,7 +154,7 @@ func TestHighThroughputDelivery(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -277,7 +277,7 @@ func TestRecoveryFromFailure(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 

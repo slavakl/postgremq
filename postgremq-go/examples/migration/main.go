@@ -17,7 +17,7 @@ import (
 	"os"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 )
 
 func main() {
@@ -81,7 +81,7 @@ func main() {
 	log.Println("\nPostgreMQ is ready to use.")
 
 	// Example: Create a connection and verify everything works
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(ctx, pool)
 	if err != nil {
 		log.Fatalf("Failed to create connection: %v", err)
 	}

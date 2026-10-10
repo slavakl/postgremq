@@ -1,15 +1,6 @@
 name: Go Tests
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'postgremq-go/**'
-      - 'cmd/postgremq/**'
-      - 'mq/**'
-      - 'go.work'
-      - 'observability/**'
-      - '.github/workflows/go-tests.yml'
   pull_request:
     branches: [ main ]
     paths:
@@ -18,7 +9,14 @@ on:
       - 'mq/**'
       - 'go.work'
       - 'observability/**'
+      - 'scripts/release/**'
       - '.github/workflows/go-tests.yml'
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to test (default: the triggering commit)"
+        type: string
+        default: ''
 
 jobs:
   test:
@@ -32,6 +30,9 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
 
     - name: Set up Go
       uses: actions/setup-go@v5
@@ -48,29 +49,14 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-go-${{ matrix.go-version }}-
 
-    - name: Download dependencies
-      working-directory: ./postgremq-go
-      env:
-        GOWORK: 'off'
-      run: go mod download
-
-    # Test the module as published (its own go.mod), not the workspace:
-    # the workspace also holds the metrics example, which needs Go 1.26.
+    # Test the module as published: GOWORK=off, postgremq.dev/mq at the
+    # version go.mod requires (from its release tag when released, so go.sum
+    # is checked; otherwise from this tree). See scripts/release/go-standalone.sh.
     - name: Run tests
-      working-directory: ./postgremq-go
-      env:
-        GOWORK: 'off'
-      run: go test -v -race -timeout=20m -coverprofile=coverage.out -covermode=atomic ./...
+      run: scripts/release/go-standalone.sh postgremq-go go test -v -race -timeout=20m -coverprofile=coverage.out -covermode=atomic ./...
 
-    # Uncomment to enable Codecov (requires CODECOV_TOKEN secret)
-    # - name: Upload coverage to Codecov
-    #   uses: codecov/codecov-action@v4
-    #   with:
-    #     files: ./postgremq-go/coverage.out
-    #     flags: go
-    #     name: go-${{ matrix.go-version }}
-    #     token: ${{ secrets.CODECOV_TOKEN }}
-    #     fail_ci_if_error: false
+    - name: Test the CLI
+      run: scripts/release/go-standalone.sh cmd/postgremq go test ./...
 
   lint:
     name: Lint Go Code
@@ -79,16 +65,17 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
 
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
         go-version: '1.26'
 
+    # Workspace mode (go.work): postgremq.dev modules resolve to this tree.
     - name: golangci-lint
       uses: golangci/golangci-lint-action@v8
-      env:
-        GOWORK: 'off'
       with:
         version: v2.12
         working-directory: postgremq-go
@@ -98,9 +85,3 @@ jobs:
       run: |
         go build ./cmd/postgremq/... ./postgremq-go/examples/...
         go vet ./cmd/postgremq/... ./postgremq-go/examples/...
-
-    - name: Test the CLI
-      working-directory: ./cmd/postgremq
-      env:
-        GOWORK: 'off'
-      run: go test ./...

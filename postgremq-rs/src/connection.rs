@@ -265,6 +265,13 @@ struct QueueMeta {
     exclusive: bool,
 }
 
+/// Fails, rather than letting sqlx panic, outside a Tokio runtime.
+fn require_runtime() -> Result<()> {
+    tokio::runtime::Handle::try_current()
+        .map(drop)
+        .map_err(|_| Error::invalid("a Connection must be created within a Tokio runtime"))
+}
+
 impl Connection {
     /// Connects with a new pool that the connection owns (and closes in
     /// [`close`](Self::close)).
@@ -285,9 +292,13 @@ impl Connection {
     /// # Errors
     ///
     /// [`Error::Validation`] for invalid options; [`Error::Sqlx`] if the pool
-    /// cannot connect.
+    /// cannot connect; [`Error::Incompatible`] if the database's
+    /// `postgremq.info()` reports a protocol major not in
+    /// [`SUPPORTED_PROTOCOL_MAJORS`](crate::SUPPORTED_PROTOCOL_MAJORS), or is
+    /// missing (the database needs a PostgreMQ installation or upgrade).
     pub async fn connect(url: &str, options: ConnectionOptions) -> Result<Self> {
         options.retry.validate()?;
+        require_runtime()?;
         // No ping before every checkout: it doubles the round trips of every
         // claim and settlement. Instead idle connections are recycled before
         // typical load-balancer/pooler idle cut-offs (~4-6 min), and an
@@ -297,6 +308,10 @@ impl Connection {
             .idle_timeout(IDLE_TIMEOUT)
             .connect(url)
             .await?;
+        if let Err(err) = crate::protocol::check(&pool).await {
+            pool.close().await;
+            return Err(err);
+        }
         Self::build(pool, true, options)
     }
 
@@ -324,7 +339,7 @@ impl Connection {
     ///     .idle_timeout(std::time::Duration::from_secs(180))
     ///     .connect("postgres://localhost/app")
     ///     .await?;
-    /// let conn = Connection::from_pool(pool, ConnectionOptions::default())?;
+    /// let conn = Connection::from_pool(pool, ConnectionOptions::default()).await?;
     /// # let _ = conn;
     /// # Ok(())
     /// # }
@@ -332,8 +347,15 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// [`Error::Validation`] for invalid options or outside a Tokio runtime.
-    pub fn from_pool(pool: PgPool, options: ConnectionOptions) -> Result<Self> {
+    /// [`Error::Validation`] for invalid options or outside a Tokio runtime;
+    /// [`Error::Incompatible`] as for [`connect`](Self::connect). The pool is
+    /// consumed even on error; pass a clone to keep using it (e.g. to call
+    /// [`migrate`](crate::migrate) after `Error::Incompatible`);
+    /// [`Error::Sqlx`] if the protocol check cannot reach the database.
+    pub async fn from_pool(pool: PgPool, options: ConnectionOptions) -> Result<Self> {
+        options.retry.validate()?;
+        require_runtime()?;
+        crate::protocol::check(&pool).await?;
         Self::build(pool, false, options)
     }
 
@@ -1388,7 +1410,7 @@ mod tests {
                 hooks.fetch_add(1, Ordering::SeqCst);
             }
         });
-        (Connection::from_pool(pool, options).unwrap(), hooks)
+        (Connection::build(pool, false, options).unwrap(), hooks)
     }
 
     fn declare(inner: &Inner, queue: &str) -> Generation {

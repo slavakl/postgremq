@@ -1,11 +1,12 @@
-package postgremq_go_test
+package postgremq_test
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"testing"
 
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -18,7 +19,7 @@ func TestMetricsContractWithTransactionsAndRedelivery(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	defer func() { require.NoError(t, provider.Shutdown(ctx)) }()
-	conn, err := postgremq.DialFromPool(pool, postgremq.WithMeterProvider(provider), postgremq.WithoutRetries())
+	conn, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithMeterProvider(provider), postgremq.WithoutRetries())
 	require.NoError(t, err)
 	defer func() { require.NoError(t, conn.Close()) }()
 	require.NoError(t, conn.CreateTopic(ctx, "metrics"))
@@ -164,7 +165,7 @@ func TestMetricsCountLogicalOperationAcrossRetry(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	defer func() { require.NoError(t, provider.Shutdown(ctx)) }()
-	conn, err := postgremq.DialFromPool(pool, postgremq.WithMeterProvider(provider))
+	conn, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithMeterProvider(provider))
 	require.NoError(t, err)
 	defer func() { require.NoError(t, conn.Close()) }()
 	require.NoError(t, conn.CreateTopic(ctx, "metrics"))
@@ -217,7 +218,7 @@ func TestMetricsProviderIsOptionalAndApplicationOwned(t *testing.T) {
 			if enabled {
 				opts = append(opts, postgremq.WithMeterProvider(provider))
 			}
-			conn, err := postgremq.DialFromPool(pool, opts...)
+			conn, err := postgremq.DialFromPool(context.Background(), pool, opts...)
 			require.NoError(t, err)
 			defer func() { require.NoError(t, conn.Close()) }()
 			require.NoError(t, conn.CreateTopic(ctx, "optional"))

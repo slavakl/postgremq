@@ -3,7 +3,7 @@
 // call per tick. The headline guarantee is the
 // composite (queue, message_id) key: the same message_id distributed to
 // two queues is two independent entries, both extended.
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -91,6 +91,9 @@ func (p *extenderSpyPool) Query(ctx context.Context, sql string, args ...interfa
 }
 
 func (p *extenderSpyPool) QueryRow(ctx context.Context, sql string, args ...interface{}) pgx.Row {
+	if sql == discoverySQL {
+		return discoveryRow{}
+	}
 	return nil
 }
 func (p *extenderSpyPool) Acquire(ctx context.Context) (*pgxpool.Conn, error) { return nil, nil }
@@ -148,7 +151,7 @@ func (p *extenderSpyPool) callContaining(want qid) []qid {
 func TestExtenderCompositeKeyNoBleed(t *testing.T) {
 	t.Parallel()
 	spy := &extenderSpyPool{}
-	conn, err := postgremq.DialFromPool(spy)
+	conn, err := postgremq.DialFromPool(context.Background(), spy)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -182,7 +185,7 @@ func TestExtenderLeaseLostCancels(t *testing.T) {
 			return kept
 		},
 	}
-	conn, err := postgremq.DialFromPool(spy)
+	conn, err := postgremq.DialFromPool(context.Background(), spy)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -224,7 +227,7 @@ func TestExtenderLeaseLostCancels(t *testing.T) {
 func TestExtenderBatchSizeCapsPerTick(t *testing.T) {
 	t.Parallel()
 	spy := &extenderSpyPool{vtFromNow: 150 * time.Millisecond}
-	conn, err := postgremq.DialFromPool(spy, postgremq.WithExtenderBatchSize(2))
+	conn, err := postgremq.DialFromPool(context.Background(), spy, postgremq.WithExtenderBatchSize(2))
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -246,7 +249,7 @@ func TestExtenderBatchSizeCapsPerTick(t *testing.T) {
 func TestExtenderDeregisterStopsExtension(t *testing.T) {
 	t.Parallel()
 	spy := &extenderSpyPool{}
-	conn, err := postgremq.DialFromPool(spy)
+	conn, err := postgremq.DialFromPool(context.Background(), spy)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -267,7 +270,7 @@ func TestSetVTBatchMultiCompositeKey(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 

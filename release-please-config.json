@@ -1,0 +1,52 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "c398691f4cb58a8e37e73a20ca53d748370d400f",
+  "separate-pull-requests": true,
+  "include-component-in-tag": true,
+  "include-v-in-tag": true,
+  "tag-separator": "/",
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": false,
+  "changelog-sections": [
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "perf", "section": "Performance Improvements" },
+    { "type": "revert", "section": "Reverts" },
+    { "type": "deps", "section": "Dependencies" },
+    { "type": "docs", "section": "Documentation", "hidden": true },
+    { "type": "refactor", "section": "Code Refactoring", "hidden": true },
+    { "type": "test", "section": "Tests", "hidden": true },
+    { "type": "build", "section": "Build System", "hidden": true },
+    { "type": "ci", "section": "Continuous Integration", "hidden": true },
+    { "type": "chore", "section": "Miscellaneous Chores", "hidden": true }
+  ],
+  "packages": {
+    "mq": {
+      "component": "mq",
+      "release-type": "simple",
+      "version-file": "VERSION",
+      "package-name": "mq"
+    },
+    "postgremq-go": {
+      "component": "postgremq-go",
+      "release-type": "go",
+      "package-name": "postgremq.dev/postgremq-go",
+      "exclude-paths": ["postgremq-go/examples"]
+    },
+    "cmd/postgremq": {
+      "component": "cmd/postgremq",
+      "release-type": "go",
+      "package-name": "postgremq.dev/cmd/postgremq"
+    },
+    "postgremq-rs": {
+      "component": "rust",
+      "release-type": "rust",
+      "package-name": "postgremq"
+    },
+    "postgremq-ts": {
+      "component": "npm",
+      "release-type": "node",
+      "package-name": "postgremq"
+    }
+  }
+}

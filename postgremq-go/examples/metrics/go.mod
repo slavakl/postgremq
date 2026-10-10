@@ -1,10 +1,10 @@
-module github.com/slavakl/postgremq/postgremq-go/examples/metrics
+module postgremq.dev/postgremq-go/examples/metrics
 
 go 1.26.0
 
 require (
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/slavakl/postgremq/postgremq-go v0.0.0
+	postgremq.dev/postgremq-go v0.2.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0
@@ -25,7 +25,7 @@ require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
-	github.com/slavakl/postgremq/mq v0.0.0-20251023012409-f6969aee581c // indirect
+	postgremq.dev/mq v0.2.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	go.opentelemetry.io/otel/metric v1.47.0 // indirect
@@ -41,6 +41,6 @@ require (
 	google.golang.org/protobuf v1.36.12 // indirect
 )
 
-replace github.com/slavakl/postgremq/postgremq-go => ../..
+replace postgremq.dev/postgremq-go => ../..
 
-replace github.com/slavakl/postgremq/mq => ../../../mq
+replace postgremq.dev/mq => ../../../mq

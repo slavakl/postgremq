@@ -1,10 +1,10 @@
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/require"
 	"testing"
 	"time"
@@ -14,7 +14,7 @@ func TestCloseAllowsDeliverySettlement(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
-	c, err := postgremq.DialFromPool(pool, postgremq.WithShutdownTimeout(time.Second))
+	c, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithShutdownTimeout(time.Second))
 	require.NoError(t, err)
 	defer c.Close()
 	require.NoError(t, c.CreateTopic(ctx, "t"))
@@ -42,7 +42,7 @@ func TestCancelledHandlerReturnDoesNotAcknowledge(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
-	c, err := postgremq.DialFromPool(pool)
+	c, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer c.Close()
 	require.NoError(t, c.CreateTopic(ctx, "t"))
@@ -69,7 +69,7 @@ func TestCloseCancelsBlockedFetch(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
-	c, err := postgremq.DialFromPool(pool, postgremq.WithShutdownTimeout(50*time.Millisecond))
+	c, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithShutdownTimeout(50*time.Millisecond))
 	require.NoError(t, err)
 	defer c.Close()
 	require.NoError(t, c.CreateTopic(ctx, "t"))
@@ -99,7 +99,7 @@ func TestFailedQueueDeletionKeepsItsLeaseAlive(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
-	c, err := postgremq.DialFromPool(pool)
+	c, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer c.Close()
 	require.NoError(t, c.CreateTopic(ctx, "t"))
@@ -123,7 +123,7 @@ func TestAmbiguousPublishIsNotRetried(t *testing.T) {
 		calls++
 		return &mockErrRow{err: &pgconn.PgError{Code: "08006", Message: "response lost"}}
 	}}
-	c, err := postgremq.DialFromPool(pool)
+	c, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer c.Close()
 	_, err = c.Publish(context.Background(), "t", []byte(`{}`))

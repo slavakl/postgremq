@@ -58,10 +58,10 @@ It reads `DATABASE_URL` and `OTEL_EXPORTER_OTLP_ENDPOINT` if they are set. See [
 
 ## Common patterns
 
-The package name is `postgremq_go`; import it with an alias:
+The package name is `postgremq`:
 
 ```go
-import postgremq "github.com/slavakl/postgremq/postgremq-go"
+import "postgremq.dev/postgremq-go"
 ```
 
 Connect:

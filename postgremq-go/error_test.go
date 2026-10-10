@@ -1,7 +1,7 @@
 // Error handling tests simulate connection loss and retryable errors, validate
 // backoff behavior and maximum attempts, and confirm that common invalid input
 // conditions are surfaced cleanly from client methods.
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -166,7 +166,7 @@ func TestConnectionLossRecovery(t *testing.T) {
 		RealPool: pool,
 	}
 
-	conn, err := postgremq.DialFromPool(mockPool)
+	conn, err := postgremq.DialFromPool(context.Background(), mockPool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -242,7 +242,7 @@ func TestTransactionErrorHandling(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	conn, err := postgremq.DialFromPool(mockPool,
+	conn, err := postgremq.DialFromPool(context.Background(), mockPool,
 		postgremq.WithRetryConfig(postgremq.RetryConfig{
 			MaxAttempts:       5,
 			InitialBackoff:    10 * time.Millisecond,
@@ -298,7 +298,7 @@ func TestConsumeMessagesDoesNotRetry(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	conn, err := postgremq.DialFromPool(mockPool,
+	conn, err := postgremq.DialFromPool(context.Background(), mockPool,
 		postgremq.WithRetryConfig(postgremq.RetryConfig{
 			MaxAttempts:       5,
 			InitialBackoff:    1 * time.Millisecond,
@@ -351,7 +351,7 @@ func TestConsumeMessagesReturnsPartialOnError(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	conn, err := postgremq.DialFromPool(mockPool)
+	conn, err := postgremq.DialFromPool(context.Background(), mockPool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -383,7 +383,7 @@ func TestRetryBackoffBehavior(t *testing.T) {
 	}
 
 	// Configure with initial backoff of 100ms doubling each time
-	conn, err := postgremq.DialFromPool(pool,
+	conn, err := postgremq.DialFromPool(context.Background(), pool,
 		postgremq.WithLogger(logger),
 		postgremq.WithRetryConfig(postgremq.RetryConfig{
 			MaxAttempts:       5,
@@ -430,7 +430,7 @@ func TestErrorConditionsInOperations(t *testing.T) {
 		pool, ctx := setupTestConnection(t)
 		defer pool.Close()
 
-		conn, err := postgremq.DialFromPool(pool)
+		conn, err := postgremq.DialFromPool(context.Background(), pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 
@@ -448,7 +448,7 @@ func TestErrorConditionsInOperations(t *testing.T) {
 		pool, ctx := setupTestConnection(t)
 		defer pool.Close()
 
-		conn, err := postgremq.DialFromPool(pool)
+		conn, err := postgremq.DialFromPool(context.Background(), pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 
@@ -476,7 +476,7 @@ func TestErrorConditionsInOperations(t *testing.T) {
 		topicName := "test_parallel_topic"
 		queueName := "test_parallel_queue"
 
-		conn, err := postgremq.DialFromPool(pool)
+		conn, err := postgremq.DialFromPool(context.Background(), pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 
@@ -525,7 +525,7 @@ func TestVeryLargePayload(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -594,7 +594,7 @@ func TestBoundaryConditions(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 

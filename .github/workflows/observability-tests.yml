@@ -1,17 +1,22 @@
 name: Observability Tests
 on:
-  push:
-    branches: [main]
-    paths: ['observability/**', 'mq/**', 'postgremq-go/**', 'postgremq-ts/**', 'postgremq-rs/**', 'docs/observability.md', '.github/workflows/observability-tests.yml']
   pull_request:
     branches: [main]
     paths: ['observability/**', 'mq/**', 'postgremq-go/**', 'postgremq-ts/**', 'postgremq-rs/**', 'docs/observability.md', '.github/workflows/observability-tests.yml']
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to test (default: the triggering commit)"
+        type: string
+        default: ''
 jobs:
   collector:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26'

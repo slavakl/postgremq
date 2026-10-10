@@ -1,10 +1,10 @@
-module github.com/slavakl/postgremq/cmd/postgremq
+module postgremq.dev/cmd/postgremq
 
 go 1.25.0
 
 require (
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/slavakl/postgremq/postgremq-go v0.0.0
+	postgremq.dev/postgremq-go v0.2.0
 	github.com/spf13/cobra v1.8.1
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.40.0
@@ -56,7 +56,7 @@ require (
 	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
 	github.com/shirou/gopsutil/v4 v4.25.6 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
-	github.com/slavakl/postgremq/mq v0.0.0-20251023012409-f6969aee581c // indirect
+	postgremq.dev/mq v0.2.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
@@ -72,7 +72,3 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 )
-
-replace github.com/slavakl/postgremq/postgremq-go => ../../postgremq-go
-
-replace github.com/slavakl/postgremq/mq => ../../mq

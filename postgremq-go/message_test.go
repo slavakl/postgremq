@@ -1,9 +1,10 @@
 // Message tests cover ack/nack/release semantics, delayed publish and delayed
 // redelivery, manual visibility extension (SetVT), state transitions, message
 // payload handling, and transactional ack behavior (commit/rollback).
-package postgremq_go_test
+package postgremq_test
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -11,7 +12,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -25,7 +26,7 @@ func TestMessageAcknowledgment(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -68,7 +69,7 @@ func TestMessageNegativeAcknowledgment(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -113,7 +114,7 @@ func TestMessageVisibilityTimeout(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -160,7 +161,7 @@ func TestMessageDelayedDelivery(t *testing.T) {
 	defer pool.Close()
 
 	logger := MockLogger{}
-	conn, err := postgremq.DialFromPool(pool, postgremq.WithLogger(&logger))
+	conn, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithLogger(&logger))
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -211,7 +212,7 @@ func TestMessageDelayedRedelivery(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -267,7 +268,7 @@ func TestMessageStatusTransitions(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -323,7 +324,7 @@ func TestMessageProperties(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -393,7 +394,7 @@ func TestAckWithTx(t *testing.T) {
 	// Test Case 1: Successful commit of acknowledge
 	t.Run("CommitTransaction", func(t *testing.T) {
 
-		conn, err := postgremq.DialFromPool(pool)
+		conn, err := postgremq.DialFromPool(context.Background(), pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 
@@ -448,7 +449,7 @@ func TestAckWithTx(t *testing.T) {
 	t.Run("RollbackTransaction", func(t *testing.T) {
 
 		cleanTestData(t, pool, ctx)
-		conn, err := postgremq.DialFromPool(pool)
+		conn, err := postgremq.DialFromPool(context.Background(), pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 
@@ -525,7 +526,7 @@ func TestMessageID_BeyondInt32(t *testing.T) {
 	_, err := pool.Exec(ctx, "SELECT setval('postgremq.messages_id_seq', $1)", seedTo)
 	require.NoError(t, err, "setval messages_id_seq")
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 

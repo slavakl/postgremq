@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Release guard: run before Release Please creates tags and GitHub releases.
+
+Release Please tags the merge commit of every merged release PR still
+labelled `autorelease: pending`. A tag publishes (Go modules are published by
+the tag alone), so each such commit must already have passed validation, and
+must be a consistent release (scripts/release/verify_release.py). A later
+passing commit must not authorize an earlier failed one.
+
+    check_pending_releases.py --branch main --validated-sha "$GITHUB_SHA"
+
+--validated-sha is the commit this workflow run validated. Any other merge
+commit counts as validated only if an earlier run of this workflow
+(--workflow, default release.yml) finished the `Validated` job successfully on
+it. Needs `gh` authenticated (GH_TOKEN) and GITHUB_REPOSITORY.
+Prints the pending releases; exits 1 if any must not be tagged.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+COMPONENT_PATHS = {
+    'mq': 'mq',
+    'postgremq-go': 'postgremq-go',
+    'cmd/postgremq': 'cmd/postgremq',
+    'rust': 'postgremq-rs',
+    'npm': 'postgremq-ts',
+}
+VALIDATED_JOB = 'Validated'
+
+
+def run(*args: str, cwd: Path = ROOT) -> str:
+    return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+def gh_json(*args: str):
+    return json.loads(run('gh', *args))
+
+
+def validated_elsewhere(repo: str, workflow: str, sha: str) -> bool:
+    runs = gh_json('api', f'repos/{repo}/actions/workflows/{workflow}/runs?head_sha={sha}&per_page=100')
+    for workflow_run in runs.get('workflow_runs', []):
+        jobs = gh_json('api', f'repos/{repo}/actions/runs/{workflow_run["id"]}/jobs?per_page=100&filter=all')
+        if any(job['name'] == VALIDATED_JOB and job['conclusion'] == 'success' for job in jobs.get('jobs', [])):
+            return True
+    return False
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--branch', required=True, help='the release branch (Release Please target)')
+    parser.add_argument('--validated-sha', required=True, help='the commit this run validated')
+    parser.add_argument('--workflow', default='release.yml', help='the workflow whose Validated job counts')
+    args = parser.parse_args()
+    repo = os.environ['GITHUB_REPOSITORY']
+
+    prs = gh_json('pr', 'list', '--repo', repo, '--base', args.branch, '--state', 'merged',
+                  '--label', 'autorelease: pending', '--json', 'number,title,headRefName,mergeCommit,url')
+    if not prs:
+        print('No merged release PRs are waiting to be tagged.')
+        return 0
+
+    problems = []
+    for pr in prs:
+        sha = (pr.get('mergeCommit') or {}).get('oid')
+        component = pr['headRefName'].rpartition('--components--')[2]
+        label = f'#{pr["number"]} ({pr["title"]}, {sha and sha[:12]})'
+        if component not in COMPONENT_PATHS or not sha:
+            problems.append(f'{label}: cannot tell its component or merge commit')
+            continue
+        if sha != args.validated_sha and not validated_elsewhere(repo, args.workflow, sha):
+            problems.append(
+                f'{label}: its merge commit has not passed validation. If the failure was spurious, '
+                f're-run that commit\'s {args.workflow} run; when its {VALIDATED_JOB} job succeeds, the next '
+                f'run tags it. If the commit is broken, do not tag it: remove the "autorelease: pending" '
+                f'label from {pr["url"]}, revert the release commit, and fix forward; Release Please then '
+                f'proposes a new release PR.')
+            continue
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / 'source'
+            run('git', 'worktree', 'add', '--detach', str(worktree), sha)
+            try:
+                manifest = json.loads((worktree / '.release-please-manifest.json').read_text())
+                version = manifest[COMPONENT_PATHS[component]]
+                check = subprocess.run([sys.executable, 'scripts/release/verify_release.py', f'{component}/v{version}'],
+                                       cwd=worktree, capture_output=True, text=True)
+                print(check.stdout, end='')
+                if check.returncode != 0:
+                    problems.append(f'{label}: {component} {version} is not a consistent release:\n{check.stderr}')
+                else:
+                    print(f'{label}: validated; will be tagged {component}/v{version}')
+            finally:
+                run('git', 'worktree', 'remove', '--force', str(worktree))
+
+    if problems:
+        print('Release guard: not tagging. Correct the pending release(s) first:', file=sys.stderr)
+        for problem in problems:
+            print(f'  - {problem}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

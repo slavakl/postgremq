@@ -1,4 +1,4 @@
-package postgremq_go
+package postgremq
 
 import (
 	"container/heap"

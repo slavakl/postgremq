@@ -1,12 +1,13 @@
-package postgremq_go_test
+package postgremq_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -53,7 +54,7 @@ func TestSchemaIsolationWithApplicationTransactions(t *testing.T) {
 		(SELECT count(*) FROM pg_proc WHERE pronamespace='public'::regnamespace)`).Scan(&publicObjects))
 	require.Zero(t, publicObjects)
 
-	c, err := postgremq.DialFromPool(pool, postgremq.WithShutdownTimeout(time.Second))
+	c, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithShutdownTimeout(time.Second))
 	require.NoError(t, err)
 	defer c.Close()
 	require.NoError(t, c.CreateTopic(ctx, "in"))

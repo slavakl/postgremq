@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 import pytest
 import psycopg2
@@ -3272,26 +3273,32 @@ def _schema_dump(postgres_container, db_config, dbname: str) -> str:
     code, out = postgres_container.get_wrapped_container().exec_run(
         ['pg_dump', '-U', db_config['user'], '--schema-only', '--schema', 'postgremq', dbname])
     assert code == 0, out.decode()
-    return out.decode()
+    # pg_dump 15.14+ brackets the dump with \restrict / \unrestrict lines
+    # carrying a random key; they are not part of the schema.
+    return ''.join(line for line in out.decode().splitlines(keepends=True)
+                   if not line.startswith(('\\restrict ', '\\unrestrict ')))
 
 
-def test_latest_sql_install_equals_the_migrations(postgres_container, db_config, admin_conn):
-    """A fresh latest.sql install equals running every migration as a migrator does."""
+def _assert_install_equals_migrations(postgres_container, db_config, admin_conn,
+                                      latest_sql: str, migrations: list[Path]) -> str:
+    """Installs latest_sql and, separately, every migration as a migrator does;
+    asserts identical schemas and version rows. Returns info()'s db_version."""
     by_script, by_migrations = f"mq_latest_{uuid.uuid4().hex[:8]}", f"mq_migrated_{uuid.uuid4().hex[:8]}"
     for name in (by_script, by_migrations):
         _fresh_database(admin_conn, name)
     try:
         with psycopg2.connect(**{**db_config, 'dbname': by_script}) as c, c.cursor() as cur:
-            cur.execute(SQL_FILE.read_text())
+            cur.execute(latest_sql)
+        numbers = [int(path.name.split('_', 1)[0]) for path in migrations]
+        assert len(numbers) == len(set(numbers)), f'duplicate migration numbers: {sorted(numbers)}'
         # The migrators' protocol (golang-migrate): version table first, then
         # each migration between a dirty and a clean version row.
-        migrations = sorted(MIGRATIONS_DIR.glob('*.up.sql'))
         with psycopg2.connect(**{**db_config, 'dbname': by_migrations}) as c:
             c.autocommit = True
             with c.cursor() as cur:
                 cur.execute('CREATE SCHEMA postgremq; CREATE TABLE postgremq.postgremq_migrations '
                             '(version bigint not null primary key, dirty boolean not null)')
-                for path in migrations:
+                for path in sorted(migrations):
                     version = int(path.name.split('_', 1)[0])
                     cur.execute('TRUNCATE postgremq.postgremq_migrations; '
                                 'INSERT INTO postgremq.postgremq_migrations VALUES (%s, true)', (version,))
@@ -3299,13 +3306,123 @@ def test_latest_sql_install_equals_the_migrations(postgres_container, db_config,
                     cur.execute('UPDATE postgremq.postgremq_migrations SET dirty = false')
         assert _schema_dump(postgres_container, db_config, by_script) == \
             _schema_dump(postgres_container, db_config, by_migrations)
-        rows = []
+        rows, versions = [], []
         for name in (by_script, by_migrations):
             with psycopg2.connect(**{**db_config, 'dbname': name}) as c, c.cursor() as cur:
                 cur.execute('SELECT version, dirty FROM postgremq.postgremq_migrations')
                 rows.append(cur.fetchall())
+                cur.execute("SELECT postgremq.info()->>'db_version'")
+                versions.append(cur.fetchone()[0])
         assert rows[0] == rows[1]
+        assert versions[0] == versions[1]
+        return versions[0]
     finally:
         with admin_conn.cursor() as cur:
             for name in (by_script, by_migrations):
                 cur.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
+
+
+def test_latest_sql_install_equals_the_migrations(postgres_container, db_config, admin_conn):
+    """A fresh latest.sql install equals running every migration as a migrator does."""
+    _assert_install_equals_migrations(postgres_container, db_config, admin_conn,
+                                      SQL_FILE.read_text(), list(MIGRATIONS_DIR.glob('*.up.sql')))
+
+
+def test_info_reports_the_mq_version_and_protocol_major(cur):
+    cur.execute('SELECT postgremq.info()')
+    info = cur.fetchone()[0]
+    assert info['db_version'] == (MIGRATIONS_DIR.parent / 'VERSION').read_text().strip()
+    assert info['protocol_major'] == 1
+
+
+def test_release_stamp_keeps_install_and_upgrade_equal(postgres_container, db_config, admin_conn, tmp_path):
+    """The release PR's stamp makes both install paths report the new version."""
+    import shutil
+    import subprocess
+    mq = MIGRATIONS_DIR.parent
+    shutil.copytree(mq / 'migrations', tmp_path / 'migrations')
+    shutil.copytree(mq / 'sql', tmp_path / 'sql')
+    (tmp_path / 'VERSION').write_text('9.9.9-rc.1\n')
+    script = [sys.executable, str(mq / 'scripts' / 'stamp_release.py'), '--mq-dir', str(tmp_path), '9.9.9-rc.1']
+    first = subprocess.run(script, check=True, capture_output=True, text=True).stdout
+    assert 'release_v9_9_9_rc_1.up.sql' in first
+    again = subprocess.run(script, check=True, capture_output=True, text=True).stdout
+    assert 'already stamped' in again
+
+    migrations = list((tmp_path / 'migrations').glob('*.up.sql'))
+    assert len(migrations) == len(list(MIGRATIONS_DIR.glob('*.up.sql'))) + 1
+    version = _assert_install_equals_migrations(postgres_container, db_config, admin_conn,
+                                                (tmp_path / 'sql' / 'latest.sql').read_text(), migrations)
+    assert version == '9.9.9-rc.1'
+
+
+REPO_ROOT = MIGRATIONS_DIR.parent.parent
+
+
+def _git(*args: str) -> str:
+    import subprocess
+    return subprocess.run(['git', '-C', str(REPO_ROOT), *args], check=True,
+                          capture_output=True, text=True).stdout
+
+
+def _mq_release_tags() -> list[str]:
+    try:
+        # Only this branch's releases: tags on other branches are not its history.
+        return [tag for tag in _git('tag', '--merged', 'HEAD', '--list', 'mq/v*').split() if tag]
+    except Exception:  # no git checkout (e.g. a source archive)
+        return []
+
+
+def test_released_migrations_are_unchanged():
+    """Released migrations are immutable: each mq release tag's files are still byte-identical."""
+    tags = _mq_release_tags()
+    if not tags:
+        pytest.skip('no mq release yet')
+    for tag in tags:
+        for path in _git('ls-tree', '--name-only', f'{tag}:mq/migrations').split():
+            released = _git('show', f'{tag}:mq/migrations/{path}')
+            current = MIGRATIONS_DIR / path
+            assert current.exists(), f'{path} (released in {tag}) was deleted'
+            assert current.read_text() == released, f'{path} (released in {tag}) was changed'
+
+
+def test_upgrade_from_released_versions_equals_a_fresh_install(postgres_container, db_config, admin_conn):
+    """Installing a released latest.sql, then migrating, equals installing the current latest.sql."""
+    import re
+    tags = _mq_release_tags()
+    if not tags:
+        pytest.skip('no mq release yet')
+    fresh = f"mq_fresh_{uuid.uuid4().hex[:8]}"
+    _fresh_database(admin_conn, fresh)
+    try:
+        with psycopg2.connect(**{**db_config, 'dbname': fresh}) as c, c.cursor() as cur:
+            cur.execute(SQL_FILE.read_text())
+        expected = _schema_dump(postgres_container, db_config, fresh)
+        for tag in tags:
+            old_sql = _git('show', f'{tag}:mq/sql/latest.sql')
+            recorded = int(re.search(
+                r'INSERT INTO postgremq\.postgremq_migrations \(version, dirty\) VALUES \((\d+), false\);',
+                old_sql).group(1))
+            upgraded = f"mq_upgraded_{uuid.uuid4().hex[:8]}"
+            _fresh_database(admin_conn, upgraded)
+            try:
+                with psycopg2.connect(**{**db_config, 'dbname': upgraded}) as c:
+                    c.autocommit = True
+                    with c.cursor() as cur:
+                        cur.execute(old_sql)
+                        for path in sorted(MIGRATIONS_DIR.glob('*.up.sql')):
+                            version = int(path.name.split('_', 1)[0])
+                            if version <= recorded:
+                                continue
+                            cur.execute('TRUNCATE postgremq.postgremq_migrations; '
+                                        'INSERT INTO postgremq.postgremq_migrations VALUES (%s, true)', (version,))
+                            cur.execute(path.read_text())
+                            cur.execute('UPDATE postgremq.postgremq_migrations SET dirty = false')
+                assert _schema_dump(postgres_container, db_config, upgraded) == expected, \
+                    f'upgrading from {tag} differs from a fresh install'
+            finally:
+                with admin_conn.cursor() as cur:
+                    cur.execute(f"DROP DATABASE IF EXISTS {upgraded} WITH (FORCE)")
+    finally:
+        with admin_conn.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS {fresh} WITH (FORCE)")

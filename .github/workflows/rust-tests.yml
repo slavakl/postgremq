@@ -1,15 +1,6 @@
 name: Rust Tests
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'postgremq-rs/**'
-      - 'mq/sql/**'
-      - 'mq/migrations/**'
-      - 'observability/**'
-      - 'docs/observability.md'
-      - '.github/workflows/rust-tests.yml'
   pull_request:
     branches: [ main ]
     paths:
@@ -19,6 +10,12 @@ on:
       - 'observability/**'
       - 'docs/observability.md'
       - '.github/workflows/rust-tests.yml'
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to test (default: the triggering commit)"
+        type: string
+        default: ''
 
 jobs:
   test:
@@ -50,6 +47,9 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
 
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@1.98
@@ -96,6 +96,9 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
 
     - name: Set up Rust 1.94
       uses: dtolnay/rust-toolchain@1.94

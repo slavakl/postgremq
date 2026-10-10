@@ -3,10 +3,10 @@
 A message queue built entirely on PostgreSQL: plain SQL tables and functions,
 with client libraries for Go, TypeScript and Rust.
 
-[![SQL Tests](https://github.com/slavakl/postgremq/actions/workflows/sql-tests.yml/badge.svg)](https://github.com/slavakl/postgremq/actions/workflows/sql-tests.yml)
-[![Go Tests](https://github.com/slavakl/postgremq/actions/workflows/go-tests.yml/badge.svg)](https://github.com/slavakl/postgremq/actions/workflows/go-tests.yml)
-[![TypeScript Tests](https://github.com/slavakl/postgremq/actions/workflows/typescript-tests.yml/badge.svg)](https://github.com/slavakl/postgremq/actions/workflows/typescript-tests.yml)
-[![Rust Tests](https://github.com/slavakl/postgremq/actions/workflows/rust-tests.yml/badge.svg)](https://github.com/slavakl/postgremq/actions/workflows/rust-tests.yml)
+[![SQL Tests](https://github.com/postgremq/postgremq/actions/workflows/sql-tests.yml/badge.svg)](https://github.com/postgremq/postgremq/actions/workflows/sql-tests.yml)
+[![Go Tests](https://github.com/postgremq/postgremq/actions/workflows/go-tests.yml/badge.svg)](https://github.com/postgremq/postgremq/actions/workflows/go-tests.yml)
+[![TypeScript Tests](https://github.com/postgremq/postgremq/actions/workflows/typescript-tests.yml/badge.svg)](https://github.com/postgremq/postgremq/actions/workflows/typescript-tests.yml)
+[![Rust Tests](https://github.com/postgremq/postgremq/actions/workflows/rust-tests.yml/badge.svg)](https://github.com/postgremq/postgremq/actions/workflows/rust-tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 PostgreMQ runs in the PostgreSQL database you already have. It is a SQL
@@ -39,13 +39,16 @@ transactions.
 | Component | Path | Install |
 |-----------|------|---------|
 | SQL schema and functions | [`mq/`](./mq/README.md) | run `mq/sql/latest.sql`, or the migrations |
-| Go client | [`postgremq-go/`](./postgremq-go/README.md) | `go get github.com/slavakl/postgremq/postgremq-go` |
+| Go client | [`postgremq-go/`](./postgremq-go/README.md) | `go get postgremq.dev/postgremq-go` |
 | TypeScript client | [`postgremq-ts/`](./postgremq-ts/README.md) | `npm install postgremq` |
 | Rust client | [`postgremq-rs/`](./postgremq-rs/README.md) | `cargo add postgremq` |
-| CLI (migrations) | [`cmd/postgremq/`](./cmd/postgremq/README.md) | `go install github.com/slavakl/postgremq/cmd/postgremq@latest` |
+| CLI (migrations) | [`cmd/postgremq/`](./cmd/postgremq/README.md) | `go install postgremq.dev/cmd/postgremq@latest` |
 
 Requirements: PostgreSQL 15+. Go 1.25+, Node.js 22+ or Rust 1.94+ for the
 clients.
+
+Each component has its own version and changelog, and the clients check the
+database's protocol version when they connect; see [RELEASE.md](./RELEASE.md).
 
 ## Quick start
 

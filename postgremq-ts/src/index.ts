@@ -34,10 +34,14 @@ export {
   ConnectionClosedError,
   QueueFatalError,
   DirtySchemaError,
+  CompatibilityError,
   ErrCodeLeaseLost,
   ErrCodeQueueNotFound,
   ErrCodeValidation,
 } from './errors';
+
+// Protocol compatibility metadata.
+export { SUPPORTED_PROTOCOL_MAJORS } from './protocol';
 
 // Schema migrations (compatible with the Go client and the CLI).
 export { migrate, getMigrationStatus, MigrationStatus } from './migrate';
@@ -53,7 +57,13 @@ import { ConnectionOptions } from './types';
  */
 export async function connect(options: ConnectionOptions = {}): Promise<ConnectionImpl> {
   const client = new ConnectionImpl(options);
-  await client.connect();
+  try {
+    await client.connect();
+  } catch (err) {
+    // Close what the connection created (its own pool, when it owns one).
+    await client.close().catch(() => {});
+    throw err;
+  }
   return client;
 }
 

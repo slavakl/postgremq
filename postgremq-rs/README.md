@@ -1,6 +1,6 @@
 # postgremq
 
-Rust client for [PostgreMQ](https://github.com/slavakl/postgremq), a message
+Rust client for [PostgreMQ](https://github.com/postgremq/postgremq), a message
 queue that lives in PostgreSQL. Topics fan out to queues; each delivery is
 leased with a visibility timeout and fenced by a per-claim token; deliveries
 that exhaust their attempts move to a dead letter queue; `LISTEN`/`NOTIFY`
@@ -8,7 +8,7 @@ wakes consumers, with polling as the fallback. Publishing and acknowledging
 can run inside the application's own transaction.
 
 The crate is built on `sqlx` 0.9 (Postgres, rustls) and Tokio. It follows the
-shared [delivery lifecycle contract](https://github.com/slavakl/postgremq/blob/main/docs/delivery-lifecycle.md)
+shared [delivery lifecycle contract](https://github.com/postgremq/postgremq/blob/main/docs/delivery-lifecycle.md)
 of the PostgreMQ clients.
 
 ## Installation
@@ -41,14 +41,14 @@ assert!(!status.needs_migration);
 
 `migrate` only goes up, to the latest version in this crate. It uses the same
 version table and advisory lock as the Go client and the
-[migration CLI](https://github.com/slavakl/postgremq/blob/main/cmd/postgremq/README.md),
+[migration CLI](https://github.com/postgremq/postgremq/blob/main/cmd/postgremq/README.md),
 so concurrent callers are safe and any of them can upgrade a database another
 one installed. A database already at a newer version (migrated by a newer
 release) is left unchanged. A dirty database (a migration failed partway) is
 `Error::DirtySchema`. `migrate` creates the `postgremq` schema when it is
 missing, which needs the `CREATE` privilege on the database. You can also
 install the schema from
-[`mq/sql/latest.sql`](https://github.com/slavakl/postgremq/blob/main/mq/sql/latest.sql)
+[`mq/sql/latest.sql`](https://github.com/postgremq/postgremq/blob/main/mq/sql/latest.sql)
 or with the CLI. `latest.sql` is for fresh databases only (it refuses to run
 on an existing installation) and records the version it installs, so `migrate`
 can upgrade it later.
@@ -81,8 +81,19 @@ conn.close().await;
 ## Connecting
 
 `Connection::connect(url, options)` creates a pool that the connection owns
-and closes in `close`. `Connection::from_pool(pool, options)` uses an existing
-`PgPool`, which it never closes; it must be called inside a Tokio runtime.
+and closes in `close`. `Connection::from_pool(pool, options).await` uses an
+existing `PgPool`, which it never closes; it must be called inside a Tokio
+runtime.
+
+Both read `postgremq.info()` and check that the installation speaks a
+protocol major this client implements (`postgremq::SUPPORTED_PROTOCOL_MAJORS`,
+currently `[1]`). Otherwise they return `Error::Incompatible` with the
+database version, its protocol major and the supported majors; a database
+without `info()` (not installed, or older than discovery) gets it too, with
+the database error as its source, meaning it needs an installation or
+upgrade. Connection and permission errors are returned as they are. Within a
+supported major, a function the installation lacks fails with the database's
+error (SQLSTATE `42883`, `Error::Sqlx`) like any other.
 `Connection` is cheap to clone: clones share the pool, one `LISTEN` session and
 the two background schedulers (lease renewal and queue keep-alive).
 `Connection::pool()` returns the pool, e.g. to begin a transaction.
@@ -155,7 +166,7 @@ whose deadline passes, is gone (see [Queue gone](#queue-gone)).
 `Error::Validation` while it has dead-letter entries; a queue that does not
 exist is not an error); `delete_topic` deletes a topic that has no messages. Topic and queue names are limited to 57 ASCII
 bytes (PostgreSQL channel names, see the
-[SQL README](https://github.com/slavakl/postgremq/blob/main/mq/README.md)).
+[SQL README](https://github.com/postgremq/postgremq/blob/main/mq/README.md)).
 
 ## Publishing
 
@@ -218,7 +229,7 @@ the group. Publishers of one group are serialized by the database, so a group
 should be something like a session or an order, not a hot shared key. A
 buffered group head blocks its group for every consumer until processed, so
 keep `batch_size` small when groups move slowly. See the
-[SQL README](https://github.com/slavakl/postgremq/blob/main/mq/README.md#message-groups)
+[SQL README](https://github.com/postgremq/postgremq/blob/main/mq/README.md#message-groups)
 for the full contract.
 
 ```rust,no_run
@@ -514,7 +525,7 @@ SQLSTATE when the error came from the database.
 
 The schema does not schedule its own maintenance. Run these periodically from
 one place, as described in the
-[SQL README](https://github.com/slavakl/postgremq/blob/main/mq/README.md#maintenance-and-retention):
+[SQL README](https://github.com/postgremq/postgremq/blob/main/mq/README.md#maintenance-and-retention):
 
 ```rust,no_run
 # async fn example(conn: postgremq::Connection) -> postgremq::Result<()> {
@@ -550,7 +561,7 @@ With the `otel` feature, `ConnectionOptions::meter_provider(&provider)` records
 the PostgreMQ client metrics (operation and handler durations, sent and
 consumed messages, active handlers, lost renewals) under the instrumentation
 scope `postgremq`, contract version 1, defined in
-[`docs/observability.md`](https://github.com/slavakl/postgremq/blob/main/docs/observability.md).
+[`docs/observability.md`](https://github.com/postgremq/postgremq/blob/main/docs/observability.md).
 Nothing is recorded without `meter_provider`, even when a global provider is
 set; pass `opentelemetry::global::meter_provider()` to use that one.
 
@@ -578,9 +589,9 @@ tokio::task::spawn_blocking(move || provider.force_flush()).await??;
 # }
 ```
 
-[`examples/metrics.rs`](https://github.com/slavakl/postgremq/blob/main/postgremq-rs/examples/metrics.rs)
+[`examples/metrics.rs`](https://github.com/postgremq/postgremq/blob/main/postgremq-rs/examples/metrics.rs)
 exports over OTLP/HTTP to the Collector of
-[`observability/compose.yaml`](https://github.com/slavakl/postgremq/blob/main/observability/compose.yaml):
+[`observability/compose.yaml`](https://github.com/postgremq/postgremq/blob/main/observability/compose.yaml):
 
 ```sh
 cargo run --example metrics --features otel
@@ -596,7 +607,7 @@ clock skew does not shorten leases.
 ## Running the tests
 
 The integration tests live in the
-[repository](https://github.com/slavakl/postgremq/tree/main/postgremq-rs/tests)
+[repository](https://github.com/postgremq/postgremq/tree/main/postgremq-rs/tests)
 and are not part of the published crate; they load `mq/sql/latest.sql` from
 the checkout. From `postgremq-rs/`:
 

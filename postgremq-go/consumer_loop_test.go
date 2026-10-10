@@ -1,6 +1,6 @@
 // Single-loop consumer tests: head-of-line behavior under a slow /
 // non-reading consumer, and Stop()/Close() shutdown races.
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -22,7 +22,7 @@ func TestConsumerStopWhenDeliveryBlocked(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -66,7 +66,7 @@ func TestConsumerSlowReaderDeliversAll(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -106,7 +106,7 @@ func TestConsumerStopCloseRace(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 
 	require.NoError(t, conn.CreateTopic(ctx, "topic"))

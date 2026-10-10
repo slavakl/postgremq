@@ -7,13 +7,13 @@ Requirements: Go 1.25+, PostgreSQL 15+.
 ## Installation
 
 ```bash
-go get github.com/slavakl/postgremq/postgremq-go
+go get postgremq.dev/postgremq-go
 ```
 
-The package name is `postgremq_go`; import it with an alias:
+The package name is `postgremq`:
 
 ```go
-import postgremq "github.com/slavakl/postgremq/postgremq-go"
+import "postgremq.dev/postgremq-go"
 ```
 
 Install the SQL schema in the same database as your application. All queue objects live in the fixed `postgremq` schema, and the client schema-qualifies every call, so your `search_path` is never changed. Install it with one of:
@@ -37,7 +37,7 @@ import (
 	"log"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 )
 
 func main() {
@@ -87,10 +87,12 @@ Runnable programs are in [examples/](examples/README.md).
 
 ## Connecting
 
-- `Dial(ctx, *pgxpool.Config, opts...)` creates and owns a `pgxpool.Pool`; `Close` closes it. `ctx` only bounds pool creation.
-- `DialFromPool(pool, opts...)` uses an existing pool (a `Pool` implementation, normally `*pgxpool.Pool`). `Close` leaves the pool open; close the `Connection` before the pool, since its `LISTEN` session holds a pooled connection until `Connection.Close`. A pool with `MaxConns` 1 is starved by that session.
+- `Dial(ctx, *pgxpool.Config, opts...)` creates and owns a `pgxpool.Pool`; `Close` closes it. `ctx` only bounds pool creation and the protocol check.
+- `DialFromPool(ctx, pool, opts...)` uses an existing pool (a `Pool` implementation, normally `*pgxpool.Pool`). `Close` leaves the pool open; close the `Connection` before the pool, since its `LISTEN` session holds a pooled connection until `Connection.Close`. A pool with `MaxConns` 1 is starved by that session.
 
 From its first `Consume` or `ConsumeHandler` until `Close`, each `Connection` holds one pooled connection for `LISTEN` (shared by all its consumers), so size the pool for that plus publish, consume, settle and heartbeat traffic. `LISTEN` needs session affinity and does not work through a transaction-mode pooler. If the session fails, the client closes that connection and reconnects after a delay that starts at 1 second and grows ×1.5 per attempt up to 30 seconds. Notifications sent while it is disconnected are lost; consumers still poll every `WithCheckTimeout`. Connection methods are safe for concurrent use.
+
+On connect, `Dial` and `DialFromPool` read `postgremq.info()` and check that the installation speaks a protocol major this client implements (`postgremq.SupportedProtocolMajors()`, currently `[1]`). Otherwise they return a `*postgremq.CompatibilityError` (`errors.Is(err, postgremq.ErrIncompatibleSchema)`) with the database version, its protocol major and the supported majors; a database without `info()` (not installed, or older than discovery) gets the same error saying it needs an installation or upgrade. Connection and permission errors are returned as they are. Within a supported major, a function the installation lacks fails with the database's error (SQLSTATE `42883`) like any other.
 
 | Connection option | Default | Effect |
 |---|---|---|

@@ -2,14 +2,14 @@
 // Pure unit tests — no DB, no goroutines — so they run as part of every
 // `go test` without testcontainer overhead.
 
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"strings"
 	"testing"
 	"time"
 
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

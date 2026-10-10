@@ -1,16 +1,17 @@
 name: SQL Tests
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'mq/**'
-      - '.github/workflows/sql-tests.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'mq/**'
       - '.github/workflows/sql-tests.yml'
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to test (default: the triggering commit)"
+        type: string
+        default: ''
 
 jobs:
   test:
@@ -20,6 +21,9 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
 
     - name: Set up Python
       uses: actions/setup-python@v5

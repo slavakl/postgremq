@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
 import { migrate, getMigrationStatus, migrationLockId } from '../../migrate';
-import { MIGRATIONS } from '../../migrations.generated';
+import { MIGRATIONS, MQ_VERSION } from '../../migrations.generated';
 import { DirtySchemaError } from '../../errors';
 import { Connection } from '../../connection';
 import { createEmptyTestDatabase, createIsolatedTestConnection, getSharedTestDatabase, TestDatabase } from '../helpers';
@@ -37,14 +37,19 @@ async function advisoryLocksHeld(pool: Pool): Promise<number> {
 const latest = Math.max(...MIGRATIONS.map((m) => m.version));
 
 describe('embedded migrations', () => {
-  test('match mq/migrations byte for byte', () => {
+  test('are the pinned mq release\'s migrations, byte for byte', () => {
+    const { bundledMigrations } = require('../../../scripts/embed-migrations.js');
+    const { migrations } = bundledMigrations();
     const dir = path.join(__dirname, '../../../../mq/migrations');
-    const files = fs.readdirSync(dir).filter((f) => f.endsWith('.up.sql')).sort();
-    expect(MIGRATIONS.map((m) => `${String(m.version).padStart(6, '0')}_${m.name}.up.sql`)).toEqual(files);
-    for (const m of MIGRATIONS) {
-      const file = files.find((f) => f.startsWith(String(m.version).padStart(6, '0') + '_'))!;
-      expect(m.sql).toBe(fs.readFileSync(path.join(dir, file), 'utf8'));
+    expect(MIGRATIONS.map((m) => m.version)).toEqual(migrations.map((m: { version: number }) => m.version));
+    for (const m of migrations) {
+      const embedded = MIGRATIONS.find((e) => e.version === m.version)!;
+      expect(embedded.sql).toBe(fs.readFileSync(path.join(dir, m.file), 'utf8'));
     }
+    const all = fs.readdirSync(dir).filter((f) => /^\d+_.+\.up\.sql$/.test(f));
+    const stamp = all.find((f) => f.endsWith(`_release_v${MQ_VERSION.replace(/[^0-9A-Za-z]/g, '_')}.up.sql`));
+    // Released pin: up to its stamp. Unreleased pin: every migration.
+    expect(MIGRATIONS.length).toBe(stamp ? Number(stamp.split('_')[0]) : all.length);
   });
 
   test('the advisory lock id matches golang-migrate', () => {
@@ -127,6 +132,8 @@ describe('migrate', () => {
   test('concurrent callers in separate pools are serialised', async () => {
     const { connectionString } = await emptyDatabase();
     const pools = [0, 1, 2].map(() => new Pool({ connectionString, max: 2 }));
+    // Closing clients may be terminated by the database drop in afterEach.
+    for (const p of pools) p.on('error', () => {});
     try {
       await Promise.all(pools.map((p) => migrate(p)));
       const status = await getMigrationStatus(pools[0]);

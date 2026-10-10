@@ -126,6 +126,26 @@ pub enum Error {
     #[error("payload serialization failed")]
     Payload(#[source] serde_json::Error),
 
+    /// The database's PostgreMQ installation is not compatible with this
+    /// client: its protocol major is not in
+    /// [`SUPPORTED_PROTOCOL_MAJORS`](crate::SUPPORTED_PROTOCOL_MAJORS) (the
+    /// message lists them), or it has no discovery function
+    /// (`postgremq.info()`) and needs an installation or upgrade (then
+    /// `source` is the database error).
+    #[error("{}", incompatible_message(db_version.as_deref(), *protocol_major, source.is_some()))]
+    #[non_exhaustive]
+    Incompatible {
+        /// The installed implementation version; `None` when discovery is
+        /// missing.
+        db_version: Option<String>,
+        /// The installation's protocol major; `None` when discovery is
+        /// missing or reports none, or not a valid major.
+        protocol_major: Option<u32>,
+        /// The database error when discovery is missing.
+        #[source]
+        source: Option<sqlx::Error>,
+    },
+
     /// [`migrate`](crate::migrate) found the schema version marked dirty: a
     /// migration failed partway, so the schema needs manual repair before
     /// the dirty flag in `postgremq.postgremq_migrations` is cleared.
@@ -163,6 +183,7 @@ pub enum Error {
 ///         postgremq::ErrorKind::QueueGone => "gone",
 ///         postgremq::ErrorKind::Payload => "payload",
 ///         postgremq::ErrorKind::DirtySchema => "dirty schema",
+///         postgremq::ErrorKind::Incompatible => "incompatible",
 ///         postgremq::ErrorKind::Sqlx => "database",
 ///         postgremq::ErrorKind::Closed => "closed",
 ///     }
@@ -185,6 +206,8 @@ pub enum ErrorKind {
     Payload,
     /// See [`Error::DirtySchema`].
     DirtySchema,
+    /// See [`Error::Incompatible`].
+    Incompatible,
     /// See [`Error::Sqlx`].
     Sqlx,
     /// See [`Error::Closed`].
@@ -242,6 +265,7 @@ impl Error {
             Self::QueueGone { .. } => ErrorKind::QueueGone,
             Self::Payload(_) => ErrorKind::Payload,
             Self::DirtySchema { .. } => ErrorKind::DirtySchema,
+            Self::Incompatible { .. } => ErrorKind::Incompatible,
             Self::Sqlx(_) => ErrorKind::Sqlx,
             Self::Closed => ErrorKind::Closed,
         }
@@ -254,7 +278,8 @@ impl Error {
             Self::Sqlx(err) | Self::Busy { source: err } => sqlstate_of(err),
             Self::LeaseLost { source }
             | Self::QueueNotFound { source, .. }
-            | Self::Validation { source, .. } => source.as_ref().and_then(sqlstate_of),
+            | Self::Validation { source, .. }
+            | Self::Incompatible { source, .. } => source.as_ref().and_then(sqlstate_of),
             Self::QueueGone { .. } | Self::Payload(_) | Self::DirtySchema { .. } | Self::Closed => {
                 None
             }
@@ -273,6 +298,24 @@ impl Error {
     pub(crate) fn already_settled() -> Self {
         Self::LeaseLost { source: None }
     }
+}
+
+fn incompatible_message(
+    db_version: Option<&str>,
+    protocol_major: Option<u32>,
+    discovery_missing: bool,
+) -> String {
+    let supported = crate::SUPPORTED_PROTOCOL_MAJORS;
+    if discovery_missing {
+        return format!(
+            "postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports protocol majors {supported:?})"
+        );
+    }
+    let major = protocol_major.map_or_else(|| "none".to_owned(), |major| major.to_string());
+    format!(
+        "the database's PostgreMQ {} uses protocol major {major}; this client supports {supported:?}",
+        db_version.unwrap_or("(unknown version)")
+    )
 }
 
 /// The SQLSTATE of a database error.

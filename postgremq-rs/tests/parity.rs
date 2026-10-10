@@ -28,7 +28,7 @@ fn nz(n: u32) -> NonZeroU32 {
 }
 
 async fn setup(db: &TestDb, options: QueueOptions) -> (Connection, String, String) {
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -135,7 +135,7 @@ async fn admin_operations_round_trip() {
 #[tokio::test(flavor = "multi_thread")]
 async fn fan_out_deliveries_are_keyed_per_queue() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let (q1, q2) = (unique("q"), unique("q"));
     conn.create_topic(&topic).await.unwrap();
@@ -172,12 +172,14 @@ async fn fan_out_deliveries_are_keyed_per_queue() {
 async fn a_gone_queue_fails_every_consumer_on_it_once() {
     let db = TestDb::new().await;
     let hooks = Arc::new(AtomicUsize::new(0));
-    let conn = db.connect(ConnectionOptions::default().on_queue_fatal({
-        let hooks = Arc::clone(&hooks);
-        move |_, _| {
-            hooks.fetch_add(1, Ordering::SeqCst);
-        }
-    }));
+    let conn = db
+        .connect(ConnectionOptions::default().on_queue_fatal({
+            let hooks = Arc::clone(&hooks);
+            move |_, _| {
+                hooks.fetch_add(1, Ordering::SeqCst);
+            }
+        }))
+        .await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -215,7 +217,7 @@ async fn a_gone_queue_fails_every_consumer_on_it_once() {
         .unwrap();
     within(5, handled.notified()).await;
 
-    let other = db.connect(ConnectionOptions::default());
+    let other = db.connect(ConnectionOptions::default()).await;
     other.delete_queue(&queue).await.unwrap();
 
     for consumer in [&mut c1, &mut c2] {
@@ -342,7 +344,7 @@ async fn nack_and_release_wake_other_consumers() {
         .check_timeout(Duration::from_secs(30));
     let mut holder = conn.consume(&queue, slow_poll.clone()).await.unwrap();
     let held = next(&mut holder).await;
-    let other = db.connect(ConnectionOptions::default());
+    let other = db.connect(ConnectionOptions::default()).await;
     let mut waiter = other.consume(&queue, slow_poll).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await; // idle after its first fetch
 
@@ -571,7 +573,9 @@ async fn a_stopped_stream_ends_without_an_error() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_panicking_queue_fatal_hook_does_not_break_the_connection() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default().on_queue_fatal(|_, _| panic!("hook panic")));
+    let conn = db
+        .connect(ConnectionOptions::default().on_queue_fatal(|_, _| panic!("hook panic")))
+        .await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -674,12 +678,14 @@ async fn a_select_loop_over_next_loses_nothing() {
 async fn deleting_an_exclusive_queue_does_not_signal_it_as_fatal() {
     let db = TestDb::new().await;
     let hooks = Arc::new(AtomicUsize::new(0));
-    let conn = db.connect(ConnectionOptions::default().on_queue_fatal({
-        let hooks = Arc::clone(&hooks);
-        move |_, _| {
-            hooks.fetch_add(1, Ordering::SeqCst);
-        }
-    }));
+    let conn = db
+        .connect(ConnectionOptions::default().on_queue_fatal({
+            let hooks = Arc::clone(&hooks);
+            move |_, _| {
+                hooks.fetch_add(1, Ordering::SeqCst);
+            }
+        }))
+        .await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();

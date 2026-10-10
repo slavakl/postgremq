@@ -1,4 +1,4 @@
-// Package postgremq_go provides a Go client for PostgreMQ, a message queue that
+// Package postgremq provides a Go client for PostgreMQ, a message queue that
 // runs inside PostgreSQL.
 //
 // # Overview
@@ -49,9 +49,9 @@
 //		log.Fatal(err)
 //	}
 //
-// The package name is postgremq_go; import it with an alias:
+// Import it as:
 //
-//	import postgremq "github.com/slavakl/postgremq/postgremq-go"
+//	import "postgremq.dev/postgremq-go" // package postgremq
 //
 // # Publishing Messages
 //
@@ -312,4 +312,4 @@
 // Several consumers can consume from the same queue: each claim locks the rows
 // it takes with FOR UPDATE SKIP LOCKED, so a message is claimed by one consumer
 // at a time.
-package postgremq_go
+package postgremq

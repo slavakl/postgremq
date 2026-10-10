@@ -1,7 +1,7 @@
 // Connection tests cover lifecycle (dial/close), configuration, topic/queue
 // CRUD, keep‑alive behavior, publishing, DLQ operations, administrative listing
 // helpers, and queue statistics.
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
@@ -15,7 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -47,7 +47,21 @@ func (m *MockPool) Query(ctx context.Context, sql string, args ...interface{}) (
 	return nil, nil
 }
 
+// discoverySQL is the protocol check Dial and DialFromPool run first.
+const discoverySQL = "SELECT postgremq.info()"
+
+// discoveryRow answers the protocol check in pool test doubles.
+type discoveryRow struct{}
+
+func (discoveryRow) Scan(dest ...any) error {
+	*(dest[0].(*[]byte)) = []byte(`{"db_version": "0.1.0", "protocol_major": 1}`)
+	return nil
+}
+
 func (m *MockPool) QueryRow(ctx context.Context, sql string, args ...interface{}) pgx.Row {
+	if sql == discoverySQL {
+		return discoveryRow{}
+	}
 	if m.QueryRowFunc != nil {
 		return m.QueryRowFunc(ctx, sql, args...)
 	}
@@ -127,7 +141,7 @@ func TestConnectionEstablishment(t *testing.T) {
 	defer pool.Close()
 
 	// Create a new connection
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 
 	// Verify connection works by creating a topic
@@ -154,7 +168,7 @@ func TestConsumeAfterCloseReturnsError(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 
 	require.NoError(t, conn.CreateTopic(ctx, "afterclose_topic"))
@@ -184,7 +198,7 @@ func TestConnectionConfigOptions(t *testing.T) {
 	}
 
 	// Create connection with options
-	conn, err := postgremq.DialFromPool(pool,
+	conn, err := postgremq.DialFromPool(context.Background(), pool,
 		postgremq.WithLogger(logger),
 		postgremq.WithShutdownTimeout(2*time.Second),
 		postgremq.WithRetryConfig(postgremq.RetryConfig{
@@ -211,7 +225,7 @@ func TestTopicCreationAndDeletion(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -253,7 +267,7 @@ func TestQueueCreationAndDeletion(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -321,7 +335,7 @@ func TestConnectionKeepAlive(t *testing.T) {
 	defer pool.Close()
 
 	// Create connection
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -378,7 +392,7 @@ func TestMessagePublishing(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -436,7 +450,7 @@ func TestDLQOperations(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -555,7 +569,7 @@ func TestAdministrativeOperations(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -715,7 +729,7 @@ func TestListTopics(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -760,7 +774,7 @@ func TestListQueues(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -848,7 +862,7 @@ func TestQueueStatistics(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -958,7 +972,7 @@ func TestMessageOperations(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1030,7 +1044,7 @@ func TestQueueCleanup(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1097,7 +1111,7 @@ func TestCleanupCompletedMessages(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1193,7 +1207,7 @@ func TestTopicCleanup(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1261,7 +1275,7 @@ func TestDLQOperationsAdmin(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1407,7 +1421,7 @@ func TestPurgeAllMessages(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1493,7 +1507,7 @@ func TestDeleteInactiveQueues(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 
@@ -1533,7 +1547,7 @@ func TestDeleteInactiveQueues(t *testing.T) {
 	// period (delete_inactive_queues only reaps queues expired > 5s).
 	time.Sleep(8 * time.Second)
 
-	conn, err = postgremq.DialFromPool(pool)
+	conn, err = postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 
 	// Now call DeleteInactiveQueues
@@ -1556,7 +1570,7 @@ func TestPublishWithTx(t *testing.T) {
 
 	// Test Case 1: Successful commit
 	t.Run("CommitTransaction", func(t *testing.T) {
-		conn, err := postgremq.DialFromPool(pool)
+		conn, err := postgremq.DialFromPool(context.Background(), pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 
@@ -1618,7 +1632,7 @@ func TestPublishWithTx(t *testing.T) {
 	t.Run("RollbackTransaction", func(t *testing.T) {
 		cleanTestData(t, pool, ctx)
 
-		conn, err := postgremq.DialFromPool(pool)
+		conn, err := postgremq.DialFromPool(context.Background(), pool)
 		require.NoError(t, err, "Failed to create connection")
 		defer conn.Close()
 

@@ -75,7 +75,7 @@ async fn installs_a_usable_schema_and_records_the_version_like_golang_migrate() 
     );
     assert_eq!(advisory_locks_held(&db.pool).await, 0);
 
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();

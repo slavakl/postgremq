@@ -1,209 +1,292 @@
-# Release Process
+# Releasing PostgreMQ
 
-How PostgreMQ's components are versioned and published.
+PostgreMQ's components are versioned and released independently, by
+[Release Please](https://github.com/googleapis/release-please) running in
+`.github/workflows/release.yml`. Releasing a component means merging its
+release PR; tags, GitHub releases and registry publishing follow
+automatically.
 
 ## Components
 
-| Component | Published as | Tag |
-|-----------|--------------|-----|
-| SQL schema (`mq/`) | Go module `github.com/slavakl/postgremq/mq` (embeds `sql/latest.sql` and `migrations/`) | `mq/vX.Y.Z` |
-| Go client (`postgremq-go/`) | Go module `github.com/slavakl/postgremq/postgremq-go` | `postgremq-go/vX.Y.Z` |
-| CLI (`cmd/postgremq/`) | Go module `github.com/slavakl/postgremq/cmd/postgremq` | `cmd/postgremq/vX.Y.Z` |
-| TypeScript client (`postgremq-ts/`) | npm package `postgremq` | covered by `vX.Y.Z` |
-| Rust client (`postgremq-rs/`) | crates.io crate `postgremq` | covered by `vX.Y.Z` |
+| Component | Directory | Version source | Tag | Published as |
+|-----------|-----------|----------------|-----|--------------|
+| SQL implementation and Go `mq` module | `mq/` | `mq/VERSION` | `mq/vX.Y.Z` | Go module `postgremq.dev/mq` (embeds `sql/latest.sql` and `migrations/`) |
+| Go client | `postgremq-go/` | the tag | `postgremq-go/vX.Y.Z` | Go module `postgremq.dev/postgremq-go` (package `postgremq`) |
+| CLI | `cmd/postgremq/` | the tag | `cmd/postgremq/vX.Y.Z` | Go module `postgremq.dev/cmd/postgremq` |
+| Rust client | `postgremq-rs/` | `Cargo.toml` | `rust/vX.Y.Z` | crates.io crate `postgremq` |
+| TypeScript client | `postgremq-ts/` | `package.json` | `npm/vX.Y.Z` | npm package `postgremq` |
 
-All components share one version number and are released together. The
-repository tag `vX.Y.Z` marks the release; the Go modules also need their
-path-prefixed tags, because Go resolves a module in a subdirectory only from
-tags carrying that prefix.
+`release-please-config.json` defines them; `.release-please-manifest.json`
+holds each one's last released version. Release Please assigns commits to
+components by the paths they change. Changes outside these directories (docs,
+`observability/`, CI) release nothing.
 
-The first public release is **0.2.0**: the npm name `postgremq` already has a
-0.1.0 release, so every component starts at 0.2.0 to stay aligned.
+## Versioning rules
 
-## Versioning
+- Semantic versioning per component. Client versions describe the public
+  language API; the SQL version describes the database implementation
+  (migrations, fixes, features). Versions need not match across components.
+- After 1.0: incompatible API changes bump MAJOR, compatible features MINOR,
+  fixes PATCH.
+- Before 1.0 (now): a breaking change bumps MINOR, as does a feature
+  (`bump-minor-pre-major: true`, `bump-patch-for-minor-pre-major: false`); a
+  fix bumps PATCH. Breaking changes are listed under **⚠ BREAKING CHANGES** in
+  the release notes, from the commit's `!` or `BREAKING CHANGE:` footer.
+- Published versions and tags are immutable. A correction is a new release.
 
-PostgreMQ follows [Semantic Versioning](https://semver.org/). Before 1.0, a
-MINOR bump may contain breaking changes; they are listed under a **Breaking**
-heading in `CHANGELOG.md`.
+## The SQL implementation
 
-### The SQL schema
+### Protocol major and discovery
 
-`mq/sql/latest.sql` is the complete current schema, used for fresh installs.
-`mq/migrations/` holds the same schema as numbered
-[golang-migrate](https://github.com/golang-migrate/migrate) migrations, used to
-upgrade existing installs. Every client applies them (Go `Migrate`, TypeScript
-`migrate`, Rust `migrate`), as does the CLI's `migrate` command. Each embeds the
-files at build time:
+The protocol major is the contract clients rely on: SQL function signatures,
+result types, error codes, ownership rules and delivery semantics. It is
+currently **1**. Additive changes (a new function, an added optional
+parameter with a default, an added result field) keep it; incompatible ones
+need a new major.
 
-- Go: the `mq` module, with `go:embed`.
-- TypeScript: `scripts/embed-migrations.js` generates
-  `src/migrations.generated.ts` (not committed) on `npm ci` / `npm install`
-  (`prepare`), before `tsc` (`npm run build`) and before Jest.
-- Rust: `postgremq-rs/migrations` is a symlink to `mq/migrations`, which
-  `cargo package` follows. A new migration also needs an entry in `MIGRATIONS`
-  in `postgremq-rs/src/migrate.rs`; a unit test fails until it has one.
-
-- `latest.sql` is a fresh-install script: a guard at the top refuses to run
-  when `postgremq.postgremq_migrations` exists, and the end creates that table
-  and records the latest migration's version. Until the first release,
-  `000001_initial_schema.up.sql` is edited in place and equals `latest.sql`
-  without the guard and the version stamp. The SQL test suite checks that a
-  fresh `latest.sql` install and a database migrated through every migration
-  have identical schema dumps and version rows.
-- After a release, published migrations are never edited. Each schema change
-  adds a new `0000NN_<name>.up.sql` and the same change is applied to
-  `latest.sql`, so that a fresh `latest.sql` install equals the result of
-  running every migration, and the version `latest.sql` records at its end is
-  raised to the new migration's number (both checked by the SQL test suite).
-- Migrations only go up, always to the latest migration the client embeds;
-  there is no target version. A database already at a newer version (migrated
-  by a newer release) is left unchanged. Each `.down.sql` is a comment-only
-  placeholder that no client runs. Removing an installation is
-  `DROP SCHEMA postgremq CASCADE`.
-- A schema change that existing clients cannot work with is a breaking
-  change for every component.
-
-## One-time setup for the new repository
-
-The code currently uses the module path `github.com/slavakl/postgremq`. Before
-the first release from a new repository:
-
-1. **Rename the module path** if the repository lives elsewhere (replace
-   `NEW` with the new path, e.g. `github.com/acme/postgremq`):
-
-   ```bash
-   git grep -l 'github.com/slavakl/postgremq' \
-     | xargs sed -i '' 's#github.com/slavakl/postgremq#NEW#g'   # GNU sed: sed -i
-   ```
-
-   This covers the Go module paths and imports, `go.mod` replace directives,
-   `package.json` (`repository`, `bugs`, `homepage`), `Cargo.toml`
-   (`repository`), and links and badges in the documentation. Then run
-   `go mod tidy` in `mq/`, `postgremq-go/`, `postgremq-go/examples/metrics/`
-   and `cmd/postgremq/`, and `go work sync` at the root.
-2. **Repository settings**: enable private vulnerability reporting
-   (Security → Settings), which `SECURITY.md` relies on; protect `main`
-   (required CI checks, reviews); set the description and topics; enable
-   Dependabot alerts.
-3. **Registry accounts**: an npm account that owns `postgremq`, and a
-   crates.io account (the first `cargo publish` claims the crate name).
-4. Search once more for leftovers: `git grep -n 'slavakl'`.
-
-## Pre-release checklist
-
-- [ ] CI is green on `main` (SQL, Go, TypeScript, Rust, observability).
-- [ ] `CHANGELOG.md`: move the `Unreleased` entries under `## [X.Y.Z] - YYYY-MM-DD`.
-- [ ] Versions bumped:
-  - `postgremq-ts/package.json` and `package-lock.json` (`npm version X.Y.Z --no-git-tag-version`);
-  - `postgremq-rs/Cargo.toml` (and `Cargo.lock` via `cargo update -p postgremq`);
-  - version numbers in install snippets in the READMEs.
-- [ ] If the schema changed since the last release, a new migration exists
-  and matches `latest.sql` (see above).
-- [ ] Vulnerability scans are clean:
-  ```bash
-  (cd postgremq-go && govulncheck ./...)
-  (cd cmd/postgremq && govulncheck ./...)
-  (cd postgremq-ts && npm audit --omit=dev)
-  (cd postgremq-rs && cargo audit)
-  ```
-- [ ] Packages build and contain what they should:
-  ```bash
-  (cd postgremq-ts && npm pack --dry-run)
-  (cd postgremq-rs && cargo package --list && cargo publish --dry-run)
-  ```
-
-## Publishing
-
-Release from an up-to-date `main` after the release commit is merged. Each
-block below starts at the repository root. With `main` protected, every commit
-goes through a pull request; tags are pushed on the merged commit.
-
-### 1. Go modules, in dependency order
-
-The Go modules depend on each other (`cmd/postgremq` → `postgremq-go` →
-`mq`). Locally the `go.work` workspace and `replace` directives point them at
-each other's directories. Published versions must require tagged versions.
-`go install …@version` also refuses a module whose `go.mod` has `replace`
-directives.
-
-```bash
-# 1. The SQL module: tag main as it is.
-git tag mq/vX.Y.Z && git push origin mq/vX.Y.Z
-
-# 2. The client: require the tagged mq in a PR; after it merges, tag the merge.
-git switch -c release/go-vX.Y.Z
-(cd postgremq-go \
-  && go mod edit -require=github.com/slavakl/postgremq/mq@vX.Y.Z \
-  && GOWORK=off go mod tidy && GOWORK=off go test ./...)
-git commit -am "chore(go): require mq vX.Y.Z"   # open a PR, merge it, then:
-git switch main && git pull
-git tag postgremq-go/vX.Y.Z && git push origin postgremq-go/vX.Y.Z
-
-# 3. The CLI: require the tagged modules and drop its replace directives in a
-#    PR; after it merges, tag the merge.
-git switch -c release/cli-vX.Y.Z
-(cd cmd/postgremq \
-  && go mod edit -dropreplace=github.com/slavakl/postgremq/postgremq-go \
-                 -dropreplace=github.com/slavakl/postgremq/mq \
-                 -require=github.com/slavakl/postgremq/postgremq-go@vX.Y.Z \
-                 -require=github.com/slavakl/postgremq/mq@vX.Y.Z \
-  && GOWORK=off GOPROXY=direct go mod tidy && GOWORK=off go build ./...)
-git commit -am "chore(cli): require postgremq-go vX.Y.Z"   # PR, merge, then:
-git switch main && git pull
-git tag cmd/postgremq/vX.Y.Z && git push origin cmd/postgremq/vX.Y.Z
+```sql
+SELECT postgremq.info();
+-- {"db_version": "0.2.0", "protocol_major": 1}
 ```
 
-After the CLI drops its `replace` directives, local development still resolves
-both modules from the working tree through `go.work`.
+`postgremq.info()` and its two fields are stable across protocol majors;
+fields may be added. Each client declares the majors it implements
+(`SupportedProtocolMajors()` in Go, `SUPPORTED_PROTOCOL_MAJORS` in TypeScript
+and Rust), checks `info()` when it connects, and rejects any other major with
+a typed compatibility error that names the database version, its major and the
+supported majors (Go `*CompatibilityError` / `ErrIncompatibleSchema`,
+TypeScript `CompatibilityError`, Rust `Error::Incompatible`). A database
+without `info()` gets the same error saying it needs an installation or
+upgrade; connection and permission errors keep their real cause. Within a
+supported major, clients call SQL functions directly: a function missing from
+an older installation fails with the database's own error (SQLSTATE 42883),
+through normal error handling. A client may declare a second major only when
+it implements and tests both contracts.
 
-`postgremq-go/go.mod` keeps its `replace` for `mq`: downstream builds ignore
-the `replace` directives of dependencies, and CI tests the module with
-`GOWORK=off`. After a release, verify that the modules resolve:
+### Migrations, latest.sql and the release stamp
+
+- `mq/migrations/` holds numbered [golang-migrate](https://github.com/golang-migrate/migrate)
+  migrations. Released migrations are immutable: a schema or function change
+  adds a new migration. Migration numbers track installation progress, not
+  protocol versions.
+- `mq/sql/latest.sql` is the fresh-install script: everything the migrations
+  produce, in one file. A guard at the top refuses to run when the version
+  table `postgremq.postgremq_migrations` exists (an existing installation is
+  upgraded with the migrations), and the end records the migration number it
+  equals. Change it in the same PR as the migration.
+- `info()`'s `db_version` is the mq release. Feature PRs never set it: when
+  Release Please opens or updates the mq release PR, release.yml's
+  `stamp-mq` job runs `mq/scripts/stamp_release.py X.Y.Z`, which adds the
+  migration `NNNNNN_release_vX_Y_Z.up.sql` (redefining `info()` with the
+  version) and updates `latest.sql` to match. The job re-applies it whenever
+  Release Please rewrites the branch.
+- The SQL test suite (`mq/tests/tests.py`) checks that a fresh `latest.sql`
+  install and a database migrated through every migration have identical
+  schema dumps, version rows and `info()`; that `info()` reports
+  `mq/VERSION`; that stamping keeps both paths equal; that every migration at
+  an `mq/v*` tag in the branch's history is unchanged; and that upgrading from
+  each such release's `latest.sql` equals a fresh install.
+
+## Dependencies between components
+
+A client release ships a released SQL implementation, and the dependency is
+explicit in the client's source:
+
+| Client | Dependency | Where |
+|--------|-----------|-------|
+| Go client | `postgremq.dev/mq` | `postgremq-go/go.mod` (`require`), hashes in `go.sum` |
+| CLI | `postgremq.dev/postgremq-go` | `cmd/postgremq/go.mod` (`require`), hashes in `go.sum` |
+| Rust client | mq version | `[package.metadata.postgremq] mq` in `postgremq-rs/Cargo.toml` |
+| TypeScript client | mq version | `"postgremq": { "mq": … }` in `postgremq-ts/package.json` |
+
+The Rust and TypeScript clients embed the migrations up to and including the
+pinned version's release stamp (`postgremq-rs/build.rs`,
+`postgremq-ts/scripts/embed-migrations.js`); an unreleased pin embeds them all,
+for development. Published modules have no `replace` directives; locally
+`go.work` resolves the Go modules from the working tree.
+
+A release is refused (`scripts/release/verify_release.py`, on the release PR
+and again before tagging) unless its dependency is a released version in the
+branch's history, the Go `go.sum` has its hashes, and the Rust/TypeScript
+embedded migrations are byte-identical to the pinned mq release. So when a
+client needs new SQL: release mq first, then bump the client's dependency in a
+commit that touches the client (which also queues its release):
 
 ```bash
-GOFLAGS=-mod=mod go list -m github.com/slavakl/postgremq/postgremq-go@vX.Y.Z
-go install github.com/slavakl/postgremq/cmd/postgremq@vX.Y.Z
+# Go client (after mq/vX.Y.Z is tagged; resolves through a local module proxy
+# until postgremq.dev discovery is live)
+scripts/release/go-standalone.sh --write postgremq-go go get postgremq.dev/mq@vX.Y.Z
+scripts/release/go-standalone.sh --write postgremq-go go mod tidy
+# CLI, after postgremq-go/vX.Y.Z
+scripts/release/go-standalone.sh --write cmd/postgremq go get postgremq.dev/postgremq-go@vX.Y.Z
+scripts/release/go-standalone.sh --write cmd/postgremq go mod tidy
+# Rust / TypeScript: edit the pin, then commit, e.g.
+#   feat(rs): bundle mq X.Y.Z
 ```
 
-### 2. npm
+A SQL change does not release the clients by itself. A breaking SQL change
+(new protocol major) is breaking for every client and needs their explicit
+updates.
 
-```bash
-(cd postgremq-ts && npm ci && npm test && npm publish)
-# prepublishOnly runs the build; the package ships dist/, README.md and LICENSE
-```
+## Day-to-day development
 
-### 3. crates.io
+- PRs are squash-merged. The PR title becomes the commit message on `main` and
+  must be a [Conventional Commit](https://www.conventionalcommits.org/)
+  (checked by `.github/workflows/pr-title.yml`); see CONTRIBUTING.md for the
+  types and scopes.
+- Feature PRs never change versions, `.release-please-manifest.json`, the
+  component changelogs, or `info()`'s `db_version`.
+- `feat` and `fix` (and `perf`, `revert`, `deps`) appear in release notes;
+  `docs`, `test`, `ci`, `refactor`, `build` and `chore` do not, and do not
+  trigger a release on their own.
 
-```bash
-(cd postgremq-rs && cargo publish)
-```
+## The release pipeline
 
-### 4. Repository tag and GitHub release
+On every push to `main`, `release.yml`:
 
-```bash
-git tag vX.Y.Z && git push origin vX.Y.Z
-```
+1. **Validates** the pushed commit with the reusable test workflows (SQL, Go
+   standalone with `GOWORK=off`, Rust, TypeScript, observability) and
+   `packages.yml` (Go modules installed from an external module through a
+   module proxy, the packed npm package, the packaged crate, each run against
+   a fresh database). The `Validated` job passes only if all of them do.
+2. **Guards** tagging (`scripts/release/check_pending_releases.py`): every
+   merged release PR still labelled `autorelease: pending` must have a merge
+   commit that passed validation (this run, or an earlier run's `Validated`
+   job on that commit) and must pass `verify_release.py` at that commit.
+   Otherwise nothing is tagged and the run fails (see *Correcting a pending
+   release*).
+3. **Tags** each such merge commit and creates its GitHub release with the
+   changelog section as notes (Release Please, `skip-github-pull-request`).
+4. **Opens or updates** one release PR per component with unreleased
+   `feat`/`fix` changes: version bump, `CHANGELOG.md` entry, manifest update
+   (Release Please, `skip-github-release`). `stamp-mq` adds the release stamp
+   to the mq release PR.
+5. **Publishes** each new tag through `publish.yml`.
 
-Create a GitHub release from `vX.Y.Z` with the `CHANGELOG.md` section as its
-notes.
+A failed run tags nothing and opens no PRs. Release boundaries come from the
+last release tag, so the next passing run includes every unreleased change.
 
-## Patch releases
+### Publishing (`publish.yml`)
 
-Fix on `main` and release the next PATCH version of every component. If a
-component has no changes it is still tagged and published, so that one version
-number identifies a compatible set.
+For a tag it checks out the tag, verifies it (`verify_release.py --tag-exists`:
+manifest, version files and changelog match the tag; dependencies released),
+smoke-tests the package built from the tag, skips a version already in its
+registry, and publishes:
+
+- `rust/v*`: `cargo publish`;
+- `npm/v*`: `npm publish --provenance` (pre-release versions under the `next`
+  dist-tag);
+- `mq/v*`, `postgremq-go/v*`, `cmd/postgremq/v*`: Go modules are published by
+  the tag itself (which is why Go validation precedes tagging); the job asks
+  `proxy.golang.org` to fetch the version.
+
+Until the repository variable `PUBLISH_ENABLED` is `true`, every publish step
+is a dry run (`cargo publish --dry-run`, `npm publish --dry-run`, no proxy
+request).
+
+**Manual retry**: Actions → Publish → Run workflow with the existing tag (e.g.
+`npm/v0.2.0`). It also re-runs the component's tests on the tag, and skips a
+version that is already published.
+
+### Releasing a component
+
+1. Wait for its release PR (`chore(main): release <component> X.Y.Z`). Edit
+   nothing in it except, if needed, the changelog wording; Release Please
+   rewrites the branch on the next push to `main`. For mq, wait for the
+   `chore(mq): stamp release X.Y.Z` commit, which `stamp-mq` pushes right
+   after each rewrite (*Release PR consistency* fails until then).
+2. Make sure its checks pass. A client release PR fails `Release PR
+   consistency` until its mq (or client) dependency is released and pinned;
+   release that first.
+3. Squash-merge it. The next `release.yml` run on that merge commit tags it,
+   creates the GitHub release, and publishes.
+
+Order for a release that spans components: mq → (bump pins) → Go client, Rust,
+TypeScript → (bump the CLI's client requirement) → CLI.
+
+### Correcting a pending release
+
+If the guard refuses a merged release PR because its merge commit failed
+validation:
+
+- If the failure was spurious, re-run the failed jobs of that commit's
+  `release.yml` run. When its `Validated` job succeeds, the next run on `main`
+  tags it (push any commit, or re-run the latest run).
+- If the commit is broken, do not tag it: remove the `autorelease: pending`
+  label from the release PR, revert the release commit on `main`, and fix
+  forward. Release Please then proposes a fresh release PR.
+
+If it refuses because the release is inconsistent (for example a pin to an
+unreleased mq), fix `main` the same way and let Release Please propose the
+release again.
+
+## First release
+
+Independent versioning starts from the baseline in
+`.release-please-manifest.json`: every component at `0.1.0` (npm `postgremq`
+0.1.0 and the crates.io `postgremq` 0.0.1 placeholder exist from before;
+nothing else was published), with `bootstrap-sha` limiting history to commits
+after the switch. The first release notes' compare link points at the
+never-created `<component>/v0.1.0` tag; edit it out of the release PR's
+changelog if you like. The first release of each
+component is therefore `0.2.0` (its commits include `feat`s). The clients pin
+mq `0.2.0` and the CLI requires the Go client `0.2.0`, so release mq first,
+then the clients (after adding the Go `go.sum` hashes), then the CLI.
+
+## One-time setup
+
+- **GitHub App for release PRs.** Release PRs opened with the default
+  `GITHUB_TOKEN` trigger no workflows, so their checks never run. Create a
+  GitHub App with *Contents*, *Pull requests* and *Issues* read/write and
+  *Actions* read on this repository, install it, and set the variable
+  `RELEASE_APP_ID` and the secret `RELEASE_APP_PRIVATE_KEY`. Without them
+  release.yml falls back to `GITHUB_TOKEN` (with a warning); then also enable
+  *Settings → Actions → General → Allow GitHub Actions to create and approve
+  pull requests*.
+- **Repository settings.** Allow squash merging only, with *Default commit
+  message: Pull request title*; protect `main` and require the PR Title check
+  and, on release PRs, *Release PR consistency*. The test and Packages
+  workflows run on pull requests only when their paths change, so a required
+  status from them would block unrelated PRs: require them only after
+  removing their `paths:` filters. Enable private vulnerability reporting
+  (SECURITY.md) and Dependabot alerts.
+- **Registries.** Prefer trusted publishing (OIDC from `publish.yml`): on
+  crates.io (the crate `postgremq` exists, owned by the maintainer) and npm
+  (package `postgremq`), register this repository and workflow `publish.yml`,
+  then set the variables `CRATES_IO_TRUSTED_PUBLISHING=true` /
+  `NPM_TRUSTED_PUBLISHING=true`. Otherwise add scoped tokens as the secrets
+  `CARGO_REGISTRY_TOKEN` and `NPM_TOKEN` (an automation token for
+  `postgremq`).
+- **Go module paths.** `postgremq.dev/mq`, `postgremq.dev/postgremq-go` and
+  `postgremq.dev/cmd/postgremq` need `go-import` discovery on postgremq.dev
+  (the website repository). Until it works, resolve them with
+  `scripts/release/go-proxy.sh` / `go-standalone.sh`, which build a local
+  module proxy from tags or the working tree.
+- **Enable publishing**: set the variable `PUBLISH_ENABLED=true`.
+
+## Tools
+
+| Script | Purpose |
+|--------|---------|
+| `mq/scripts/stamp_release.py X.Y.Z` | Adds the mq release stamp (run by release.yml) |
+| `scripts/release/verify_release.py <tag>` / `--component <c>` | Checks a release's consistency |
+| `scripts/release/check_pending_releases.py` | The release guard |
+| `scripts/release/go-proxy.sh DIR` | Builds a GOPROXY tree of this repo's Go modules (from tags when released) |
+| `scripts/release/go-standalone.sh [--write] DIR go …` | Runs a go command with `GOWORK=off` against that proxy (`--write` records released hashes in go.mod/go.sum) |
+| `scripts/release/smoke-go.sh`, `smoke-npm.sh`, `smoke-rust.sh` | Installs the packages outside the repository and runs them (`SMOKE_ADMIN_URL`) |
 
 ## Security releases
 
-Security fixes follow `SECURITY.md`: the fix is developed in a private GitHub
-security advisory, released as a PATCH version, and the advisory is published
-with the release.
+Security fixes follow SECURITY.md: the fix is developed in a private GitHub
+security advisory, released as a PATCH of each affected component, and the
+advisory is published with the release.
 
 ## Yanking a bad release
 
-- npm: `npm deprecate postgremq@X.Y.Z "<reason>"` (unpublishing is only
-  possible within 72 hours and is discouraged).
-- crates.io: `cargo yank --version X.Y.Z postgremq`.
+Published versions are never reused. To withdraw one:
+
+- npm: `npm deprecate postgremq@X.Y.Z "<reason>"`;
+- crates.io: `cargo yank --version X.Y.Z postgremq`;
 - Go: add a `retract` directive for the version to the module's `go.mod` and
   release a new version.
 

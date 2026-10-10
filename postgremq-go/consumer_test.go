@@ -2,7 +2,7 @@
 // fair distribution across consumers, automatic VT extension behavior,
 // buffered message release on stop, restart behavior, and options like
 // WithNoAutoExtension and retry configuration.
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
@@ -15,7 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -33,7 +33,7 @@ func TestConsumerStartAndReceive(t *testing.T) {
 	const topicName = "test_consumer_start_topic"
 	const queueName = "test_consumer_start_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -83,7 +83,7 @@ func TestConsumerMessageRetryAfterNack(t *testing.T) {
 	const topicName = "test_consumer_nack_topic"
 	const queueName = "test_consumer_nack_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -137,7 +137,7 @@ func TestConsumerMultipleDistribution(t *testing.T) {
 	const topicName = "test_multiple_consumers_topic"
 	const queueName = "test_multiple_consumers_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -211,7 +211,7 @@ func TestConsumerVisibilityTimeoutExtension(t *testing.T) {
 	const topicName = "test_vt_extension_topic"
 	const queueName = "test_vt_extension_queue"
 	logger := MockLogger{}
-	conn, err := postgremq.DialFromPool(pool, postgremq.WithLogger(&logger))
+	conn, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithLogger(&logger))
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -264,7 +264,7 @@ func TestConsumerExtensionCancelsHandlerOnLeaseLost(t *testing.T) {
 	const topicName = "test_extension_cancel_topic"
 	const queueName = "test_extension_cancel_queue"
 	logger := MockLogger{}
-	conn, err := postgremq.DialFromPool(pool, postgremq.WithLogger(&logger))
+	conn, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithLogger(&logger))
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -334,7 +334,7 @@ func TestConsumerBufferedMessagesReleased(t *testing.T) {
 	const topicName = "test_buffer_release_topic"
 	const queueName = "test_buffer_release_queue"
 	logger := MockLogger{}
-	conn, err := postgremq.DialFromPool(pool, postgremq.WithLogger(&logger))
+	conn, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithLogger(&logger))
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -401,7 +401,7 @@ func TestConsumerStopAndRestart(t *testing.T) {
 	const topicName = "test_consumer_restart_topic"
 	const queueName = "test_consumer_restart_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -492,7 +492,7 @@ func TestConsumerWithRetry(t *testing.T) {
 			},
 		}
 
-		conn, err := postgremq.DialFromPool(pool,
+		conn, err := postgremq.DialFromPool(context.Background(), pool,
 			postgremq.WithLogger(logger),
 			postgremq.WithRetryConfig(postgremq.RetryConfig{
 				MaxAttempts:       3,
@@ -517,7 +517,7 @@ func TestWithNoAutoExtension(t *testing.T) {
 	defer pool.Close()
 
 	// Create a connection
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "Failed to create connection")
 	defer conn.Close()
 

@@ -44,16 +44,18 @@ pip install -r tests/requirements.txt
 pytest tests/tests.py -v
 ```
 
-`mq/sql/latest.sql` is the complete schema. Until the first release,
-`mq/migrations/000001_initial_schema.up.sql` is kept equal to it, minus the
-fresh-install guard at the top and the version stamp at the end.
-After a release, schema changes add a new migration and update `latest.sql`
-to match (see [RELEASE.md](./RELEASE.md)). Every client embeds the migrations
-at build time, so there is nothing to copy by hand: the Go `mq` module uses
-`go:embed`, `npm ci`, the TypeScript build and Jest generate
-`postgremq-ts/src/migrations.generated.ts`, and `postgremq-rs/migrations` is a
-symlink to `mq/migrations` (on Windows, clone with `git config core.symlinks
-true`). A new migration needs one entry in `postgremq-rs/src/migrate.rs`.
+`mq/sql/latest.sql` is the fresh-install script and `mq/migrations/` the
+upgrade path; a schema or function change adds a new migration and makes the
+same change in `latest.sql` (released migrations are never edited). The SQL
+tests check that both produce the same schema. Do not change `mq/VERSION` or
+the `db_version` that `postgremq.info()` reports: the mq release PR does (see
+[RELEASE.md](./RELEASE.md)). Every client embeds the migrations at build
+time, so there is nothing to copy by hand: the Go `postgremq.dev/mq` module
+uses `go:embed`, `npm ci`, the TypeScript build and Jest generate
+`postgremq-ts/src/migrations.generated.ts`, and `postgremq-rs/build.rs` reads
+`postgremq-rs/migrations`, a symlink to `mq/migrations` (on Windows, clone
+with `git config core.symlinks true`). The TypeScript and Rust clients embed
+the migrations of the mq release they pin.
 
 ### Go
 
@@ -110,7 +112,8 @@ each client, and checks the exported metrics.
    the same change in the others.
 4. Update the documentation that describes the behaviour you changed:
    READMEs, `docs/`, doc comments.
-5. Add an entry under `Unreleased` in [CHANGELOG.md](./CHANGELOG.md).
+5. Do not edit versions or changelogs: release notes are generated from the
+   squash commit (your PR title) when the component is released.
 
 ### Guidelines
 
@@ -126,16 +129,35 @@ each client, and checks the exported metrics.
 - **Transactions**: functions that accept a caller's transaction or
   connection never begin, commit or roll it back.
 
-### Commit messages
+### Commit messages and PR titles
 
-Use [Conventional Commits](https://www.conventionalcommits.org/):
+PRs are squash-merged, and the PR title becomes the commit on `main`, so the
+PR title must be a [Conventional Commit](https://www.conventionalcommits.org/)
+(CI checks it):
 
 ```
-<type>(<scope>): <subject>
+<type>(<scope>)[!]: <subject, lowercase, imperative, no period>
 ```
 
-Types: `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `chore`. Scopes:
-`sql`, `go`, `ts`, `rs`, `cli`, `docs`, `ci`, or several (`sql,go,ts`).
+- **Types**: `feat` (new behaviour: a minor release), `fix` (a patch
+  release), `perf`, `revert`, `deps` (dependency updates that matter to
+  users); `docs`, `test`, `refactor`, `build`, `ci`, `chore` do not appear in
+  release notes and release nothing on their own.
+- **Scopes**: `sql`, `go`, `cli`, `ts`, `rs`, `docs`, `ci`, `release`, or
+  several (`sql,go`). The scope is for readers; Release Please decides which
+  components a commit releases from the paths it changes.
+- **Breaking changes**: add `!` after the scope and a `BREAKING CHANGE:`
+  footer in the PR description's squash commit body, saying what breaks and
+  how to migrate. Before 1.0 this is a minor release, listed under
+  "BREAKING CHANGES".
+- Commits on your branch can be anything; only the squash commit counts. Keep
+  a PR to one component where you can, so each release note says what changed
+  in that component.
+
+Examples: `feat(go): add WithGroupKey publish option`,
+`fix(sql): keep group order when a nack is delayed`,
+`feat(ts)!: make connect() check the protocol major`,
+`feat(rs): bundle mq 0.3.0` (a pin bump that ships new SQL).
 
 ## Reporting bugs and requesting features
 

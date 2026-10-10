@@ -8,7 +8,7 @@ import (
 	"os"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 )
 
 func main() {
@@ -28,7 +28,7 @@ func main() {
 	defer pool.Close()
 
 	// Connect PostgreMQ using existing pool
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(ctx, pool)
 	if err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}

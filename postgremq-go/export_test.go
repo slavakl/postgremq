@@ -1,4 +1,4 @@
-package postgremq_go
+package postgremq
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 )
 
 // This file is compiled only during `go test`. It exposes a few unexported
-// pieces of state to the external `postgremq_go_test` package so internal
+// pieces of state to the external `postgremq_test` package so internal
 // invariants (refcounted LISTEN sharing, etc.) can be asserted without
 // leaking those hooks into the public API.
 

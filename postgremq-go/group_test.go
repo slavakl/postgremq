@@ -1,4 +1,4 @@
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 )
 
 // Two consumers (on separate connections) share a queue carrying interleaved
@@ -23,7 +23,7 @@ func TestMessageGroups_OrderHoldsWithTwoConsumers(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -56,7 +56,7 @@ func TestMessageGroups_OrderHoldsWithTwoConsumers(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c, err := postgremq.DialFromPool(pool)
+			c, err := postgremq.DialFromPool(context.Background(), pool)
 			if !assert.NoError(t, err) {
 				return
 			}
@@ -143,7 +143,7 @@ func TestMessageGroups_AckWakesSuccessor(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -195,7 +195,7 @@ func TestMessageGroups_PublishOptionsAndInspection(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 

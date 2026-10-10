@@ -3,14 +3,14 @@
 // failed), the consumer is torn down — handlers cancelled, in-flight messages
 // deregistered from the extender, Messages() closed — and the reason is surfaced
 // via Consumer.NotifyClose and the connection-level WithQueueFatalHandler.
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
 	"testing"
 	"time"
 
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -25,7 +25,7 @@ func TestQueueFatalOnDeletedQueue(t *testing.T) {
 	defer pool.Close()
 
 	fatal := make(chan string, 4)
-	conn, err := postgremq.DialFromPool(pool,
+	conn, err := postgremq.DialFromPool(context.Background(), pool,
 		postgremq.WithQueueFatalHandler(func(queue string, err error) {
 			assert.ErrorIs(t, err, postgremq.ErrQueueGone)
 			fatal <- queue
@@ -83,7 +83,7 @@ func TestQueueFatalNormalStopNoError(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -113,7 +113,7 @@ func TestQueueFatalTearsDownAllConsumersOnQueue(t *testing.T) {
 	defer pool.Close()
 
 	fatal := make(chan string, 8)
-	conn, err := postgremq.DialFromPool(pool,
+	conn, err := postgremq.DialFromPool(context.Background(), pool,
 		postgremq.WithQueueFatalHandler(func(queue string, err error) { fatal <- queue }))
 	require.NoError(t, err)
 	defer conn.Close()
@@ -166,7 +166,7 @@ func TestQueueFatalProducerOnlyExclusiveQueue(t *testing.T) {
 		keptFn: func(names []string) []string { return nil }, // omit all => permanent
 	}
 	fatal := make(chan string, 4)
-	conn, err := postgremq.DialFromPool(spy,
+	conn, err := postgremq.DialFromPool(context.Background(), spy,
 		postgremq.WithQueueFatalHandler(func(queue string, err error) {
 			assert.ErrorIs(t, err, postgremq.ErrQueueGone)
 			fatal <- queue
@@ -193,7 +193,7 @@ func TestQueueFatalInFlightDeregisteredFromExtender(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 

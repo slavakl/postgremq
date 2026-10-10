@@ -1,4 +1,4 @@
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/slavakl/postgremq/mq"
+	"postgremq.dev/mq"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )

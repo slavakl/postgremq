@@ -17,6 +17,7 @@ mod listener;
 mod metrics;
 mod migrate;
 mod options;
+mod protocol;
 mod renewal;
 mod retry;
 mod scheduler;
@@ -33,6 +34,7 @@ pub use migrate::{MigrationStatus, migrate, migration_status};
 pub use options::{
     ConnectionOptions, ConsumeOptions, PublishOptions, QueueFatalHook, QueueOptions, RetryConfig,
 };
+pub use protocol::SUPPORTED_PROTOCOL_MAJORS;
 pub use types::{Generation, MessageId};
 
 /// Re-exported so applications use the same version as

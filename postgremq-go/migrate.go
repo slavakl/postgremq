@@ -1,4 +1,4 @@
-package postgremq_go
+package postgremq
 
 import (
 	"context"
@@ -15,7 +15,7 @@ import (
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
-	"github.com/slavakl/postgremq/mq"
+	"postgremq.dev/mq"
 )
 
 const MigrationsTable = "postgremq_migrations"
