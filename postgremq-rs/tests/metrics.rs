@@ -246,12 +246,14 @@ async fn take(conn: &Connection, queue: &str) -> (Consumer, Delivery) {
 async fn metrics_contract_with_transactions_and_redelivery() {
     let db = TestDb::new().await;
     let telemetry = Telemetry::new();
-    let conn = db.connect(
-        ConnectionOptions::default()
-            .notifications(false)
-            .retry(RetryConfig::default().max_attempts(NonZeroU32::MIN))
-            .meter_provider(&telemetry.provider),
-    );
+    let conn = db
+        .connect(
+            ConnectionOptions::default()
+                .notifications(false)
+                .retry(RetryConfig::default().max_attempts(NonZeroU32::MIN))
+                .meter_provider(&telemetry.provider),
+        )
+        .await;
     conn.create_topic("metrics").await.unwrap();
     conn.create_queue("q", "metrics", QueueOptions::default())
         .await
@@ -378,7 +380,9 @@ async fn metrics_contract_with_transactions_and_redelivery() {
 async fn a_retried_publish_is_one_operation_and_two_send_attempts() {
     let db = TestDb::new().await;
     let telemetry = Telemetry::new();
-    let conn = db.connect(ConnectionOptions::default().meter_provider(&telemetry.provider));
+    let conn = db
+        .connect(ConnectionOptions::default().meter_provider(&telemetry.provider))
+        .await;
     conn.create_topic("metrics").await.unwrap();
     let fault = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -428,7 +432,7 @@ async fn the_provider_is_optional_and_application_owned() {
         if enabled {
             options = options.meter_provider(&telemetry.provider);
         }
-        let conn = db.connect(options);
+        let conn = db.connect(options).await;
         conn.create_topic("optional").await.unwrap();
         conn.create_queue("q", "optional", QueueOptions::default())
             .await
@@ -486,7 +490,9 @@ async fn the_provider_is_optional_and_application_owned() {
 async fn handler_callbacks_are_measured_and_balanced() {
     let db = TestDb::new().await;
     let telemetry = Telemetry::new();
-    let conn = db.connect(ConnectionOptions::default().meter_provider(&telemetry.provider));
+    let conn = db
+        .connect(ConnectionOptions::default().meter_provider(&telemetry.provider))
+        .await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -599,7 +605,9 @@ async fn handler_callbacks_are_measured_and_balanced() {
 async fn a_lost_renewal_and_background_batches_are_recorded() {
     let db = TestDb::new().await;
     let telemetry = Telemetry::new();
-    let conn = db.connect(ConnectionOptions::default().meter_provider(&telemetry.provider));
+    let conn = db
+        .connect(ConnectionOptions::default().meter_provider(&telemetry.provider))
+        .await;
     let topic = unique("t");
     let queue = unique("q");
     let exclusive = unique("x");
@@ -696,7 +704,9 @@ async fn seeded(
     db: &TestDb,
     messages: usize,
 ) -> (Connection, String, String) {
-    let conn = db.connect(ConnectionOptions::default().meter_provider(&telemetry.provider));
+    let conn = db
+        .connect(ConnectionOptions::default().meter_provider(&telemetry.provider))
+        .await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();

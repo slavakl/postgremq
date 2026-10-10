@@ -204,8 +204,28 @@ impl TestDb {
     }
 
     /// A connection over this database's pool.
-    pub(crate) fn connect(&self, options: ConnectionOptions) -> Connection {
-        Connection::from_pool(self.pool.clone(), options).unwrap()
+    pub(crate) async fn connect(&self, options: ConnectionOptions) -> Connection {
+        Connection::from_pool(self.pool.clone(), options)
+            .await
+            .unwrap()
+    }
+
+    /// This database's URL.
+    pub(crate) fn url(&self) -> String {
+        server_options()
+            .database(&self.name)
+            .to_url_lossy()
+            .to_string()
+    }
+
+    /// This database's URL, connecting as `user`.
+    pub(crate) fn url_as(&self, user: &str, password: &str) -> String {
+        server_options()
+            .database(&self.name)
+            .username(user)
+            .password(password)
+            .to_url_lossy()
+            .to_string()
     }
 
     /// A connection with its own pool (as a separate process would have).
@@ -225,7 +245,7 @@ impl TestDb {
             .connect_with(server_options().database(&self.name).application_name(app))
             .await
             .unwrap();
-        Connection::from_pool(pool, options).unwrap()
+        Connection::from_pool(pool, options).await.unwrap()
     }
 
     /// The `LISTEN` session backends of this database tagged `app`.

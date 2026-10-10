@@ -33,7 +33,7 @@ async fn attempts(db: &TestDb, queue: &str) -> Vec<(String, i32)> {
 #[tokio::test(flavor = "multi_thread")]
 async fn close_drains_in_flight_work_and_releases_buffered_rows() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -88,8 +88,9 @@ async fn close_drains_in_flight_work_and_releases_buffered_rows() {
 #[tokio::test(flavor = "multi_thread")]
 async fn close_abandons_unsettled_work_at_the_shutdown_timeout() {
     let db = TestDb::new().await;
-    let conn =
-        db.connect(ConnectionOptions::default().shutdown_timeout(Duration::from_millis(300)));
+    let conn = db
+        .connect(ConnectionOptions::default().shutdown_timeout(Duration::from_millis(300)))
+        .await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -118,13 +119,15 @@ async fn close_abandons_unsettled_work_at_the_shutdown_timeout() {
 async fn deleting_the_queue_ends_the_stream_with_queue_gone() {
     let db = TestDb::new().await;
     let fatal = Arc::new(Mutex::new(Vec::<String>::new()));
-    let conn = db.connect(ConnectionOptions::default().on_queue_fatal({
-        let fatal = Arc::clone(&fatal);
-        move |queue, err| {
-            assert_eq!(err.kind(), ErrorKind::QueueGone);
-            fatal.lock().unwrap().push(queue.to_owned());
-        }
-    }));
+    let conn = db
+        .connect(ConnectionOptions::default().on_queue_fatal({
+            let fatal = Arc::clone(&fatal);
+            move |queue, err| {
+                assert_eq!(err.kind(), ErrorKind::QueueGone);
+                fatal.lock().unwrap().push(queue.to_owned());
+            }
+        }))
+        .await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -171,12 +174,14 @@ async fn deleting_the_queue_ends_the_stream_with_queue_gone() {
 async fn deleting_through_the_same_connection_still_stops_every_consumer() {
     let db = TestDb::new().await;
     let fatal = Arc::new(AtomicUsize::new(0));
-    let conn = db.connect(ConnectionOptions::default().on_queue_fatal({
-        let fatal = Arc::clone(&fatal);
-        move |_, _| {
-            fatal.fetch_add(1, Ordering::SeqCst);
-        }
-    }));
+    let conn = db
+        .connect(ConnectionOptions::default().on_queue_fatal({
+            let fatal = Arc::clone(&fatal);
+            move |_, _| {
+                fatal.fetch_add(1, Ordering::SeqCst);
+            }
+        }))
+        .await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -247,12 +252,14 @@ async fn deleting_through_the_same_connection_still_stops_every_consumer() {
 async fn exclusive_queues_are_kept_alive_and_their_loss_is_fatal() {
     let db = TestDb::new().await;
     let fatal = Arc::new(AtomicUsize::new(0));
-    let conn = db.connect(ConnectionOptions::default().on_queue_fatal({
-        let fatal = Arc::clone(&fatal);
-        move |_, _| {
-            fatal.fetch_add(1, Ordering::SeqCst);
-        }
-    }));
+    let conn = db
+        .connect(ConnectionOptions::default().on_queue_fatal({
+            let fatal = Arc::clone(&fatal);
+            move |_, _| {
+                fatal.fetch_add(1, Ordering::SeqCst);
+            }
+        }))
+        .await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -315,10 +322,12 @@ async fn exclusive_queues_are_kept_alive_and_their_loss_is_fatal() {
 async fn keep_alive_alone_detects_a_producer_only_exclusive_queue_is_gone() {
     let db = TestDb::new().await;
     let fatal: Arc<Mutex<Vec<String>>> = Arc::default();
-    let conn = db.connect(ConnectionOptions::default().on_queue_fatal({
-        let fatal = Arc::clone(&fatal);
-        move |queue, _| fatal.lock().unwrap().push(queue.to_owned())
-    }));
+    let conn = db
+        .connect(ConnectionOptions::default().on_queue_fatal({
+            let fatal = Arc::clone(&fatal);
+            move |queue, _| fatal.lock().unwrap().push(queue.to_owned())
+        }))
+        .await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -355,7 +364,7 @@ async fn keep_alive_alone_detects_a_producer_only_exclusive_queue_is_gone() {
 #[tokio::test(flavor = "multi_thread")]
 async fn handlers_auto_ack_and_auto_nack_on_error_and_panic() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -440,7 +449,7 @@ async fn handlers_auto_ack_and_auto_nack_on_error_and_panic() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_handler_consumer_reports_queue_gone() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -468,7 +477,7 @@ async fn a_handler_consumer_reports_queue_gone() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_panic_while_building_the_handler_future_auto_nacks() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -515,7 +524,7 @@ async fn a_panic_while_building_the_handler_future_auto_nacks() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_close_call_does_not_cancel_the_shutdown() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();

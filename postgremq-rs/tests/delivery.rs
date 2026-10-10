@@ -29,7 +29,7 @@ fn secs(n: u32) -> NonZeroU32 {
 }
 
 async fn setup(db: &TestDb, queue_options: QueueOptions) -> (Connection, String, String) {
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();

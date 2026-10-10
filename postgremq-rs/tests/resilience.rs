@@ -57,7 +57,7 @@ async fn the_client_recovers_after_its_backends_are_killed() {
     // Every pooled and LISTEN session of the client dies (failover, a
     // pooler restart, an idle cut-off).
     assert!(db.kill_tagged(&app).await > 0);
-    let other = db.connect(ConnectionOptions::default());
+    let other = db.connect(ConnectionOptions::default()).await;
     for n in 1..=5 {
         other
             .publish(&topic, &n, PublishOptions::default())
@@ -85,7 +85,7 @@ async fn the_client_recovers_after_its_backends_are_killed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blocked_claim_is_bounded_by_the_server_and_recovers() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -156,7 +156,7 @@ async fn a_blocked_claim_is_bounded_by_the_server_and_recovers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_consumer_start_blocked_on_queue_metadata_gives_up() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -191,8 +191,9 @@ async fn a_consumer_start_blocked_on_queue_metadata_gives_up() {
 #[tokio::test(flavor = "multi_thread")]
 async fn close_is_not_held_up_by_a_blocked_claim() {
     let db = TestDb::new().await;
-    let conn =
-        db.connect(ConnectionOptions::default().shutdown_timeout(Duration::from_millis(500)));
+    let conn = db
+        .connect(ConnectionOptions::default().shutdown_timeout(Duration::from_millis(500)))
+        .await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -337,7 +338,7 @@ async fn the_listener_reconnects_after_its_session_is_killed() {
         )
         .await
         .unwrap();
-    let other = db.connect(ConnectionOptions::default());
+    let other = db.connect(ConnectionOptions::default()).await;
     for round in 1..=3 {
         let session = within(10, async {
             loop {
@@ -387,7 +388,7 @@ async fn the_listener_reconnects_after_its_session_is_killed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn message_ids_beyond_i32_round_trip() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -416,7 +417,7 @@ async fn message_ids_beyond_i32_round_trip() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_large_payload_round_trips() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();

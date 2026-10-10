@@ -1,6 +1,6 @@
 // Handler consumer tests validate handler-based message processing,
 // maxInFlight limiting, graceful shutdown, panic recovery, and auto-ack behavior.
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 )
 
 // TestHandlerConsumerExplicitAck verifies that messages are acked when handler calls Ack().
@@ -26,7 +26,7 @@ func TestHandlerConsumerExplicitAck(t *testing.T) {
 	const topicName = "test_handler_explicit_ack_topic"
 	const queueName = "test_handler_explicit_ack_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -86,7 +86,7 @@ func TestHandlerConsumerAutoAck(t *testing.T) {
 	const topicName = "test_handler_auto_ack_topic"
 	const queueName = "test_handler_auto_ack_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -143,7 +143,7 @@ func TestHandlerConsumerNack(t *testing.T) {
 	const topicName = "test_handler_nack_topic"
 	const queueName = "test_handler_nack_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -194,7 +194,7 @@ func TestHandlerConsumerNackWithDelay(t *testing.T) {
 	const topicName = "test_handler_nack_delay_topic"
 	const queueName = "test_handler_nack_delay_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -250,7 +250,7 @@ func TestHandlerConsumerMaxInFlight(t *testing.T) {
 	const topicName = "test_handler_max_inflight_topic"
 	const queueName = "test_handler_max_inflight_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -330,7 +330,7 @@ func TestHandlerConsumerStopUnderLoadDoesNotDeadlock(t *testing.T) {
 	const topicName = "test_handler_stop_deadlock_topic"
 	const queueName = "test_handler_stop_deadlock_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -402,7 +402,7 @@ func TestHandlerConsumerPanicRecovery(t *testing.T) {
 	const queueName = "test_handler_panic_queue"
 
 	logger := &MockLogger{}
-	conn, err := postgremq.DialFromPool(pool, postgremq.WithLogger(logger))
+	conn, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithLogger(logger))
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -452,7 +452,7 @@ func TestHandlerConsumerGracefulShutdown(t *testing.T) {
 	const topicName = "test_handler_shutdown_topic"
 	const queueName = "test_handler_shutdown_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -526,7 +526,7 @@ func TestHandlerConsumerContextCancellation(t *testing.T) {
 	const topicName = "test_handler_ctx_cancel_topic"
 	const queueName = "test_handler_ctx_cancel_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -583,7 +583,7 @@ func TestHandlerConsumerMessageFields(t *testing.T) {
 	const topicName = "test_handler_msg_fields_topic"
 	const queueName = "test_handler_msg_fields_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -646,7 +646,7 @@ func TestHandlerConsumerInvalidMaxInFlight(t *testing.T) {
 	const topicName = "test_handler_invalid_inflight_topic"
 	const queueName = "test_handler_invalid_inflight_queue"
 
-	conn, err := postgremq.DialFromPool(pool)
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
 	require.NoError(t, err, "DialFromPool failed")
 	defer conn.Close()
 
@@ -675,7 +675,7 @@ func TestHandlerConsumerConnectionClose(t *testing.T) {
 	const topicName = "test_handler_conn_close_topic"
 	const queueName = "test_handler_conn_close_queue"
 
-	conn, err := postgremq.DialFromPool(pool, postgremq.WithShutdownTimeout(5*time.Second))
+	conn, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithShutdownTimeout(5*time.Second))
 	require.NoError(t, err, "DialFromPool failed")
 	// Safety net: if the test fatals before reaching the explicit conn.Close()
 	// below, EventListener.session would otherwise keep a pgx connection
@@ -748,7 +748,7 @@ func TestMultipleConsumersSameQueue(t *testing.T) {
 	const topicName = "test_multi_consumer_topic"
 	const queueName = "test_multi_consumer_queue"
 
-	conn, err := postgremq.DialFromPool(pool, postgremq.WithShutdownTimeout(5*time.Second))
+	conn, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithShutdownTimeout(5*time.Second))
 	require.NoError(t, err, "DialFromPool failed")
 	// Safety net: if the test fatals before reaching the explicit conn.Close()
 	// below, EventListener.session would otherwise keep a pgx connection

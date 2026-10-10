@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"postgremq.dev/postgremq-go"
 )
 
 func main() {

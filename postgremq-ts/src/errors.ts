@@ -98,6 +98,45 @@ export class ConnectionClosedError extends Error {
 }
 
 /**
+ * CompatibilityError is thrown by `Connection.connect()` when the database's
+ * PostgreMQ installation uses a protocol major this client does not support
+ * (see `SUPPORTED_PROTOCOL_MAJORS`), or has no discovery function
+ * (`postgremq.info()`) and needs an installation or upgrade. Mirrors the Go
+ * client's CompatibilityError / ErrIncompatibleSchema.
+ *
+ * Pure client-side error (no SQLSTATE), so it carries no `code`; when
+ * discovery is missing, `cause` is the database error.
+ */
+export class CompatibilityError extends Error {
+  /** The installed schema version (the last migration applied); undefined when discovery is missing. */
+  readonly schemaVersion?: number;
+  /** The installation's protocol major; undefined when discovery is missing. */
+  readonly protocolMajor?: number;
+  /** The protocol majors this client supports. */
+  readonly supportedMajors: readonly number[];
+  /** The database error when discovery is missing. */
+  readonly cause?: Error;
+  constructor(details: {
+    schemaVersion?: number;
+    protocolMajor?: number;
+    supportedMajors: readonly number[];
+    cause?: Error;
+  }) {
+    const supported = `[${details.supportedMajors.join(', ')}]`;
+    super(
+      details.cause
+        ? `postgremq: postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports protocol majors ${supported}): ${details.cause.message}`
+        : `postgremq: the database's PostgreMQ schema (version ${details.schemaVersion ?? 'unknown'}) uses protocol major ${details.protocolMajor}; this client supports ${supported}`
+    );
+    this.name = 'CompatibilityError';
+    this.schemaVersion = details.schemaVersion;
+    this.protocolMajor = details.protocolMajor;
+    this.supportedMajors = details.supportedMajors;
+    this.cause = details.cause;
+  }
+}
+
+/**
  * DirtySchemaError is thrown by `migrate()` when the recorded schema version
  * is marked dirty: a migration failed partway, so the schema is in an unknown
  * state. Fix the schema by hand, then clear the flag in

@@ -1,14 +1,6 @@
 name: TypeScript Tests
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'postgremq-ts/**'
-      - 'mq/sql/**'
-      - 'mq/migrations/**'
-      - 'observability/**'
-      - '.github/workflows/typescript-tests.yml'
   pull_request:
     branches: [ main ]
     paths:
@@ -17,6 +9,12 @@ on:
       - 'mq/migrations/**'
       - 'observability/**'
       - '.github/workflows/typescript-tests.yml'
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to test (default: the triggering commit)"
+        type: string
+        default: ''
 
 jobs:
   test:
@@ -30,6 +28,9 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
 
     - name: Set up Node.js
       uses: actions/setup-node@v4
@@ -71,6 +72,9 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
 
     - name: Set up Node.js
       uses: actions/setup-node@v4

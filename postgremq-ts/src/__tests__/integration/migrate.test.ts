@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
 import { migrate, getMigrationStatus, migrationLockId } from '../../migrate';
-import { MIGRATIONS } from '../../migrations.generated';
+import { MIGRATIONS, MQ_SCHEMA } from '../../migrations.generated';
 import { DirtySchemaError } from '../../errors';
 import { Connection } from '../../connection';
 import { createEmptyTestDatabase, createIsolatedTestConnection, getSharedTestDatabase, TestDatabase } from '../helpers';
@@ -37,12 +37,15 @@ async function advisoryLocksHeld(pool: Pool): Promise<number> {
 const latest = Math.max(...MIGRATIONS.map((m) => m.version));
 
 describe('embedded migrations', () => {
-  test('match mq/migrations byte for byte', () => {
+  test('are migrations 1..N for the pinned schema version N, byte for byte', () => {
+    const pin = JSON.parse(fs.readFileSync(path.join(__dirname, '../../../package.json'), 'utf8')).postgremq['mq-schema'];
+    expect(MQ_SCHEMA).toBe(pin);
     const dir = path.join(__dirname, '../../../../mq/migrations');
-    const files = fs.readdirSync(dir).filter((f) => f.endsWith('.up.sql')).sort();
-    expect(MIGRATIONS.map((m) => `${String(m.version).padStart(6, '0')}_${m.name}.up.sql`)).toEqual(files);
+    const files = fs.readdirSync(dir).filter((f) => /^\d+_.+\.up\.sql$/.test(f)).sort();
+    const expected = files.filter((f) => Number(f.split('_')[0]) <= pin);
+    expect(MIGRATIONS.map((m) => `${String(m.version).padStart(6, '0')}_${m.name}.up.sql`)).toEqual(expected);
     for (const m of MIGRATIONS) {
-      const file = files.find((f) => f.startsWith(String(m.version).padStart(6, '0') + '_'))!;
+      const file = expected.find((f) => Number(f.split('_')[0]) === m.version)!;
       expect(m.sql).toBe(fs.readFileSync(path.join(dir, file), 'utf8'));
     }
   });
@@ -127,6 +130,8 @@ describe('migrate', () => {
   test('concurrent callers in separate pools are serialised', async () => {
     const { connectionString } = await emptyDatabase();
     const pools = [0, 1, 2].map(() => new Pool({ connectionString, max: 2 }));
+    // Closing clients may be terminated by the database drop in afterEach.
+    for (const p of pools) p.on('error', () => {});
     try {
       await Promise.all(pools.map((p) => migrate(p)));
       const status = await getMigrationStatus(pools[0]);

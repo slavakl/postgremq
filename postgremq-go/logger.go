@@ -1,4 +1,4 @@
-package postgremq_go
+package postgremq
 
 // Logger is the interface that wraps the basic Printf logging method.
 //

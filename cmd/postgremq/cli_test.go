@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -165,14 +167,28 @@ func runCLI(args ...string) (string, string, error) {
 	return stdout.String(), stderr.String(), err
 }
 
+// versions reads the "Current version" and "Latest version" lines; the
+// latest is the newest embedded migration, which grows with every mq release.
+func versions(t *testing.T, stdout string) (current, latest int) {
+	t.Helper()
+	c := regexp.MustCompile(`Current version: (\d+)`).FindStringSubmatch(stdout)
+	l := regexp.MustCompile(`Latest version:  (\d+)`).FindStringSubmatch(stdout)
+	require.NotNil(t, c, stdout)
+	require.NotNil(t, l, stdout)
+	current, _ = strconv.Atoi(c[1])
+	latest, _ = strconv.Atoi(l[1])
+	return current, latest
+}
+
 func TestCLI_StatusEmptyDatabase(t *testing.T) {
 	dsn := createTestDatabase(t)
 
 	stdout, stderr, err := runCLI("status", "--dsn", dsn)
 	require.NoError(t, err, "stderr: %s", stderr)
 
-	assert.Contains(t, stdout, "Current version: 0")
-	assert.Contains(t, stdout, "Latest version:  1")
+	current, latest := versions(t, stdout)
+	assert.Equal(t, 0, current)
+	assert.GreaterOrEqual(t, latest, 1)
 	assert.Contains(t, stdout, "Migration needed")
 }
 
@@ -182,8 +198,9 @@ func TestCLI_MigrateEmptyDatabase(t *testing.T) {
 	stdout, stderr, err := runCLI("migrate", "--dsn", dsn)
 	require.NoError(t, err, "stderr: %s", stderr)
 
-	assert.Contains(t, stdout, "Current version: 0")
-	assert.Contains(t, stdout, "Latest version:  1")
+	current, latest := versions(t, stdout)
+	assert.Equal(t, 0, current)
+	assert.GreaterOrEqual(t, latest, 1)
 	assert.Contains(t, stdout, "Running migrations...")
 	assert.Contains(t, stdout, "Migration completed successfully")
 }
@@ -199,8 +216,8 @@ func TestCLI_StatusAfterMigration(t *testing.T) {
 	stdout, stderr, err := runCLI("status", "--dsn", dsn)
 	require.NoError(t, err, "status stderr: %s", stderr)
 
-	assert.Contains(t, stdout, "Current version: 1")
-	assert.Contains(t, stdout, "Latest version:  1")
+	current, latest := versions(t, stdout)
+	assert.Equal(t, latest, current)
 	assert.Contains(t, stdout, "Database is up to date")
 }
 

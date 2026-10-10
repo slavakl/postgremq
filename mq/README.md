@@ -36,7 +36,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f mq/sql/latest.sql
 
 **Migrations.** `mq/migrations/` uses the golang-migrate file layout. The
 [PostgreMQ CLI](../cmd/postgremq/README.md) (`postgremq migrate --dsn …`) and
-every client apply the files: Go `postgremq_go.Migrate(pool)`, TypeScript
+every client apply the files: Go `postgremq.Migrate(pool)`, TypeScript
 `migrate(pool)` and Rust `postgremq::migrate(&pool)`. They share one protocol,
 golang-migrate's: the version table `postgremq.postgremq_migrations` (one row,
 `version` and `dirty`), the same advisory lock, and a `dirty` flag set while a
@@ -58,7 +58,7 @@ migrate -path mq/migrations \
 Down migrations are not supported. To remove an installation and all of its queue
 data, run `DROP SCHEMA postgremq CASCADE`.
 
-**Embedding (Go).** The module `github.com/slavakl/postgremq/mq` embeds the SQL:
+**Embedding (Go).** The module `postgremq.dev/mq` embeds the SQL:
 `mq.LatestSQL` (string) and `mq.MigrationsFS` (an `embed.FS` holding
 `migrations/*.sql`).
 
@@ -66,7 +66,7 @@ data, run `DROP SCHEMA postgremq CASCADE`.
 
 Every table, sequence, index, trigger and function belongs to the `postgremq`
 schema. All object references are schema-qualified, so neither installation nor
-runtime depends on `search_path`. All functions are `SECURITY INVOKER`: they run
+runtime depends on `search_path`. All functions except `info()` are `SECURITY INVOKER`: they run
 with the privileges of the caller.
 
 A runtime role other than the installer needs:
@@ -408,6 +408,27 @@ row.
   The next publish to a pruned group starts again at `group_seq` 1. Pruning skips
   rows that an in-flight publisher holds. A row left behind that way is harmless:
   the next publish to that group reuses it.
+
+## Versions and discovery
+
+```sql
+SELECT postgremq.info();
+-- {"schema_version": 7, "protocol_major": 1}
+```
+
+`schema_version` is the number of the last migration applied, the exact
+schema and function state of the database, read from the version table
+`postgremq.postgremq_migrations` that fresh installs (`latest.sql`) and
+upgrades (the migrations) both maintain; `null` without that table. A
+migration never changes once merged, so equal numbers mean equal schemas. The
+mq release notes state which schema version each release ships. `info()` is
+the one `SECURITY DEFINER` function, so runtime roles need no privilege on the
+version table to call it. `protocol_major` is
+the contract clients rely on: function signatures, result types, error codes,
+ownership rules and delivery semantics. Additive changes keep the major;
+incompatible changes get a new one. Each client checks it when connecting and
+rejects a major it does not implement. `info()` and these two fields stay
+stable across protocol majors; fields may be added.
 
 ## Function reference
 

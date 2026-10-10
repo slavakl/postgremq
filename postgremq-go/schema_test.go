@@ -1,13 +1,14 @@
-package postgremq_go_test
+package postgremq_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
 	"github.com/stretchr/testify/require"
+	"postgremq.dev/postgremq-go"
 )
 
 func TestSchemaIsolationWithApplicationTransactions(t *testing.T) {
@@ -42,7 +43,7 @@ func TestSchemaIsolationWithApplicationTransactions(t *testing.T) {
 	require.NoError(t, postgremq.Migrate(pool))
 	status, err = postgremq.GetMigrationStatus(pool)
 	require.NoError(t, err)
-	require.Equal(t, uint(1), status.CurrentVersion)
+	require.Equal(t, status.LatestVersion, status.CurrentVersion)
 	require.False(t, status.Dirty)
 	var version int
 	require.NoError(t, pool.QueryRow(ctx, "SELECT version FROM app.postgremq_migrations").Scan(&version))
@@ -53,7 +54,7 @@ func TestSchemaIsolationWithApplicationTransactions(t *testing.T) {
 		(SELECT count(*) FROM pg_proc WHERE pronamespace='public'::regnamespace)`).Scan(&publicObjects))
 	require.Zero(t, publicObjects)
 
-	c, err := postgremq.DialFromPool(pool, postgremq.WithShutdownTimeout(time.Second))
+	c, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithShutdownTimeout(time.Second))
 	require.NoError(t, err)
 	defer c.Close()
 	require.NoError(t, c.CreateTopic(ctx, "in"))

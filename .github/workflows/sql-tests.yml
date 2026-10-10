@@ -1,16 +1,18 @@
 name: SQL Tests
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'mq/**'
-      - '.github/workflows/sql-tests.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'mq/**'
+      - 'scripts/release/check_migrations_immutable.sh'
       - '.github/workflows/sql-tests.yml'
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to test (default: the triggering commit)"
+        type: string
+        default: ''
 
 jobs:
   test:
@@ -20,6 +22,15 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
+
+    # A migration's number is the schema version postgremq.info() reports, so
+    # migrations already on the base branch never change.
+    - name: Existing migrations are unchanged
+      if: github.event_name == 'pull_request'
+      run: scripts/release/check_migrations_immutable.sh "origin/${{ github.base_ref }}"
 
     - name: Set up Python
       uses: actions/setup-python@v5

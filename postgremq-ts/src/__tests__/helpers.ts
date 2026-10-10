@@ -285,6 +285,9 @@ export async function createEmptyTestDatabase(db: TestDatabase): Promise<{ pool:
   db['createdDatabases'].add(dbName);
   const connectionString = `postgresql://postgres:postgres@${db['host']!}:${db['port']!}/${dbName}`;
   const pool = new Pool({ connectionString, max: 10 });
+  // pool.end() resolves before the sockets close, so DROP DATABASE ... WITH
+  // (FORCE) can terminate a closing client; that error is expected here.
+  pool.on('error', () => {});
   const dropDatabase = async () => {
     await pool.end();
     try {

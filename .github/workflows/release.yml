@@ -1,0 +1,175 @@
+name: Release
+
+# Every push to main: validate, then let Release Please tag merged release PRs
+# and open or update one release PR per component, then publish what was
+# tagged. See RELEASE.md.
+#
+# A failed run creates no tags and opens no PRs; the next passing run picks up
+# every unreleased change. Tags are created only for release PRs whose merge
+# commit passed validation (scripts/release/check_pending_releases.py), so a
+# later passing commit never authorizes tagging an earlier failed one.
+
+on:
+  push:
+    branches: [ main ]
+
+# No workflow-level concurrency: every pushed commit is validated (the guard
+# needs the Validated job of each release PR's merge commit). Only the jobs
+# that change the repository are serialized; a queued one replaced by a newer
+# run loses nothing, since each run handles every pending release.
+
+permissions:
+  contents: read
+
+jobs:
+  sql:
+    uses: ./.github/workflows/sql-tests.yml
+  go:
+    uses: ./.github/workflows/go-tests.yml
+  rust:
+    uses: ./.github/workflows/rust-tests.yml
+  typescript:
+    uses: ./.github/workflows/typescript-tests.yml
+  observability:
+    uses: ./.github/workflows/observability-tests.yml
+  packages:
+    uses: ./.github/workflows/packages.yml
+
+  # The single gate the release guard looks for on a commit: all validation
+  # of this exact commit passed. Keep the name in sync with
+  # check_pending_releases.py.
+  validated:
+    name: Validated
+    needs: [ sql, go, rust, typescript, observability, packages ]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Validation passed for ${{ github.sha }}"
+
+  release:
+    name: Release Please
+    needs: validated
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-please-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    outputs:
+      mq-tag: ${{ steps.tags.outputs['mq--tag_name'] }}
+      go-tag: ${{ steps.tags.outputs['postgremq-go--tag_name'] }}
+      cli-tag: ${{ steps.tags.outputs['cmd/postgremq--tag_name'] }}
+      rust-tag: ${{ steps.tags.outputs['postgremq-rs--tag_name'] }}
+      npm-tag: ${{ steps.tags.outputs['postgremq-ts--tag_name'] }}
+    steps:
+      # Release PRs opened with the default GITHUB_TOKEN do not trigger the
+      # PR workflows (no required checks). A GitHub App token does; configure
+      # the RELEASE_APP_ID variable and RELEASE_APP_PRIVATE_KEY secret.
+      - name: GitHub App token
+        id: app
+        if: vars.RELEASE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - name: Without a GitHub App
+        if: vars.RELEASE_APP_ID == ''
+        run: echo "::warning::RELEASE_APP_ID is not set; release PRs use GITHUB_TOKEN and their checks will not run automatically."
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Release guard
+        id: guard
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+        run: python3 scripts/release/check_pending_releases.py --branch "${{ github.ref_name }}" --validated-sha "${{ github.sha }}"
+
+      - name: Tag merged release PRs and create GitHub releases
+        id: tags
+        if: steps.guard.outputs.tag == 'true'
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ steps.app.outputs.token || github.token }}
+          target-branch: ${{ github.ref_name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
+
+      # postgremq.info() reports the schema version (the last migration), not
+      # the mq release; say in the release notes which one it ships.
+      - name: Note the schema version in the mq release
+        if: steps.tags.outputs['mq--tag_name'] != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          TAG: ${{ steps.tags.outputs['mq--tag_name'] }}
+        run: |
+          git fetch -q origin "refs/tags/$TAG:refs/tags/$TAG"
+          schema=$(git show "$TAG:mq/sql/latest.sql" |
+            sed -nE 's/^INSERT INTO postgremq\.postgremq_migrations \(version, dirty\) VALUES \(([0-9]+), false\);$/\1/p')
+          notes=$(gh release view "$TAG" --json body --jq .body)
+          header="Schema version: **$schema** (what postgremq.info() reports as schema_version after installing or upgrading to this release)."
+          gh release edit "$TAG" --notes "$(printf '%s\n\n%s' "$header" "$notes")"
+
+      - name: Open or update release PRs
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ steps.app.outputs.token || github.token }}
+          target-branch: ${{ github.ref_name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
+
+  publish-mq:
+    needs: release
+    if: needs.release.outputs.mq-tag != ''
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.release.outputs.mq-tag }}
+    permissions:
+      contents: read
+      id-token: write
+    secrets: inherit
+  publish-go:
+    needs: release
+    if: needs.release.outputs.go-tag != ''
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.release.outputs.go-tag }}
+    permissions:
+      contents: read
+      id-token: write
+    secrets: inherit
+  publish-cli:
+    needs: release
+    if: needs.release.outputs.cli-tag != ''
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.release.outputs.cli-tag }}
+    permissions:
+      contents: read
+      id-token: write
+    secrets: inherit
+  publish-rust:
+    needs: release
+    if: needs.release.outputs.rust-tag != ''
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.release.outputs.rust-tag }}
+    permissions:
+      contents: read
+      id-token: write
+    secrets: inherit
+  publish-npm:
+    needs: release
+    if: needs.release.outputs.npm-tag != ''
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.release.outputs.npm-tag }}
+    permissions:
+      contents: read
+      id-token: write
+    secrets: inherit

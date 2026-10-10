@@ -1,4 +1,4 @@
-package postgremq_go_test
+package postgremq_test
 
 import (
 	"context"
@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	postgremq "github.com/slavakl/postgremq/postgremq-go"
 	"github.com/stretchr/testify/require"
+	"postgremq.dev/postgremq-go"
 )
 
 // Run explicitly: POSTGREMQ_SOAK_SECONDS=60 go test -race -run TestProductionTopologySoak -timeout=3m -v
@@ -23,7 +23,7 @@ func TestProductionTopologySoak(t *testing.T) {
 	}
 	pool, ctx := setupTestConnection(t)
 	defer pool.Close()
-	c, err := postgremq.DialFromPool(pool, postgremq.WithShutdownTimeout(5*time.Second))
+	c, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithShutdownTimeout(5*time.Second))
 	require.NoError(t, err)
 	defer c.Close()
 	for i := 0; i < 20; i++ {

@@ -20,7 +20,7 @@ use postgremq::{ConnectionOptions, ConsumeOptions, PublishOptions, QueueOptions}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn group_order_holds_under_four_consumers() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -135,7 +135,7 @@ fn fastrand_ms() -> u32 {
 #[tokio::test(flavor = "multi_thread")]
 async fn acking_a_group_head_wakes_its_successor() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
@@ -174,7 +174,7 @@ async fn acking_a_group_head_wakes_its_successor() {
 #[tokio::test(flavor = "multi_thread")]
 async fn listen_wakes_a_consumer_within_100ms() {
     let db = TestDb::new().await;
-    let conn = db.connect(ConnectionOptions::default());
+    let conn = db.connect(ConnectionOptions::default()).await;
     let topic = unique("t");
     let queue = unique("q");
     conn.create_topic(&topic).await.unwrap();
