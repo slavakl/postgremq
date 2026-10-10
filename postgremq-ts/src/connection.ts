@@ -168,7 +168,7 @@ export class Connection implements IConnection {
 
   /** Set once close() has drained consumers and stopped the background actors
    *  (keep-alive + extender). Gates the actors instead of isShuttingDown so
-   *  they keep running THROUGH the consumer drain (G6/G7) and stop only after,
+   *  they keep running THROUGH the consumer drain and stop only after,
    *  mirroring the Go client's separate keepAliveCtx/extenderCtx cancelled last. */
   private backgroundStopped = false;
 
@@ -843,7 +843,7 @@ export class Connection implements IConnection {
    * Create a new queue
    * @param name - The queue name
    * @param topic - The topic name
-   * @param exclusive - Whether the queue is exclusive (non-durable)
+   * @param exclusive - Whether the queue is exclusive (temporary, kept alive by this connection)
    * @param options - Queue options
    * @returns Promise that resolves when the queue is created
    */

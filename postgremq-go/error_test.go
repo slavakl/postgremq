@@ -29,7 +29,7 @@ import (
 // done by IsRetryableError. The pre-fix substring fallback matched any
 // error whose text contained "08" — including timestamps like "08:00:00",
 // file paths, byte counts — producing spurious retries on permanent
-// failures. (REVIEW.md §3.7)
+// failures.
 func TestIsRetryableError_Classification(t *testing.T) {
 	t.Parallel()
 
@@ -279,7 +279,7 @@ func TestTransactionErrorHandling(t *testing.T) {
 // rows to status='processing' and assigns a fresh consumer_token. If
 // we retried after a partial-result error (e.g. row-iteration network
 // drop) we'd claim a SECOND batch from the server while the first sat
-// orphaned in 'processing' until vt expired. (REVIEW.md §3.3)
+// orphaned in 'processing' until vt expired.
 func TestConsumeMessagesDoesNotRetry(t *testing.T) {
 	t.Parallel()
 

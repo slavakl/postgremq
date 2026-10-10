@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	postgremq "github.com/slavakl/postgremq/postgremq-go"
 	"github.com/stretchr/testify/assert"
@@ -90,6 +91,7 @@ func (r *MockRows) Scan(dest ...any) error {
 func (r *MockRows) Values() ([]any, error) { return nil, nil }
 func (r *MockRows) RawValues() [][]byte    { return nil }
 func (r *MockRows) Conn() *pgx.Conn        { return nil }
+func (r *MockRows) TypeMap() *pgtype.Map   { return nil }
 
 // MockLogger implements Logger interface for testing
 type MockLogger struct {
@@ -146,7 +148,7 @@ func TestConnectionEstablishment(t *testing.T) {
 // listener handles against a closed listener, appended to a slice that had
 // already been snapshotted by Close, and returned a Consumer whose
 // goroutines exited promptly on the cancelled ctx — leaving the listener
-// handles' wake channels hanging until process exit. (REVIEW.md §3.2)
+// handles' wake channels hanging until process exit.
 func TestConsumeAfterCloseReturnsError(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)

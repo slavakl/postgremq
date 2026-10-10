@@ -110,7 +110,7 @@ def test_collector_sql_and_client_examples():
                 limited.close()
             env = {**os.environ, 'DATABASE_URL': dsn, 'OTEL_EXPORTER_OTLP_ENDPOINT': endpoint}
             for directory, command, timeout in [
-                ('postgremq-go', ['go', 'run', './examples/metrics'], 120),
+                ('postgremq-go/examples/metrics', ['go', 'run', '.'], 120),
                 ('postgremq-ts', ['npm', 'exec', '--', 'ts-node', 'examples/metrics.ts'], 120),
                 ('postgremq-rs', ['cargo', 'run', '--locked', '--example', 'metrics', '--features', 'otel'], 900),
             ]:

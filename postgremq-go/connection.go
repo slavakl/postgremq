@@ -47,7 +47,7 @@ type Connection struct {
 	fatalQueues         sync.Map                      // set of queues already declared fatal (dedupe queueFatal)
 	extenderBatchSize   int                           // per-tick cap on messages extended in one set_vt_batch_multi call
 	// Connection-level background actors (see actor.go). Both run on their own
-	// context and are stopped LAST in Close() (keep-alive G7 / extender G6).
+	// context and are stopped LAST in Close().
 	keepAlive    *actor[*kaEntry, string, kaResult]
 	extender     *actor[*extEntry, extKey, extResult]
 	retryConfig  RetryConfig
@@ -141,7 +141,7 @@ func newConnection(_ context.Context, pool Pool, ownPool bool, opts ...Connectio
 	// select with no work until the first register. Built AFTER the options loop
 	// so the extender's batch cap is known and the keep-alive actor never races a
 	// write to onKeepAliveFailure. Each owns its own context (not conn.ctx) and
-	// is stopped LAST in Close() so it outlives the consumer drain (G6/G7).
+	// is stopped LAST in Close() so it outlives the consumer drain.
 	conn.keepAlive = newActor[*kaEntry, string, kaResult](newKeepAliveScheduler(conn), 64, 64)
 	conn.extender = newActor[*extEntry, extKey, extResult](newExtScheduler(conn, conn.extenderBatchSize), 256, 256)
 	conn.keepAlive.start()
@@ -217,7 +217,7 @@ func (c *Connection) Close() error {
 		}
 
 		// Stop the connection-level background actors. Both intentionally
-		// outlive the consumer drain (keep-alive: G7; extender: G6) and are
+		// outlive the consumer drain and are
 		// stopped here, after consumers have drained, in any order.
 		c.ioCancel()
 		close(c.closedFlag)
@@ -636,7 +636,7 @@ type MultiLock struct {
 // already passed, or token mismatch) — correlate by the COMPOSITE (Queue, ID)
 // identity (including Token), never message_id alone.
 //
-// The operation uses the configured retry policy: extension is idempotent (G8).
+// The operation uses the configured retry policy: extension is idempotent.
 func (c *Connection) SetVTBatchMulti(ctx context.Context, exts []MultiExtension) (result []MultiLock, resultErr error) {
 	finishMetric := c.metrics.startOperation(ctx, "extend_batch", "", false)
 	defer func() { finishMetric(resultErr) }()
@@ -753,7 +753,7 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 	// until vt expires. The fetch loop in Consumer.startMessageLoop
 	// already retries the next tick on error, which is the correct
 	// recovery path: don't double-consume, let vt expiry redeliver the
-	// stranded batch. (REVIEW.md §3.3)
+	// stranded batch.
 	var generation *string
 	if len(generations) > 0 && generations[0] != "" {
 		generation = &generations[0]

@@ -283,16 +283,13 @@ export interface ConsumerOptions {
      * auto-extension fires, matching the Go client's `WithExtensionThreshold`.
      * Must be in (0, 1). Default 0.5 (extend at the halfway point). Lower
      * values extend earlier (more headroom, more DB calls); higher values
-     * extend later (e.g. 0.9 = extend at 90% of the lease). Note: this is the
-     * inverse of pre-1.0 TS behavior, where a higher value extended earlier —
-     * it now follows the documented/Go semantics.
+     * extend later (e.g. 0.9 = extend at 90% of the lease).
      */
     extensionThreshold?: number;
     /**
      * @deprecated Ignored. Auto-extension always re-extends by
      * `visibilityTimeoutSec` (matching the Go client) so the granted lease
-     * and the next-extension schedule stay consistent. A smaller value here
-     * used to collapse a large VT and let messages expire mid-processing.
+     * and the next-extension schedule stay consistent.
      */
     extensionSec?: number;
     /**
@@ -344,7 +341,7 @@ export interface QueueInfo {
   topicName: string;
   /** Maximum delivery attempts (0 for unlimited) */
   maxDeliveryAttempts: number;
-  /** Whether the queue is exclusive (non-durable) */
+  /** Whether the queue is exclusive (temporary, kept alive by its owner) */
   exclusive: boolean;
   /** Expiration timestamp for exclusive queues */
   keepAliveUntil: Date | null;

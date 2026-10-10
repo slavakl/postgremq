@@ -1,127 +1,88 @@
 # PostgreMQ
 
-A reliable, feature-rich message queue system built entirely on PostgreSQL.
+A message queue built entirely on PostgreSQL: plain SQL tables and functions,
+with client libraries for Go, TypeScript and Rust.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Go Version](https://img.shields.io/badge/Go-1.23%2B-blue)](https://go.dev/)
-[![Node Version](https://img.shields.io/badge/Node-14.0%2B-green)](https://nodejs.org/)
+[![SQL Tests](https://github.com/slavakl/postgremq/actions/workflows/sql-tests.yml/badge.svg)](https://github.com/slavakl/postgremq/actions/workflows/sql-tests.yml)
+[![Go Tests](https://github.com/slavakl/postgremq/actions/workflows/go-tests.yml/badge.svg)](https://github.com/slavakl/postgremq/actions/workflows/go-tests.yml)
+[![TypeScript Tests](https://github.com/slavakl/postgremq/actions/workflows/typescript-tests.yml/badge.svg)](https://github.com/slavakl/postgremq/actions/workflows/typescript-tests.yml)
+[![Rust Tests](https://github.com/slavakl/postgremq/actions/workflows/rust-tests.yml/badge.svg)](https://github.com/slavakl/postgremq/actions/workflows/rust-tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-## Overview
+PostgreMQ runs in the PostgreSQL database you already have. It is a SQL
+script, with no extension and no extra server. Messages are rows, so
+publishing and acknowledging can take part in your application's own
+transactions.
 
-PostgreMQ is a message queue system that leverages PostgreSQL's reliability and ACID guarantees to provide durable, distributed message processing. It consists of three main components:
+## Features
 
-- **mq** - Core PostgreSQL implementation (SQL schema and functions)
-- **postgremq-go** - Go client library
-- **postgremq-ts** - TypeScript/Node.js client library
-- **postgremq-rs** - Rust client library (crate `postgremq`, sqlx + Tokio)
+- **Topics with fan-out**: publish once; every queue subscribed to the topic
+  gets its own copy.
+- **Transactional**: publish and acknowledge inside the caller's transaction
+  (transactional outbox and inbox).
+- **Visibility-timeout leases** with per-delivery ownership tokens; clients
+  renew leases automatically while work runs.
+- **Retries and a dead letter queue**: a per-queue delivery attempt limit,
+  delayed nack, DLQ requeue and purge.
+- **Delayed delivery**: publish now, deliver later.
+- **Ordered delivery with message groups**: messages sharing a group key are
+  delivered in publish order, one at a time, within each queue.
+- **Exclusive queues**: temporary queues that live while their owner keeps
+  them alive.
+- **Low-latency wake-ups** through LISTEN/NOTIFY, with polling as a fallback.
+- **Many consumers per queue**: rows are claimed with `SKIP LOCKED`.
+- **Observability**: per-queue metrics in SQL and OpenTelemetry client
+  metrics, described by one contract shared by the clients.
 
-## Key Features
+## Components
 
-- **No Extension Required**: Pure SQL schema - just run a .sql file, no PostgreSQL extension installation needed
-- **Topic-to-Queue Fan-out**: Publish once to a topic, automatically distributed to multiple queues via triggers
-- **ACID Guarantees**: Full PostgreSQL transaction support for reliable message persistence and processing
-- **Transactional Outbox Pattern**: Publish and acknowledge messages atomically within application transactions
-- **Visibility Timeout**: Messages use visibility timeouts instead of locks (similar to AWS SQS)
-- **Auto Visibility Extension**: Client libraries automatically extend timeouts during long-running processing
-- **Real-time Notifications**: Uses PostgreSQL LISTEN/NOTIFY for instant message delivery
-- **Dead Letter Queue**: Configurable max delivery attempts with automatic DLQ for failed messages
-- **Delayed Delivery**: Schedule messages for future delivery
-- **Multiple Consumers**: Parallel message processing with automatic load distribution via SKIP LOCKED
-- **Queue Types**:
-  - **Non-exclusive queues**: Persistent, standard message queues
-  - **Exclusive queues**: Temporary queues that auto-expire without keep-alive
+| Component | Path | Install |
+|-----------|------|---------|
+| SQL schema and functions | [`mq/`](./mq/README.md) | run `mq/sql/latest.sql`, or the migrations |
+| Go client | [`postgremq-go/`](./postgremq-go/README.md) | `go get github.com/slavakl/postgremq/postgremq-go` |
+| TypeScript client | [`postgremq-ts/`](./postgremq-ts/README.md) | `npm install postgremq` |
+| Rust client | [`postgremq-rs/`](./postgremq-rs/README.md) | `cargo add postgremq` |
+| CLI (migrations) | [`cmd/postgremq/`](./cmd/postgremq/README.md) | `go install github.com/slavakl/postgremq/cmd/postgremq@latest` |
 
-## Quick Start
+Requirements: PostgreSQL 15+. Go 1.25+, Node.js 22+ or Rust 1.94+ for the
+clients.
 
-### Prerequisites
+## Quick start
 
-- PostgreSQL 15 or later
-- Go 1.23+ (for Go client)
-- Node.js 14+ (for TypeScript client)
-
-### Installation
-
-#### SQL Schema
-
-First, install the core PostgreMQ schema in the same database as your application. Queue objects live in the fixed `postgremq` schema; application tables can stay in `public` or another schema. No `search_path` configuration is needed.
-
-```sql
--- Run the SQL from mq/sql/latest.sql
--- This creates the topics, queues, messages, and queue_messages tables
--- along with all necessary functions and triggers in the postgremq schema
-```
-
-#### Go Client
-
-```bash
-go get github.com/slavakl/postgremq/postgremq-go
-```
-
-```go
-import postgremq "github.com/slavakl/postgremq/postgremq-go"
-```
-
-#### TypeScript Client
+Install the schema into your database. It creates everything in the
+`postgremq` schema:
 
 ```bash
-npm install postgremq
+psql "$DATABASE_URL" -f mq/sql/latest.sql
+# or, with versioned migrations:
+postgremq migrate --dsn "$DATABASE_URL"
 ```
 
-```typescript
-import { connect } from 'postgremq';
-```
-
-#### Rust Client
-
-```toml
-[dependencies]
-postgremq = { path = "postgremq-rs" }
-```
-
-## Usage Examples
+Then schedule the maintenance functions (see
+[Maintenance and retention](./mq/README.md#maintenance-and-retention)).
 
 ### Go
 
 ```go
-package main
+conn, err := postgremq.Dial(ctx, cfg) // cfg from pgxpool.ParseConfig
+if err != nil {
+	log.Fatal(err)
+}
+defer conn.Close()
 
-import (
-    "context"
-    "encoding/json"
-    "log"
+_ = conn.CreateTopic(ctx, "orders")
+_ = conn.CreateQueue(ctx, "order-processing", "orders", false,
+	postgremq.WithMaxDeliveryAttempts(5))
 
-    postgremq "github.com/slavakl/postgremq/postgremq-go"
-    "github.com/jackc/pgx/v5/pgxpool"
-)
+_, _ = conn.Publish(ctx, "orders", json.RawMessage(`{"order_id": 12345}`))
 
-func main() {
-    ctx := context.Background()
-
-    // Connect to PostgreSQL
-    cfg, _ := pgxpool.ParseConfig("postgres://user:pass@localhost:5432/mydb")
-    conn, err := postgremq.Dial(ctx, cfg)
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer conn.Close()
-
-    // Create topic and queue
-    conn.CreateTopic(ctx, "orders")
-    conn.CreateQueue(ctx, "order-processor", "orders", false)
-
-    // Publish a message
-    payload := json.RawMessage(`{"order_id": 12345, "total": 99.99}`)
-    messageID, _ := conn.Publish(ctx, "orders", payload)
-    log.Printf("Published message: %d", messageID)
-
-    // Consume messages
-    consumer, _ := conn.Consume("order-processor")
-    defer consumer.Stop()
-
-    for msg := range consumer.Messages() {
-        log.Printf("Received: %s", string(msg.Payload))
-        msg.Ack(ctx)
-    }
+consumer, err := conn.Consume("order-processing", postgremq.WithVT(30))
+if err != nil {
+	log.Fatal(err)
+}
+for msg := range consumer.Messages() {
+	log.Printf("message %d: %s", msg.ID, msg.Payload)
+	_ = msg.Ack(ctx)
 }
 ```
 
@@ -130,242 +91,124 @@ func main() {
 ```typescript
 import { connect } from 'postgremq';
 
-async function main() {
-  // Connect to PostgreSQL
-  const client = await connect({
-    connectionString: 'postgresql://user:pass@localhost:5432/mydb'
-  });
+const client = await connect({ connectionString: process.env.DATABASE_URL });
 
-  // Create topic and queue
-  await client.createTopic('orders');
-  await client.createQueue('order-processor', 'orders', false);
+await client.createTopic('orders');
+await client.createQueue('order-processing', 'orders', false, { maxDeliveryAttempts: 5 });
 
-  // Publish a message
-  const messageId = await client.publish('orders', {
-    order_id: 12345,
-    total: 99.99
-  });
-  console.log(`Published message: ${messageId}`);
+await client.publish('orders', { orderId: 12345 });
 
-  // Consume messages
-  const consumer = client.consume('order-processor');
-
-  for await (const message of consumer.messages()) {
-    console.log('Received:', message.payload);
-    await message.ack();
-  }
-
-  await client.close();
+const consumer = client.consume('order-processing', { visibilityTimeoutSec: 30 });
+for await (const message of consumer.messages()) {
+  console.log(message.payload);
+  await message.ack();
 }
-
-main().catch(console.error);
 ```
 
-## Architecture
+### Rust
 
-### Message Flow
+```rust
+use postgremq::{Connection, ConnectionOptions, ConsumeOptions, PublishOptions, QueueOptions};
 
-1. **Publish**: Messages are published to a **topic**
-2. **Distribution**: A trigger automatically copies messages to all **queues** subscribed to that topic
-3. **Consume**: Consumers fetch messages from postgremq.queues with a **visibility timeout**
-4. **Processing**: Messages are invisible to other consumers during processing
-5. **Acknowledgment**: Messages can be:
-   - **Acked**: Marked as successfully processed (removed from queue)
-   - **Nacked**: Returned to queue, preserving the attempt counted at claim (optional delay)
-   - **Released**: Returned to queue without incrementing delivery attempt
-6. **Dead Letter Queue**: Messages exceeding max delivery attempts are moved to DLQ
+let conn = Connection::connect(&database_url, ConnectionOptions::default()).await?;
+conn.create_topic("orders").await?;
+conn.create_queue("order-processing", "orders", QueueOptions::default().max_delivery_attempts(5))
+    .await?;
 
-### Database Schema
+conn.publish("orders", &serde_json::json!({ "order_id": 12345 }), PublishOptions::default())
+    .await?;
 
-```
-topics
-  └─> queues (one-to-many)
-        └─> queue_messages (many-to-many with messages)
-              └─> messages
-
-dead_letter_queue (failed messages)
+let mut consumer = conn.consume("order-processing", ConsumeOptions::default()).await?;
+while let Some(delivery) = consumer.next().await {
+    let delivery = delivery?;
+    println!("{}", delivery.payload());
+    delivery.ack().await?;
+}
 ```
 
-Queue deliveries cascade with their queue or payload. DLQ references restrict destructive deletion; use the [retention maintenance functions](mq/README.md) for safe payload collection.
+Each client's README covers connection options, handler consumers,
+transactions, message groups, exclusive queues, shutdown and errors.
 
-## Core Concepts
+## How it works
 
-### Visibility Timeout
+1. **Publish**: `publish_message` stores the message. A trigger copies it into
+   every queue on the topic and notifies `pmq:t:<topic>`.
+2. **Consume**: `consume_message` claims visible rows with `SKIP LOCKED`, sets
+   their visibility timeout and gives each delivery a fresh ownership token.
+3. **Process**: while a handler runs, the client renews the lease in the
+   background, batching every in-flight delivery of the connection into one
+   call.
+4. **Settle**: an **ack** completes the delivery. A **nack** makes it visible
+   again, optionally after a delay; its final allowed attempt moves it to the
+   dead letter queue. A **release** returns it without counting the attempt.
+   A delivery whose lease expires is redelivered.
 
-Instead of traditional message locks, PostgreMQ uses **visibility timeouts** (VT). When a consumer fetches a message, it becomes invisible to other consumers until the timeout expires. This is similar to AWS SQS's model.
+[docs/architecture.md](./docs/architecture.md) describes the data model,
+leases, queue generations, message groups, notifications and the client
+design. [docs/delivery-lifecycle.md](./docs/delivery-lifecycle.md) describes
+how the clients handle settlement, cancellation, renewal and shutdown, and
+where they differ.
 
-- Default VT is configurable per consumer
-- Automatic extension prevents timeout during long processing
-- Manual extension available via `SetVT()` / `setVt()`
+## Client feature matrix
 
-### Queue Types
+| Feature | Go | TypeScript | Rust |
+|---------|:--:|:----------:|:----:|
+| Publish / ack in the caller's transaction | ✅ | ✅ | ✅ |
+| Stream consumer | channel | async iterator | `Stream` |
+| Handler consumer with bounded concurrency | ✅ | ✅ | ✅ |
+| Automatic lease renewal (batched per connection) | ✅ | ✅ | ✅ |
+| Exclusive queues with keep-alive | ✅ | ✅ | ✅ |
+| Message groups | ✅ | ✅ | ✅ |
+| Delayed delivery and delayed nack | ✅ | ✅ | ✅ |
+| Queue-loss notification | ✅ | ✅ | ✅ |
+| Graceful shutdown with deadline | ✅ | ✅ | ✅ |
+| Retry of transient errors | ✅ | ✅ | ✅ |
+| OpenTelemetry metrics | ✅ | ✅ | ✅ (`otel` feature) |
+| Schema migrations | ✅ | — | — |
 
-- **Non-exclusive** (formerly "durable"): Persistent queues that live indefinitely
-- **Exclusive** (formerly "non-durable"): Temporary queues that expire without keep-alive
+## When to use it
 
-### Event Notification
+PostgreMQ fits when you already run PostgreSQL and want:
 
-PostgreMQ emits empty notifications on `pmq:t:<topic>` for publications and `pmq:q:<queue>` for nack/release/requeue. Clients share a LISTEN session and use polling as fallback.
+- queueing without operating another system;
+- messages that commit or roll back with your data;
+- moderate throughput, where durability and simplicity matter more than raw
+  speed.
 
-## Client Libraries
-
-| Feature | Go Client | TypeScript Client | Rust Client |
-|---------|-----------|-------------------|-------------|
-| Connection pooling | ✅ | ✅ | ✅ |
-| Auto visibility timeout extension | ✅ | ✅ | ✅ |
-| Transaction support | ✅ | ✅ | ✅ |
-| Async iteration | ✅ | ✅ | ✅ (`Stream`) |
-| Delayed delivery | ✅ | ✅ | ✅ |
-| Message groups (ordered delivery) | ✅ | ✅ | ✅ |
-| Dead letter queue | ✅ | ✅ | ✅ |
-| Retry with backoff | ✅ | ✅ | ✅ |
-| LISTEN/NOTIFY | ✅ | ✅ | ✅ |
-| Keep-alive for exclusive queues | ✅ | ✅ | ✅ |
-| OpenTelemetry client metrics | ✅ | ✅ | ✅ (`otel` feature) |
+Consider a dedicated broker if you need very high throughput (hundreds of
+thousands of messages per second), cross-region replication of queues, or
+complex routing.
 
 ## Documentation
 
-- [Go Client Documentation](./postgremq-go/README.md)
-- [TypeScript Client Documentation](./postgremq-ts/README.md)
-- [Rust Client Documentation](./postgremq-rs/README.md)
-- [SQL Implementation](./mq/README.md)
-- [Contributing Guidelines](./CONTRIBUTING.md)
-- [Security Policy](./SECURITY.md)
-
-## Testing
-
-All components include comprehensive test suites using testcontainers for isolated PostgreSQL instances.
-
-### Go Tests
-
-```bash
-cd postgremq-go
-go test -v ./...
-```
-
-### TypeScript Tests
-
-```bash
-cd postgremq-ts
-npm test
-```
-
-### Rust Tests
-
-```bash
-cd postgremq-rs
-# Uses a reusable postgres:15 testcontainer (Docker) by default, or a
-# PostgreSQL 15+ server whose user can create databases:
-# export POSTGREMQ_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
-cargo test
-```
-
-### SQL Tests
-
-```bash
-cd mq
-pip install -r tests/requirements.txt
-pytest tests/tests.py -v
-```
-
-## Performance Characteristics
-
-- **Message throughput**: Depends on PostgreSQL performance
-- **Latency**: Sub-second delivery via LISTEN/NOTIFY
-- **Scalability**: Scales with PostgreSQL (supports read replicas for some operations)
-- **Durability**: ACID guarantees from PostgreSQL
-
-## Comparison with Other Message Queues
-
-| Feature | PostgreMQ | RabbitMQ | AWS SQS | Redis |
-|---------|-----------|----------|---------|-------|
-| Persistence | PostgreSQL | Disk/RAM | AWS-managed | RAM (optional disk) |
-| ACID guarantees | ✅ | ⚠️ | ⚠️ | ❌ |
-| Transaction support | ✅ Full | ⚠️ | ❌ | ⚠️ |
-| Additional infrastructure | ❌ | ✅ | ❌ | ✅ |
-| Topic-based pub/sub | ✅ | ✅ | ❌ | Pub/Sub |
-| Message ordering | Per topic | Per queue | FIFO queues | ❌ |
-| Delayed delivery | ✅ | ✅ | ✅ | ❌ |
-| Auto visibility extension | ✅ | N/A | ❌ | N/A |
-| Extension required | ❌ | N/A | N/A | N/A |
-
-*For PostgreSQL-based alternatives, see [PGMQ](https://github.com/pgmq/pgmq) in [Acknowledgments](#acknowledgments).*
-
-## Use Cases
-
-PostgreMQ is ideal when you:
-
-- Already use PostgreSQL and want to avoid additional infrastructure
-- Need ACID guarantees for message processing
-- Want to publish/acknowledge messages within database transactions
-- Need a simple, reliable queue without operational complexity
-- Require message durability and consistency over extreme throughput
-
-PostgreMQ may not be ideal when you:
-
-- Need millions of messages per second
-- Require advanced routing (use RabbitMQ)
-- Need distributed queue across multiple regions (use AWS SQS)
-- Want minimal latency (use Redis Streams)
-
-## Roadmap
-
-- [ ] Enhanced monitoring and metrics
-- [ ] Admin UI/dashboard
-- [ ] Migration to new version 
+- [Architecture](./docs/architecture.md)
+- [SQL reference and delivery contract](./mq/README.md)
+- [Delivery lifecycle (client contract)](./docs/delivery-lifecycle.md)
+- [Observability](./docs/observability.md)
+- Clients: [Go](./postgremq-go/README.md) · [TypeScript](./postgremq-ts/README.md) · [Rust](./postgremq-rs/README.md) · [CLI](./cmd/postgremq/README.md)
 
 ## Contributing
 
-We welcome contributions! Please see our [Contributing Guidelines](./CONTRIBUTING.md) for details.
+Contributions are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for how
+to build and test each component, and [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md).
+Report security issues privately as described in [SECURITY.md](./SECURITY.md).
 
 ## License
 
-PostgreMQ is released under the [MIT License](./LICENSE).
-
-## Support
-
-- **Issues**: [GitHub Issues](https://github.com/slavakl/postgremq/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/slavakl/postgremq/discussions)
+[MIT](./LICENSE)
 
 ## Acknowledgments
 
-PostgreMQ was inspired by [PGMQ](https://github.com/pgmq/pgmq) and the broader PostgreSQL message queue ecosystem. We're grateful to the PGMQ team for pioneering PostgreSQL-based message queues and demonstrating the viability of this approach.
+PostgreMQ was inspired by [PGMQ](https://github.com/pgmq/pgmq), which showed
+that PostgreSQL makes a capable message queue. PostgreMQ puts its own emphasis
+on a few areas:
 
-### Key Differences
-
-Building on the PostgreSQL message queue concept, PostgreMQ offers:
-
-**No Extension Installation Required**
-- Pure SQL schema - just run a .sql file
-- No need to install PostgreSQL extensions or restart the database
-- Works on any PostgreSQL 15+ instance, including managed services (RDS, Cloud SQL, etc.)
-
-**Topic-to-Queue Fan-out**
-- Publish once to a topic, automatically distributed to all subscribed queues
-- Perfect for fan-out patterns and event broadcasting
-- Implemented via PostgreSQL triggers for automatic, reliable distribution
-
-**Transactional Outbox Pattern**
-- Publish and acknowledge messages within application transactions
-- Ensures atomic message operations with business logic
-- Full rollback support prevents orphaned messages
-
-**Automatic Visibility Timeout Extension**
-- Client libraries automatically extend timeouts during long-running processing
-- No manual timeout management required
-- Prevents message redelivery for legitimate long-running jobs
-
-**Non-Exclusive and Exclusive Queue Support**
-- **Non-exclusive queues**: Persistent, standard message queues
-- **Exclusive queues**: Temporary queues that auto-expire without keep-alive
-- Supports different messaging patterns (persistent vs ephemeral)
-
----
-
-## Observability
-
-Queue-state metrics are available through `postgremq.queue_metrics()`. Both clients
-support opt-in OpenTelemetry metrics for operations, handler execution, received
-deliveries and renewal loss. See the [observability guide](docs/observability.md) for the
-tested Collector configuration, metric definitions, and runnable Go/TypeScript
-examples.
+- strictly ordered message groups enforced by the database: a group is
+  delivered in publish commit order, one message at a time, whichever way
+  consumers read;
+- exclusive queues that live only while their owner keeps them alive;
+- per-delivery ownership tokens and queue generations, so a stale consumer
+  cannot affect a redelivered message or a re-created queue;
+- a built-in dead letter queue with per-queue delivery attempt limits;
+- client libraries for Go, TypeScript and Rust that renew leases
+  automatically, wake up through LISTEN/NOTIFY and shut down gracefully.

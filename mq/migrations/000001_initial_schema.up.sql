@@ -90,7 +90,7 @@ CREATE TABLE postgremq.queues (
   name VARCHAR(255) PRIMARY KEY,
   topic_name VARCHAR(255) NOT NULL REFERENCES postgremq.topics(name) ON DELETE CASCADE,
   max_delivery_attempts INT NOT NULL DEFAULT 0,
-  exclusive BOOLEAN NOT NULL DEFAULT false,  -- Changed from durable
+  exclusive BOOLEAN NOT NULL DEFAULT false,  -- temporary queue kept alive by its owner
   keep_alive_interval INTERVAL NOT NULL DEFAULT '5 minutes',
   keep_alive_until TIMESTAMPTZ
 );
@@ -103,7 +103,7 @@ CREATE TABLE postgremq.messages (
   topic_name VARCHAR(255) NOT NULL REFERENCES postgremq.topics(name) ON DELETE CASCADE,
   payload JSONB NOT NULL,
   published_at TIMESTAMPTZ DEFAULT clock_timestamp(),
-  deliver_after TIMESTAMPTZ DEFAULT clock_timestamp(),  -- New column with default clock_timestamp()
+  deliver_after TIMESTAMPTZ DEFAULT clock_timestamp(),  -- first visibility time
   -- Message group (ordered delivery). NULL = ungrouped. group_seq is the
   -- dense per-(topic, group_key) sequence allocated by publish_message under
   -- the message_groups row lock, so group order is publish commit order.
@@ -131,7 +131,7 @@ CREATE TABLE postgremq.queue_messages (
   message_id BIGINT REFERENCES postgremq.messages(id) ON DELETE CASCADE,
   status VARCHAR(16) DEFAULT 'pending',  -- Allowed: 'pending', 'processing', 'completed'
   published_at TIMESTAMPTZ DEFAULT clock_timestamp(),
-  vt TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),  -- Renamed from locked_until
+  vt TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),  -- visibility timeout (lease end)
   delivery_attempts INT DEFAULT 0,
   consumer_token VARCHAR(64),
   processed_at TIMESTAMPTZ,
@@ -153,10 +153,8 @@ CREATE TABLE postgremq.queue_messages (
 -- Dead Letter Queue table.
 -- Composite primary key: (queue_name, message_id).
 -- ON DELETE RESTRICT on both FKs: DLQ entries are forensic data the
--- operator may want to keep across queue/topic cleanups. Cascading
--- deletes (the previous behavior) silently wiped DLQ history when
--- clean_up_topic or delete_queue ran. Operators now have to make an
--- explicit choice — postgremq.purge_dlq() or postgremq.requeue_dlq_messages() — before
+-- operator may want to keep across queue/topic cleanups, so cleanups never
+-- remove them implicitly. Operators make an explicit choice — postgremq.purge_dlq() or postgremq.requeue_dlq_messages() — before
 -- removing the underlying messages or queue.
 CREATE TABLE postgremq.dead_letter_queue (
   queue_name VARCHAR(255) REFERENCES postgremq.queues(name) ON DELETE RESTRICT,
@@ -848,7 +846,7 @@ CREATE OR REPLACE FUNCTION postgremq.release_message(
 BEGIN
     UPDATE postgremq.queue_messages
     SET status = 'pending',
-        vt = clock_timestamp(),  -- Renamed from locked_until
+        vt = clock_timestamp(),
         consumer_token = NULL,
         -- GREATEST floors at 0: a stale consumer racing a reclaim path could
         -- otherwise underflow delivery_attempts on repeated releases. The
@@ -975,10 +973,9 @@ BEGIN
     ),
     inserted AS (
         -- ON CONFLICT for parity with nack_message's inline retirement.
-        -- Today's predicate makes a double-insert impossible (nack flips
+        -- The predicate already makes a double-insert impossible (nack flips
         -- status to 'pending' before deleting; maintenance only matches
-        -- 'processing' rows), but the guard hardens against future code
-        -- paths that might re-fire on the same (queue_name, message_id).
+        -- 'processing' rows); the guard is defence in depth.
         INSERT INTO postgremq.dead_letter_queue(queue_name, message_id, retry_count)
         SELECT queue_name, message_id, delivery_attempts
         FROM deleted_messages
@@ -1096,15 +1093,15 @@ $$ LANGUAGE plpgsql;
  *     - queue_name (VARCHAR): The name of the queue.
  *     - topic_name (VARCHAR): The associated topic name.
  *     - max_delivery_attempts (INT): Maximum delivery attempts (-1 indicates unlimited).
- *     - durable (BOOLEAN): Indicates if the queue is durable.
- *     - keep_alive_until (TIMESTAMPTZ): Expiration timestamp for non-durable queues.
+ *     - exclusive (BOOLEAN): Whether the queue is exclusive (temporary).
+ *     - keep_alive_until (TIMESTAMPTZ): Expiration timestamp for exclusive queues.
  */
 CREATE OR REPLACE FUNCTION postgremq.list_queues()
 RETURNS TABLE(
   queue_name VARCHAR(255),
   topic_name VARCHAR(255),
   max_delivery_attempts INT,
-  exclusive BOOLEAN,  -- Changed from durable
+  exclusive BOOLEAN,
   keep_alive_until TIMESTAMPTZ
 ) AS $$
 BEGIN
@@ -1113,7 +1110,7 @@ BEGIN
       queues.name AS queue_name,
       queues.topic_name,
       queues.max_delivery_attempts,
-      queues.exclusive,  -- Changed from durable
+      queues.exclusive,
       queues.keep_alive_until
     FROM postgremq.queues
     ORDER BY queues.name;
@@ -1435,8 +1432,8 @@ $$ LANGUAGE plpgsql;
 /* Function: delete_inactive_queues
  *
  * Description:
- *   Deletes non-durable queues that are inactive. A queue is considered inactive if it
- *   is non-durable and its keep_alive_until timestamp is either NULL or has already expired.
+ *   Deletes exclusive queues that are inactive: their keep_alive_until is NULL
+ *   or has already expired.
  *
  * Returns: VOID.
  */
@@ -1447,7 +1444,7 @@ BEGIN
   -- is ON DELETE RESTRICT and the operator should explicitly handle
   -- DLQ before dropping the queue.
   DELETE FROM postgremq.queues q
-  WHERE q.exclusive = true  -- Changed from durable = false
+  WHERE q.exclusive = true
     -- Strict expiry, no grace window — see pmq_maintenance_fast.
     AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= clock_timestamp())
     AND NOT EXISTS (

@@ -1,6 +1,6 @@
 // Keep-alive actor tests: cover the connection-level keep-alive actor that
 // batches every exclusive queue's keep-alive into one
-// extend_queue_keep_alive_multi call per tick (Phase A of the actor refactor).
+// extend_queue_keep_alive_multi call per tick.
 package postgremq_go_test
 
 import (

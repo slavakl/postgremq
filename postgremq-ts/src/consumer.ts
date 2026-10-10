@@ -188,7 +188,7 @@ export class Consumer {
 
   /**
    * Start the consumer.
-   * Called internally when messages() is called. resolveTopic is now
+   * Called internally when messages() is called. resolveTopic is
    * synchronous (explicit option > cache > throw), so subscription and the
    * initial fetch happen on the same tick.
    */
@@ -206,7 +206,7 @@ export class Consumer {
       this.handleNotification.bind(this)
     );
 
-    // Auto-extension is no longer a per-consumer timer: in-flight messages are
+    // Auto-extension is connection-level: in-flight messages are
     // registered with the connection-level extender actor as they are fetched
     // (addToQueue) and deregistered when they settle (handleMessageComplete).
 

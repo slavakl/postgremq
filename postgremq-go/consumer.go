@@ -296,7 +296,7 @@ func (c *Consumer) run() {
 			}
 			outbox = outbox[:0]
 			// Cancel in-flight handlers ONCE. They stay registered with the
-			// extender and keep getting extended until they settle (G6); their
+			// extender and keep getting extended until they settle; their
 			// settle removes them from inflight via the completed channel.
 			if !cancelledInflight {
 				for _, m := range inflight {
@@ -306,7 +306,7 @@ func (c *Consumer) run() {
 			}
 			// Return only once the in-flight set is empty AND no fetch goroutine
 			// is still outstanding (it must report back so its batch is released
-			// and `fetching` clears — G5/no stranded batch, review #11 join).
+			// and `fetching` clears, so no fetched batch is stranded).
 			if !fetching && len(inflight) == 0 {
 				return
 			}
@@ -342,7 +342,7 @@ func (c *Consumer) fetchInto() {
 		return
 	}
 
-	// Process whatever messages we got — even on a partial-batch error (G4).
+	// Process whatever messages we got — even on a partial-batch error.
 	// Successfully-scanned rows are already claimed server-side; dropping them
 	// would just make us wait for vt expiry to see them again.
 	for _, msg := range msgs {
@@ -392,7 +392,7 @@ func (c *Consumer) computeNextAt(n int, err error) time.Time {
 // after the owning Ack/Nack/Release/AckWithTx operation finishes, and
 // hands the trackingID to the run loop, which untracks it and deregisters it
 // from the extender. Buffered + done-guarded so a settle never blocks the
-// caller. (G3: untrack is unconditional — this fires even on a failed settle.)
+// caller. (Untracking is unconditional: this fires even on a failed settle.)
 func (c *Consumer) onMessageSettled(m *Message) {
 	select {
 	case c.completed <- m.trackingID:

@@ -1,133 +1,80 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to this project are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+All components (SQL schema, Go, TypeScript and Rust clients, CLI) share one
+version number; see [RELEASE.md](./RELEASE.md).
 
 ## [Unreleased]
 
-### Added
-- Message groups (ordered delivery): `publish_message(..., p_group_key)` assigns a
-  dense per-(topic, group) sequence in commit order; within each queue a group is
-  claimed strictly in order, one delivery at a time (head-of-line blocking, at most
-  one row per group per batch). Successors are woken by NOTIFY when a grouped head
-  is acked, retired to the DLQ or deleted. Go `WithGroupKey` / `Message.GroupKey`,
-  `GroupSeq`; TypeScript `{ groupKey }` / `message.groupKey`, `groupSeq`.
-- Rust client (`postgremq-rs/`, crate `postgremq`) on sqlx 0.9 and Tokio: publish and
-  transactional `publish_tx`, `Stream` consumers and handler consumers, `ack`/`ack_tx`/
-  `nack`/`release`/`extend` with first-settlement-wins, connection-level batched lease
-  renewal and exclusive-queue keep-alive, a dedicated LISTEN session with poll fallback,
-  queue-gone teardown, graceful drain on `close`, message groups, and maintenance
-  passthroughs. CI job `rust-tests` (fmt, clippy `-D warnings`, docs, tests, MSRV).
-  Integration tests use `POSTGREMQ_TEST_DATABASE_URL` when set, otherwise a reusable
-  `postgres:15` testcontainer. Optional OpenTelemetry client metrics (contract v1 of
-  `docs/observability.md`) behind the `otel` cargo feature via
-  `ConnectionOptions::meter_provider`, with `examples/metrics.rs`; the Collector
-  end-to-end test now also runs the Rust example.
-- Initial open source release preparation
-- Comprehensive documentation (README, CONTRIBUTING, SECURITY)
-- CI/CD workflows for automated testing
+First public release, to be published as 0.2.0.
 
-### Fixed
-- `consume_message` no longer seq-scans every queue's rows and sorts the whole
-  visible backlog on each claim: the queue filter is now an index condition, so a
-  claim walks the queue's vt-ordered index and stops at the batch size.
-- `get_next_visible_time` ignores blocked group successors, and both clients back
-  off briefly when it reports an already-due (locked) row instead of refetching in
-  a tight loop; a NOTIFY received during an in-flight fetch now triggers a follow-up
-  fetch instead of being dropped.
+### SQL (`mq`)
 
-## [0.1.0] - 2025-02-XX
+- Schema and functions in a dedicated `postgremq` schema, installed from
+  `mq/sql/latest.sql` or as golang-migrate migrations (embedded in the Go `mq`
+  module). PostgreSQL 15+, no extensions.
+- Topics with fan-out to any number of queues through a distribution trigger.
+- Visibility-timeout leases with a per-delivery ownership token; ack, nack
+  (optionally delayed), release, and lease extension, single or batched across
+  queues (`set_vt_batch_multi`).
+- Delivery attempt limits with a dead letter queue, plus DLQ listing, requeue
+  and purge.
+- Delayed delivery (`deliver_after`).
+- Message groups: ordered, one-at-a-time delivery per group key within each
+  queue, in publish commit order.
+- Queue generations, so a queue re-created under the same name is a distinct
+  resource.
+- Exclusive (temporary) queues kept alive by their owner and reaped at expiry.
+- Notifications on `pmq:t:<topic>` and `pmq:q:<queue>`;
+  `get_next_visible_time` for timed wake-ups.
+- Maintenance and retention functions: `pmq_maintenance_fast`,
+  `cleanup_completed_messages`, `cleanup_unreferenced_messages`.
+- `queue_metrics()` for queue depth and age, usable by a least-privilege
+  scraper role.
 
-### Added
+### Go client (`postgremq-go`)
 
-#### Core SQL Implementation (mq)
-- PostgreSQL schema with topics, queues, messages, and queue_messages tables
-- Dead letter queue (DLQ) support for failed messages
-- Message visibility timeout mechanism (VT) instead of traditional locks
-- Automatic message distribution via triggers
-- Support for delayed message delivery
-- Exclusive (temporary) and non-exclusive (persistent) queue types
-- Keep-alive mechanism for exclusive queues
-- Comprehensive set of SQL functions for queue operations
-- Test suite using pytest and testcontainers
+- Connection over a pgx v5 pool; publish (also on a caller's transaction),
+  channel-based and handler-based consumers.
+- Connection-level batched lease renewal and exclusive-queue keep-alive.
+- Shared LISTEN session with reconnect and polling fallback.
+- Queue-loss teardown (`Consumer.NotifyClose`, `WithQueueFatalHandler`,
+  `ErrQueueGone`), graceful shutdown with a configurable deadline, retry with
+  exponential backoff for transient errors.
+- Schema migrations (`Migrate`, `GetMigrationStatus`).
+- Optional OpenTelemetry metrics.
 
-#### Go Client (postgremq-go)
-- Connection management with pgx/v5 connection pooling
-- Consumer with automatic message fetching
-- Automatic visibility timeout extension using min-heap tracking
-- LISTEN/NOTIFY event listener for real-time message notifications
-- Transaction support for Publish and Ack operations
-- Configurable retry logic with exponential backoff
-- Graceful shutdown with in-flight message tracking
-- Message acknowledgment modes: Ack, Nack, Release
-- Support for delayed message delivery
-- Comprehensive test suite with parallel test execution
-- Examples and documentation
+### TypeScript client (`postgremq`)
 
-#### TypeScript Client (postgremq-ts)
-- Connection management with node-postgres (pg) pooling
-- Async iterator-based message consumption
-- Automatic visibility timeout extension using sorted array tracking
-- LISTEN/NOTIFY event listener for real-time notifications
-- Transaction support for atomic operations
-- Configurable retry logic for transient errors
-- Graceful shutdown handling
-- Message acknowledgment: ack, nack, release
-- Support for delayed delivery
-- Admin functions for queue/topic management
-- Comprehensive test suite using Jest and testcontainers
-- TypeScript type definitions
-- Example code
+- Connection over a node-postgres pool; publish (also on a caller's
+  transaction), async-iterator and handler-based consumers.
+- Connection-level batched lease renewal and exclusive-queue keep-alive.
+- Shared LISTEN session with reconnect and polling fallback.
+- Queue-loss teardown (`onClose`, `onQueueFatal` / `'queueFatal'`,
+  `QueueFatalError`), graceful shutdown, retry for transient errors.
+- Optional OpenTelemetry metrics.
 
-### Features
+### Rust client (`postgremq` crate)
 
-- **Reliability**: ACID guarantees through PostgreSQL
-- **Real-time**: Sub-second message delivery via LISTEN/NOTIFY
-- **Scalability**: Support for multiple concurrent consumers
-- **Flexibility**: Configurable visibility timeouts, retry policies, and batch sizes
-- **Transaction Support**: Publish and acknowledge within database transactions
-- **Auto-Extension**: Automatic visibility timeout extension during processing
-- **Dead Letter Queue**: Automatic handling of repeatedly failed messages
-- **No Additional Infrastructure**: Uses existing PostgreSQL database
+- sqlx 0.9 and Tokio; `publish` / `publish_tx`, `Stream` consumers and handler
+  consumers; `ack` / `ack_tx` / `nack` / `release` / `extend`.
+- Connection-level batched lease renewal and exclusive-queue keep-alive.
+- Dedicated LISTEN session with reconnect and polling fallback.
+- Queue-loss teardown (`Error::QueueGone`, `on_queue_fatal`), graceful
+  shutdown, retry for transient errors, maintenance passthroughs.
+- Optional OpenTelemetry metrics behind the `otel` feature.
 
-### Documentation
+### CLI (`cmd/postgremq`)
 
-- README files for root, Go client, and TypeScript client
-- Package documentation (Go doc.go)
-- Code examples
-- Test examples
-- CLAUDE.md with project architecture and patterns
+- `migrate` and `status` commands for the schema migrations.
 
-## Version History
+### Observability
 
-- **0.1.0** - Initial release
+- A shared client metrics contract (`docs/observability.md`,
+  `observability/client-contract.json`), a tested OpenTelemetry Collector
+  configuration, and runnable metrics examples for every client.
 
-## Release Notes Format
-
-Starting with version 0.1.0, all notable changes will be documented in this changelog.
-
-### Categories
-
-Changes are grouped by:
-
-- **Added**: New features
-- **Changed**: Changes in existing functionality
-- **Deprecated**: Soon-to-be removed features
-- **Removed**: Removed features
-- **Fixed**: Bug fixes
-- **Security**: Security vulnerability fixes
-
-### Component Tags
-
-Changes will be tagged by component:
-
-- `[sql]` - Core SQL implementation
-- `[go]` - Go client library
-- `[ts]` - TypeScript client library
-- `[docs]` - Documentation changes
-- `[ci]` - CI/CD and tooling changes
-
-[Unreleased]: https://github.com/slavakl/postgremq/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/slavakl/postgremq/releases/tag/v0.1.0
+[Unreleased]: https://github.com/slavakl/postgremq/commits/main

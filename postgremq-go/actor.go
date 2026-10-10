@@ -17,7 +17,7 @@ import (
 // may request after a persistent failure.
 //
 // The actor owns its lifetime: it runs on its own context (NOT conn.ctx) so it
-// outlives the consumer drain (keep-alive G7 / extender G6) and is stopped last
+// outlives the consumer drain and is stopped last
 // in Connection.Close() via stop().
 //
 // Type parameters:

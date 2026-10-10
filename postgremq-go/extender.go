@@ -17,7 +17,7 @@ var _ scheduler[*extEntry, extKey, extResult] = (*extScheduler)(nil)
 const (
 	// ExtendWindowPercent defines what percentage of the VT period to use as the
 	// extension window. Messages due within this window are batched together for
-	// efficiency. (Moved here from the consumer in Phase B.)
+	// efficiency.
 	ExtendWindowPercent = 20 // 20% of VT period
 
 	// defaultExtenderBatchSize bounds how many messages one tick extends in a
@@ -40,7 +40,7 @@ func calculateExtendAt(vtUntil time.Time, threshold float64) time.Time {
 	return time.Now().Add(time.Duration(float64(remaining) * threshold))
 }
 
-// extKey is the composite (queue, message_id, token) index key (G2).
+// extKey is the composite (queue, message_id, token) index key.
 type extKey struct {
 	queue string
 	id    int64
@@ -58,7 +58,7 @@ type extEntry struct {
 	extendAt     time.Time
 	expiresAt    time.Time
 	onExtended   func(time.Time)
-	// cancel == msg.cancel; called directly on lease-loss (G1).
+	// cancel == msg.cancel; called directly on lease-loss.
 	cancel context.CancelFunc
 }
 
@@ -99,7 +99,7 @@ func newExtScheduler(conn *Connection, cap int) *extScheduler {
 	return &extScheduler{conn: conn, h: newExtHeap(), cap: cap, live: make(map[extKey]*extEntry)}
 }
 
-// add inserts or overrides by composite key (override-on-push, G2).
+// add inserts or overrides by composite key (override-on-push).
 func (s *extScheduler) add(entry *extEntry) { s.live[entry.key()] = entry; s.h.push(entry) }
 
 func (s *extScheduler) remove(k extKey) { delete(s.live, k); s.h.remove(k) }

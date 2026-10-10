@@ -1,54 +1,60 @@
 # PostgreMQ CLI
 
-Command-line tool for managing PostgreMQ database schema and migrations.
+`postgremq` is a command-line tool for installing and upgrading the PostgreMQ database schema. It has two commands: `migrate` applies the embedded SQL migrations and `status` reports the schema version.
+
+All PostgreMQ objects live in the fixed `postgremq` schema. The CLI does not change application schemas or the connection's `search_path`.
 
 ## Installation
 
-### From Source
-
-```bash
-# Clone the repository
-git clone https://github.com/slavakl/postgremq.git
-cd postgremq
-
-# Build the CLI
-cd cmd/postgremq
-go build -o postgremq .
-
-# Optionally, move to a directory in your PATH
-mv postgremq /usr/local/bin/
-```
-
-### Using Go Install
+Requires Go 1.25 or later. From a release:
 
 ```bash
 go install github.com/slavakl/postgremq/cmd/postgremq@latest
 ```
 
-## Usage
-
-### Database Connection
-
-All commands require a `--dsn` flag with a PostgreSQL connection string:
+Or build it from a clone:
 
 ```bash
-postgremq <command> --dsn "postgres://user:password@host:port/database?sslmode=disable"
+git clone https://github.com/slavakl/postgremq.git
+cd postgremq/cmd/postgremq
+go build -o postgremq .
+
+# Optional: put it on your PATH
+mv postgremq /usr/local/bin/
 ```
 
-**Connection string formats:**
+The migrations are embedded in the binary, so it needs no other files at runtime.
+
+## Usage
+
+```
+postgremq [command]
+
+Available Commands:
+  completion  Generate the autocompletion script for the specified shell
+  help        Help about any command
+  migrate     Run database migrations
+  status      Show migration status
+```
+
+`-h` / `--help` is available on every command.
+
+### Connection string (`--dsn`)
+
+`migrate` and `status` require `--dsn`. It accepts any connection string that pgx accepts, in URL or keyword/value form:
 
 ```bash
-# Standard format
-postgres://user:password@localhost:5432/mydb
+postgremq status --dsn "postgres://user:password@localhost:5432/mydb?sslmode=disable"
+postgremq status --dsn "host=localhost port=5432 user=user dbname=mydb sslmode=require"
+```
 
-# With SSL disabled (for local development)
-postgres://user:password@localhost:5432/mydb?sslmode=disable
+The CLI does not read a connection string from the environment itself. Settings missing from the DSN fall back to the standard libpq environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE`, ...), so you can keep the password out of the command line:
 
-# With SSL required (for production)
-postgres://user:password@host:5432/mydb?sslmode=require
+```bash
+export PGPASSWORD=secret
+postgremq migrate --dsn "postgres://app@db.internal:5432/mydb?sslmode=require"
 
-# Using environment variable
-export DATABASE_URL="postgres://user:password@localhost:5432/mydb"
+# or pass a URL kept in an environment variable
 postgremq migrate --dsn "$DATABASE_URL"
 ```
 
@@ -56,30 +62,32 @@ postgremq migrate --dsn "$DATABASE_URL"
 
 ### `migrate`
 
-Apply pending database migrations in the fixed `postgremq` schema. Application schemas and the connection's `search_path` are unchanged.
+Applies pending migrations. It creates the `postgremq` schema if it does not exist yet.
 
 ```bash
 postgremq migrate --dsn <connection-string> [--target <version>]
 ```
 
-**Flags:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--dsn` | string | none (required) | Database connection string |
+| `--target` | int | `0` | Version to migrate to. A value below 1 means the latest version |
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--dsn` | Database connection string (required) | - |
-| `--target` | Target migration version (0 = latest) | 0 |
+`migrate` first prints the current and latest versions. It then:
 
-**Examples:**
+- exits with an error if the database is in a dirty state (see [Dirty state](#dirty-state));
+- prints `✓ Database is up to date` and exits if no migration is pending and `--target` is `0`;
+- otherwise prints `Running migrations...`, creates the `postgremq` schema if needed, and runs the migrator: up to the latest version when `--target` is below 1, or to exactly `--target`. When there is nothing to apply (for example `--target` equal to the current version, or a negative `--target` on an up-to-date database) it still prints `✓ Migration completed successfully`. A target above the latest embedded version fails with `no migration found for version <n>`. A target below the current version runs the down migrations in between; the embedded down migration contains no SQL statements (only a note that `DROP SCHEMA postgremq CASCADE` removes an installation), so that lowers the recorded version without changing the schema.
 
 ```bash
 # Apply all pending migrations
 postgremq migrate --dsn "postgres://postgres:postgres@localhost:5432/mydb"
 
 # Migrate to a specific version
-postgremq migrate --dsn "postgres://postgres:postgres@localhost:5432/mydb" --target 3
+postgremq migrate --dsn "postgres://postgres:postgres@localhost:5432/mydb" --target 1
 ```
 
-**Output:**
+Output on a fresh database:
 
 ```
 Current version: 0
@@ -88,7 +96,7 @@ Running migrations...
 ✓ Migration completed successfully
 ```
 
-If the database is already up to date:
+Output when there is nothing to do:
 
 ```
 Current version: 1
@@ -98,25 +106,17 @@ Latest version:  1
 
 ### `status`
 
-Display the current migration status of the database. This command is read-only and does not create the schema or version table.
+Prints the migration status. It is read-only: it does not create the `postgremq` schema or the version table, and a database without them reports version 0.
 
 ```bash
 postgremq status --dsn <connection-string>
 ```
 
-**Flags:**
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--dsn` | string | none (required) | Database connection string |
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--dsn` | Database connection string (required) | - |
-
-**Examples:**
-
-```bash
-postgremq status --dsn "postgres://postgres:postgres@localhost:5432/mydb"
-```
-
-**Output (migrations needed):**
+Migrations pending:
 
 ```
 Current version: 0
@@ -126,7 +126,7 @@ Dirty:           false
 ⚠ Migration needed: 1 pending migration(s)
 ```
 
-**Output (up to date):**
+Up to date:
 
 ```
 Current version: 1
@@ -136,176 +136,175 @@ Dirty:           false
 ✓ Database is up to date
 ```
 
-**Output (dirty state):**
+`status` exits with code 0 whenever it can read the status, including when migrations are pending or the database is dirty. The last line depends only on the version: a dirty database shows `Dirty:           true` and then the pending or up-to-date line as usual, so a dirty database at the latest version prints `✓ Database is up to date`. Check the `Dirty` line, or run `migrate`, which refuses a dirty database.
 
-```
-Current version: 1
-Latest version:  2
-Dirty:           true
+### `completion`
 
-⚠ Migration needed: 1 pending migration(s)
-```
-
-A "dirty" state indicates a previous migration failed partway through. Manual intervention is required to resolve this.
-
-## Migration Tracking
-
-PostgreMQ uses a dedicated migrations table named `postgremq.postgremq_migrations` to track applied migrations. This table is created automatically when you run your first migration.
-
-**Schema:**
-
-```sql
-CREATE TABLE postgremq.postgremq_migrations (
-    version BIGINT PRIMARY KEY,
-    dirty BOOLEAN NOT NULL DEFAULT FALSE
-);
-```
-
-## Common Workflows
-
-### Fresh Database Setup
+Cobra's standard shell completion generator:
 
 ```bash
-# 1. Create your database (using psql or your preferred tool)
-createdb myapp_db
+postgremq completion bash|zsh|fish|powershell
+```
 
-# 2. Apply PostgreMQ migrations
+Run `postgremq completion <shell> --help` for instructions on loading the script.
+
+## Migration tracking
+
+The version is stored in the single-row table `postgremq.postgremq_migrations`, which `migrate` creates:
+
+| Column | Type | Meaning |
+|--------|------|---------|
+| `version` | `bigint` (primary key) | Last applied migration version |
+| `dirty` | `boolean` | `true` if that migration started but did not finish |
+
+Migrations are applied with [golang-migrate](https://github.com/golang-migrate/migrate) from the SQL files embedded from `mq/migrations/`.
+
+## Required privileges
+
+Whenever `migrate` runs the migrator (any pending migration, or a non-zero `--target`), it first runs `CREATE SCHEMA IF NOT EXISTS postgremq`. PostgreSQL checks the database's `CREATE` privilege before it checks whether the schema exists, so the role needs that privilege even if the schema has already been created:
+
+```sql
+GRANT CREATE ON DATABASE mydb TO myuser;
+```
+
+Without it, `migrate` fails with:
+
+```
+Error: migration failed: failed to create queue schema: ERROR: permission denied for database mydb (SQLSTATE 42501)
+```
+
+`status`, and `migrate` on an up-to-date database without `--target`, only need to connect, use the `postgremq` schema, and read `postgremq.postgremq_migrations` (if the schema does not exist yet, connecting is enough). Without `USAGE` on an existing `postgremq` schema both commands fail with `failed to get migration status: ERROR: permission denied for schema postgremq (SQLSTATE 42501)`.
+
+## Errors and exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success. For `status`, this includes pending migrations and a dirty database |
+| 1 | Any error: missing `--dsn`, unparsable DSN, connection failure, dirty database (`migrate`), migration failure |
+
+On an error, stderr gets `Error: <message>`, then the command's usage text, then `<message>` again on its own line. For example:
+
+```
+Error: required flag(s) "dsn" not set
+Usage:
+  postgremq status [flags]
+
+Flags:
+      --dsn string   Database connection string (required)
+  -h, --help         help for status
+
+required flag(s) "dsn" not set
+```
+
+Common messages:
+
+| Message | Cause |
+|---------|-------|
+| `required flag(s) "dsn" not set` | `--dsn` missing |
+| `failed to connect: cannot parse ...` | The DSN is malformed |
+| `failed to get migration status: failed to connect to ...` | The server cannot be reached, or authentication failed |
+| `failed to get migration status: ERROR: permission denied for schema postgremq ...` | The role cannot use the `postgremq` schema |
+| `database is in dirty state - manual intervention required` | See [Dirty state](#dirty-state) |
+| `migration failed: migration failed: ...` | A migration failed, or `--target` names a version that does not exist (`... no migration found for version <n>: read down for version <n> migrations: file does not exist`) |
+| `migration failed: failed to create queue schema: ...` | The role lacks `CREATE` on the database |
+
+### Dirty state
+
+If a migration fails partway, golang-migrate leaves `dirty = true` with `version` set to the migration that failed. `migrate` refuses to run until you fix it:
+
+1. Inspect the version row and the `postgremq` schema to see what the failed migration actually changed:
+
+   ```sql
+   SELECT version, dirty FROM postgremq.postgremq_migrations;
+   ```
+
+2. Bring the schema to a consistent state, then record that state:
+
+   - If the failed migration's changes are fully in place, clear the flag:
+
+     ```sql
+     UPDATE postgremq.postgremq_migrations SET dirty = false;
+     ```
+
+   - If they are absent or have been rolled back, set the version to the previous one so the migration runs again. For version 1, delete the row so the database reads as version 0:
+
+     ```sql
+     UPDATE postgremq.postgremq_migrations SET version = <failed_version - 1>, dirty = false;
+     -- for version 1:
+     DELETE FROM postgremq.postgremq_migrations;
+     ```
+
+3. Run `postgremq migrate` again.
+
+Do not just clear the flag when the migration did not complete. `migrate` and `status` would then report the database as up to date while it is missing the schema changes.
+
+## Common workflows
+
+### Fresh database
+
+```bash
+createdb myapp_db
 postgremq migrate --dsn "postgres://postgres:postgres@localhost:5432/myapp_db"
 ```
 
-### CI/CD Pipeline
+### CI/CD
 
 ```bash
 #!/bin/bash
 set -e
 
-# Check if migrations are needed
-postgremq status --dsn "$DATABASE_URL"
+postgremq status --dsn "$DATABASE_URL"    # informational; exits 0 even if migrations are pending
+postgremq migrate --dsn "$DATABASE_URL"   # exits 1 on failure or a dirty database
 
-# Apply migrations
-postgremq migrate --dsn "$DATABASE_URL"
-
-# Start application
 ./myapp
 ```
 
-### Development Workflow
+## Migrating from Go code
 
-```bash
-# Check current status
-postgremq status --dsn "postgres://localhost:5432/dev_db?sslmode=disable"
-
-# Apply new migrations after pulling latest code
-postgremq migrate --dsn "postgres://localhost:5432/dev_db?sslmode=disable"
-```
-
-## Error Handling
-
-### Dirty State
-
-If a migration fails partway through, the database is left in a "dirty" state:
-
-```
-Error: database is in dirty state - manual intervention required
-```
-
-**Resolution:**
-
-1. Check the `postgremq_migrations` table to see which version failed
-2. Manually fix the database state (complete or rollback the partial migration)
-3. Update the `dirty` column to `false`
-4. Re-run the migration
-
-```sql
--- Check current state
-SELECT * FROM postgremq_migrations;
-
--- After manually fixing the schema, clear the dirty flag
-UPDATE postgremq_migrations SET dirty = false WHERE version = <failed_version>;
-```
-
-### Connection Errors
-
-```
-Error: failed to connect: connection refused
-```
-
-**Common causes:**
-
-- PostgreSQL is not running
-- Incorrect host/port
-- Firewall blocking connection
-- Invalid credentials
-
-### Permission Errors
-
-```
-Error: migration failed: permission denied for schema public
-```
-
-**Resolution:** Ensure the database user has sufficient privileges:
-
-```sql
-GRANT ALL PRIVILEGES ON DATABASE mydb TO myuser;
-GRANT ALL PRIVILEGES ON SCHEMA public TO myuser;
-```
-
-## Programmatic Migration
-
-For applications that need to run migrations programmatically (e.g., at startup), use the standalone migration functions from the Go client library:
+To run migrations at application startup instead of through the CLI, use the same functions from the Go client:
 
 ```go
 package main
 
 import (
-    "context"
-    "log"
+	"context"
+	"log"
 
-    "github.com/jackc/pgx/v5/pgxpool"
-    postgremq "github.com/slavakl/postgremq/postgremq-go"
+	"github.com/jackc/pgx/v5/pgxpool"
+	postgremq "github.com/slavakl/postgremq/postgremq-go"
 )
 
 func main() {
-    ctx := context.Background()
+	ctx := context.Background()
 
-    pool, _ := pgxpool.New(ctx, "postgres://...")
-    defer pool.Close()
+	pool, err := pgxpool.New(ctx, "postgres://...")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
 
-    // Check status
-    status, _ := postgremq.GetMigrationStatus(ctx, pool)
-    if status.NeedsMigration {
-        // Apply migrations
-        if err := postgremq.Migrate(ctx, pool, postgremq.MigrateOptions{}); err != nil {
-            log.Fatal(err)
-        }
-    }
+	status, err := postgremq.GetMigrationStatus(pool)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if status.NeedsMigration {
+		if err := postgremq.Migrate(pool, postgremq.MigrateOptions{}); err != nil {
+			log.Fatal(err)
+		}
+	}
 
-    // Now create a connection for message queue operations
-    conn, _ := postgremq.DialFromPool(ctx, pool)
-    defer conn.Close()
-    // Use conn for publish/consume...
+	conn, err := postgremq.DialFromPool(pool)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+	// publish / consume with conn
 }
 ```
 
-See `postgremq-go/examples/migration/` for a complete example.
+`MigrateOptions.TargetVersion` corresponds to `--target`. See [`postgremq-go/examples/migration/`](../../postgremq-go/examples/migration/) for a complete example.
 
-## Environment Variables
+## See also
 
-The CLI reads the connection string from the `--dsn` flag. For convenience, you can use shell expansion:
-
-```bash
-export DATABASE_URL="postgres://user:pass@localhost:5432/mydb"
-postgremq migrate --dsn "$DATABASE_URL"
-```
-
-## Exit Codes
-
-| Code | Description |
-|------|-------------|
-| 0 | Success |
-| 1 | Error (connection failed, migration failed, etc.) |
-
-## See Also
-
-- [PostgreMQ Go Client](../../postgremq-go/README.md) - Go client library documentation
-- [Migration Example](../../postgremq-go/examples/migration/) - Programmatic migration example
+- [PostgreMQ Go client](../../postgremq-go/README.md)
+- [Migration example](../../postgremq-go/examples/migration/)

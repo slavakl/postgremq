@@ -475,9 +475,7 @@ def test_maintenance_fast_skips_healthy_in_flight(cur: psycopg2.extensions.curso
     status='processing', vt > NOW()) must NOT be retired by pmq_maintenance_fast.
     Otherwise the consumer's handler commits its side-effects, then ack returns
     PMQ01 because the row was deleted underneath it, and the message ALSO lands
-    in the DLQ — silent inconsistency between application and queue state.
-
-    Reproduces the bug reported in REVIEW.md §1.2/§2.1."""
+    in the DLQ — silent inconsistency between application and queue state."""
     cur.execute("SELECT postgremq.create_topic('HealthyMaintTopic')")
     cur.execute("SELECT postgremq.create_queue('HealthyMaintQueue', 'HealthyMaintTopic', 1, false)")
     cur.execute("SELECT postgremq.publish_message('HealthyMaintTopic', '{\"x\": 1}'::jsonb)")
@@ -1091,7 +1089,6 @@ def test_requeue_dlq_messages_emits_notify(cur: psycopg2.extensions.cursor) -> N
     (regardless of how many messages were requeued). Without this signal
     consumers wait for their poll fallback (1s in TS, 10s in Go) before
     re-fetching, defeating the point of using requeue for fast recovery.
-    Reported in REVIEW.md §2.2.
 
     Also asserts no NOTIFY fires when the DLQ is empty for the queue —
     avoids spurious wake-ups."""
@@ -1137,7 +1134,7 @@ def test_requeue_dlq_messages_idempotent_on_existing_row(cur: psycopg2.extension
     are about to requeue, the function must reset that row to a clean
     pending state instead of aborting the entire requeue with a unique
     constraint violation. This protects against partial-state recovery
-    scenarios. Reported in REVIEW.md §2.2."""
+    scenarios."""
     cur.execute("SELECT postgremq.create_topic('RequeueIdempotentTopic')")
     cur.execute("SELECT postgremq.create_queue('RequeueIdempotentQueue', 'RequeueIdempotentTopic', 1, false)")
 
@@ -1301,8 +1298,7 @@ def test_create_queue_validates_name(cur: psycopg2.extensions.cursor) -> None:
 def test_clean_up_topic_refuses_when_dlq_has_messages(cur: psycopg2.extensions.cursor) -> None:
     """clean_up_topic must refuse when any of the topic's messages are in
     DLQ. DLQ entries are forensic data; operators must explicitly
-    postgremq.purge_dlq() or postgremq.requeue_dlq_messages() before cleaning up.
-    (REVIEW.md §2.8)"""
+    postgremq.purge_dlq() or postgremq.requeue_dlq_messages() before cleaning up."""
     cur.execute("SELECT postgremq.create_topic('CleanDlqTopic')")
     cur.execute("SELECT postgremq.create_queue('CleanDlqQueue', 'CleanDlqTopic', 1, false)")
     cur.execute("SELECT postgremq.publish_message('CleanDlqTopic', '{\"x\":1}'::jsonb)")
@@ -1328,7 +1324,7 @@ def test_clean_up_topic_refuses_when_dlq_has_messages(cur: psycopg2.extensions.c
 
 def test_delete_queue_refuses_when_dlq_has_messages(cur: psycopg2.extensions.cursor) -> None:
     """delete_queue must refuse when the queue has DLQ entries. Same
-    reason as clean_up_topic. (REVIEW.md §2.8)"""
+    reason as clean_up_topic."""
     cur.execute("SELECT postgremq.create_topic('DeleteDlqTopic')")
     cur.execute("SELECT postgremq.create_queue('DeleteDlqQueue', 'DeleteDlqTopic', 1, false)")
     cur.execute("SELECT postgremq.publish_message('DeleteDlqTopic', '{\"x\":1}'::jsonb)")
@@ -1351,8 +1347,7 @@ def test_delete_queue_refuses_when_dlq_has_messages(cur: psycopg2.extensions.cur
 def test_pmq_maintenance_fast_skips_inactive_queue_with_dlq(cur: psycopg2.extensions.cursor) -> None:
     """pmq_maintenance_fast skips inactive exclusive queues that have
     DLQ entries — those entries are forensic data the operator may want
-    to keep. The queue stays around until the operator handles its DLQ.
-    (REVIEW.md §2.8)"""
+    to keep. The queue stays around until the operator handles its DLQ."""
     cur.execute("SELECT postgremq.create_topic('MaintDlqTopic')")
     cur.execute("SELECT postgremq.create_queue('MaintDlqQueue', 'MaintDlqTopic', 1, true, interval '60 seconds')")
     cur.execute("SELECT postgremq.publish_message('MaintDlqTopic', '{\"x\":1}'::jsonb)")
@@ -1379,7 +1374,7 @@ def test_pmq_maintenance_fast_skips_inactive_queue_with_dlq(cur: psycopg2.extens
 def test_create_topic_rejects_long_name(cur: psycopg2.extensions.cursor) -> None:
     """Topic names > 57 bytes would truncate the NOTIFY channel name and
     risk silent cross-delivery between topics that share their first 57
-    bytes. Boundary check at exactly 57 / 58 bytes. (REVIEW.md §2.3)"""
+    bytes. Boundary check at exactly 57 / 58 bytes."""
     name_57 = 'A' * 57
     cur.execute("SELECT postgremq.create_topic(%s)", (name_57,))  # boundary: 57 OK
     name_58 = 'B' * 58

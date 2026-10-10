@@ -39,6 +39,11 @@ What actually happened.
 // Provide minimal reproducible code
 ```
 
+```rust
+// For Rust client issues
+// Provide minimal reproducible code
+```
+
 ```sql
 -- For SQL/database issues
 -- Provide relevant queries
@@ -50,11 +55,14 @@ What actually happened.
 - [ ] SQL implementation (mq)
 - [ ] Go client (postgremq-go)
 - [ ] TypeScript client (postgremq-ts)
+- [ ] Rust client (postgremq-rs)
+- [ ] CLI (cmd/postgremq)
 
 **Versions:**
 - PostgreSQL version:
 - Go version (if applicable):
 - Node.js version (if applicable):
+- Rust version (if applicable):
 - PostgreMQ version:
 - Operating System:
 

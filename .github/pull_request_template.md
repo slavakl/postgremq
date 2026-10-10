@@ -22,6 +22,8 @@
 - [ ] SQL implementation (mq)
 - [ ] Go client (postgremq-go)
 - [ ] TypeScript client (postgremq-ts)
+- [ ] Rust client (postgremq-rs)
+- [ ] CLI (cmd/postgremq)
 - [ ] Documentation
 - [ ] CI/CD
 - [ ] Other (please specify)
@@ -50,6 +52,7 @@ Relates to #
 - PostgreSQL version:
 - Go version (if applicable):
 - Node.js version (if applicable):
+- Rust version (if applicable):
 
 ### Tests Added/Modified
 
@@ -82,7 +85,7 @@ Paste relevant test output here
 <!-- Describe any documentation changes -->
 
 - [ ] README updated
-- [ ] API documentation updated (doc.go for Go, JSDoc for TypeScript)
+- [ ] API documentation updated (Go doc comments, TSDoc, rustdoc)
 - [ ] CHANGELOG.md updated
 - [ ] Examples added/updated
 - [ ] No documentation changes needed
@@ -107,10 +110,6 @@ Paste relevant test output here
 - [ ] Performance improved
 - [ ] No performance impact
 - [ ] Performance degraded (explain and justify)
-
-## Screenshots (if applicable)
-
-<!-- Add screenshots for UI changes or visual examples -->
 
 ## Additional Notes
 

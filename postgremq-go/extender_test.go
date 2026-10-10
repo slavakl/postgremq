@@ -1,7 +1,7 @@
 // vt-extender actor tests: cover the connection-level extender that coalesces
 // every consumer's due visibility-timeout extensions into one set_vt_batch_multi
-// call per tick (Phase B of the actor refactor). The headline guarantee is the
-// composite (queue, message_id) key (G2): the same message_id distributed to
+// call per tick. The headline guarantee is the
+// composite (queue, message_id) key: the same message_id distributed to
 // two queues is two independent entries, both extended.
 package postgremq_go_test
 
@@ -144,7 +144,7 @@ func (p *extenderSpyPool) callContaining(want qid) []qid {
 
 // TestExtenderCompositeKeyNoBleed verifies that the same message_id on two
 // queues is tracked as two independent entries and both are extended in ONE
-// tick (G2). A heap keyed on message_id alone would collapse them.
+// tick. A heap keyed on message_id alone would collapse them.
 func TestExtenderCompositeKeyNoBleed(t *testing.T) {
 	t.Parallel()
 	spy := &extenderSpyPool{}
@@ -167,7 +167,7 @@ func TestExtenderCompositeKeyNoBleed(t *testing.T) {
 }
 
 // TestExtenderLeaseLostCancels verifies that a (queue,id) omitted from the
-// result has its handler cancelled (G1) and is dropped (no further calls).
+// result has its handler cancelled and is dropped (no further calls).
 func TestExtenderLeaseLostCancels(t *testing.T) {
 	t.Parallel()
 	spy := &extenderSpyPool{
@@ -198,7 +198,7 @@ func TestExtenderLeaseLostCancels(t *testing.T) {
 	select {
 	case <-lostCtx.Done():
 	case <-time.After(3 * time.Second):
-		t.Fatal("lease-lost message was not cancelled (G1)")
+		t.Fatal("lease-lost message was not cancelled")
 	}
 	// The kept message keeps being extended; its cancel is never called.
 	select {

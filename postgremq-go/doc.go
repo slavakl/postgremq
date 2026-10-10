@@ -1,55 +1,61 @@
-// Package postgremq_go provides a Go client for PostgreMQ, a PostgreSQL-based message queue system.
+// Package postgremq_go provides a Go client for PostgreMQ, a message queue that
+// runs inside PostgreSQL.
 //
 // # Overview
 //
-// PostgreMQ implements a reliable message queue using PostgreSQL as the backend. Messages are published
-// to topics and distributed to all subscribed queues automatically. Consumers fetch messages with
-// visibility timeouts instead of traditional locks, providing reliable message processing with
-// automatic failure recovery.
+// Messages are published to topics and copied to every queue subscribed to the
+// topic. Consumers claim messages under a visibility timeout (a lease) instead
+// of a lock: an unsettled message becomes visible again when its lease expires.
+// Because the queue lives in your database, you can publish and acknowledge in
+// the same transaction as your application writes.
 //
 // # Core Concepts
 //
-// Visibility Timeout (VT): When a consumer fetches a message, it becomes invisible to other consumers
-// until the visibility timeout expires. This is similar to Amazon SQS's visibility timeout mechanism.
-// The client automatically extends visibility timeouts for messages being processed (unless disabled).
+// Visibility timeout (VT): a claimed message is invisible to other consumers
+// until its visibility timeout expires, similar to Amazon SQS. By default the
+// client extends the lease of every claimed message until it is settled.
 //
-// Queue Types:
-//   - Non-exclusive (persistent): Queues that persist indefinitely
-//   - Exclusive (temporary): Queues that expire unless kept alive by periodic extensions
-//     (automatically handled by the client)
+// Queue types:
+//   - Non-exclusive: persistent queues.
+//   - Exclusive: queues with a lease that the creating Connection renews in the
+//     background. If renewals stop, the queue expires, and maintenance deletes it
+//     unless it has DLQ entries.
 //
-// Dead Letter Queue (DLQ): Messages that exceed their max delivery attempts are automatically moved
-// to the DLQ for inspection and potential reprocessing.
+// Dead letter queue (DLQ): with WithMaxDeliveryAttempts(n), a message whose
+// n-th delivery is nacked moves to the DLQ for inspection and requeueing; if the
+// n-th delivery's lease expires unsettled, MaintenanceFast moves it. The default
+// 0 means unlimited attempts and no DLQ.
 //
 // # Basic Usage
 //
-// Create a connection and set up topics and queues:
+// Create a connection and set up a topic and a queue:
 //
-//	import (
-//		"context"
-//		"encoding/json"
-//		"log"
-//		postgremq "github.com/slavakl/postgremq/postgremq-go"
-//		"github.com/jackc/pgx/v5/pgxpool"
-//	)
-//
-//	func main() {
-//		ctx := context.Background()
-//		cfg, _ := pgxpool.ParseConfig("postgres://user:pass@localhost:5432/postgremq")
-//		conn, err := postgremq.Dial(ctx, cfg)
-//		if err != nil {
-//			log.Fatal(err)
-//		}
-//		defer conn.Close()
-//
-//		// Create topic and queue
-//		_ = conn.CreateTopic(ctx, "orders")
-//		_ = conn.CreateQueue(ctx, "orders-processor", "orders", false)
+//	ctx := context.Background()
+//	cfg, err := pgxpool.ParseConfig("postgres://user:pass@localhost:5432/app")
+//	if err != nil {
+//		log.Fatal(err)
 //	}
+//	conn, err := postgremq.Dial(ctx, cfg)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//	defer conn.Close()
+//
+//	// Both calls are idempotent.
+//	if err := conn.CreateTopic(ctx, "orders"); err != nil {
+//		log.Fatal(err)
+//	}
+//	if err := conn.CreateQueue(ctx, "orders-processor", "orders", false); err != nil {
+//		log.Fatal(err)
+//	}
+//
+// The package name is postgremq_go; import it with an alias:
+//
+//	import postgremq "github.com/slavakl/postgremq/postgremq-go"
 //
 // # Publishing Messages
 //
-// Publish messages with optional delayed delivery:
+// Publish a JSON payload, optionally with delayed delivery:
 //
 //	payload := json.RawMessage(`{"order_id": 12345, "amount": 99.99}`)
 //	messageID, err := conn.Publish(ctx, "orders", payload)
@@ -57,13 +63,18 @@
 //		log.Fatal(err)
 //	}
 //
-//	// Publish with 5-minute delay
+//	// Not visible to consumers for 5 minutes.
 //	delayedID, err := conn.Publish(ctx, "orders", payload,
 //		postgremq.WithDeliverAfter(time.Now().Add(5*time.Minute)))
 //
+// WithGroupKey publishes into a message group: within each queue, a group's
+// messages are delivered one at a time, in publish commit order.
+//
 // # Consuming Messages
 //
-// Create a consumer and process messages with automatic acknowledgment:
+// Consume needs the queue's topic: create the queue on the same Connection
+// (CreateQueue is idempotent) or pass WithTopic. Range over Messages() and
+// settle every message:
 //
 //	consumer, err := conn.Consume("orders-processor",
 //		postgremq.WithBatchSize(10),
@@ -74,136 +85,146 @@
 //	defer consumer.Stop()
 //
 //	for msg := range consumer.Messages() {
-//		// Process the message
-//		var order map[string]interface{}
+//		var order map[string]any
 //		if err := json.Unmarshal(msg.Payload, &order); err != nil {
-//			log.Printf("Invalid message: %v", err)
-//			_ = msg.Nack(ctx) // Return to queue for retry
+//			log.Printf("invalid message: %v", err)
+//			_ = msg.Nack(ctx) // redeliver now
 //			continue
 //		}
-//
-//		// Successful processing
-//		if err := processOrder(order); err != nil {
-//			log.Printf("Processing failed: %v", err)
-//			// Retry after 1 minute
+//		if err := processOrder(msg.StoppedCtx, order); err != nil {
+//			// Redeliver after one minute.
 //			_ = msg.Nack(ctx, postgremq.WithDelayUntil(time.Now().Add(time.Minute)))
-//		} else {
-//			_ = msg.Ack(ctx)
+//			continue
 //		}
+//		_ = msg.Ack(ctx)
 //	}
 //
-// # Message Acknowledgment
+// ConsumeHandler runs a function per message on its own goroutine, limited by
+// WithMaxInFlight. A handler that returns without settling has its message
+// acked, or nacked if its context was cancelled; a panic is recovered and the
+// message is nacked.
 //
-// Messages support three acknowledgment modes:
+// # Settling Messages
 //
-//   - Ack(): Mark message as successfully processed (will not be redelivered)
-//   - Nack(): Return message to queue for redelivery (increments delivery attempts)
-//   - Release(): Return message to queue without incrementing delivery attempts
-//     (use when message was fetched but never attempted to be processed)
+//   - Ack: mark the message completed.
+//   - Nack: return the message for redelivery, immediately or at WithDelayUntil.
+//     The attempt counts; on the final allowed attempt the message moves to the
+//     DLQ.
+//   - Release: return the message immediately without counting the attempt
+//     (use it for work that was never started).
+//   - AckWithTx: Ack inside the caller's transaction.
 //
-// Example with transaction:
+// Only the first settle call on a Message runs SQL; later calls return
+// ErrLeaseLost. Delivery is at least once, so make side effects idempotent.
 //
-//	func processWithTx(ctx context.Context, conn *postgremq.Connection, msg *postgremq.Message) error {
-//		tx, err := conn.pool.Begin(ctx)
+// Acknowledging inside a transaction:
+//
+//	func processWithTx(ctx context.Context, pool *pgxpool.Pool, msg *postgremq.Message) error {
+//		tx, err := pool.Begin(ctx)
 //		if err != nil {
 //			return err
 //		}
-//		defer tx.Rollback(ctx)
+//		defer tx.Rollback(ctx) // no-op after Commit
 //
-//		// Process message and update database atomically
-//		_, err = tx.Exec(ctx, "INSERT INTO orders (id, data) VALUES ($1, $2)",
-//			msg.ID, msg.Payload)
-//		if err != nil {
+//		if _, err := tx.Exec(ctx, "INSERT INTO app.orders (id, data) VALUES ($1, $2)",
+//			msg.ID, msg.Payload); err != nil {
 //			return err
 //		}
-//
-//		// Acknowledge within same transaction
 //		if err := msg.AckWithTx(ctx, tx); err != nil {
 //			return err
 //		}
-//
 //		return tx.Commit(ctx)
 //	}
 //
-// # Auto-Extension Behavior
+// The caller owns the transaction; the client never begins, commits, rolls back
+// or retries it. If the transaction rolls back, the message is redelivered when
+// its lease expires.
 //
-// By default, the consumer automatically extends visibility timeouts for in-flight messages
-// to prevent them from becoming visible to other consumers while still being processed.
+// # Auto-Extension
 //
-// Extension occurs at 50% of the visibility timeout. For example:
-//   - VT = 60 seconds: extension happens at 30 seconds
-//   - VT = 120 seconds: extension happens at 60 seconds
+// Auto-extension runs once per Connection: one background goroutine extends the
+// due leases of every consumer, across all queues, in one batched call per tick
+// (at most WithExtenderBatchSize messages per call).
 //
-// Messages due for extension within a 20% window are batched together for efficiency.
-// For VT=30s, messages due within the next 6 seconds are extended in one batch.
+// A message is extended once WithExtensionThreshold (default 0.5) of its
+// remaining lease has elapsed, and each extension sets the deadline to now plus
+// the consumer's WithVT. With WithVT(60), the first extension happens about 30
+// seconds after the claim. If an extension finds that the lease was lost, the
+// client cancels the message's StoppedCtx.
 //
-// Disable auto-extension if you want manual control:
+// Disable auto-extension to manage leases yourself (WithVT is then required):
 //
-//	consumer, _ := conn.Consume("queue-name",
+//	consumer, err := conn.Consume("queue-name",
 //		postgremq.WithVT(60),
 //		postgremq.WithNoAutoExtension())
+//	if err != nil {
+//		log.Fatal(err)
+//	}
 //
 //	for msg := range consumer.Messages() {
-//		// Manually extend if needed
-//		newVT, _ := msg.SetVT(ctx, 60)
-//		// ... process message ...
+//		if _, err := msg.SetVT(ctx, 60); err != nil { // deadline = now + 60 s
+//			log.Printf("extend: %v", err)
+//		}
+//		// ... process and settle the message ...
 //	}
 //
 // # Shutdown Behavior
 //
-// Connection.Close() performs graceful shutdown:
-//  1. Stops the LISTEN/NOTIFY event listener
-//  2. Signals all consumers to stop
-//  3. Releases buffered messages that haven't been delivered to application code
-//     (without incrementing delivery attempts)
-//  4. Waits for in-flight messages to be acknowledged, nacked, or released
-//     (subject to shutdown timeout if configured)
-//  5. Stops keep-alive background loops for exclusive queues
-//  6. Closes the database connection pool (if owned by the Connection)
+// Connection.Close performs a graceful shutdown:
+//  1. Publish, PublishWithTx, CreateTopic, CreateQueue, Consume and
+//     ConsumeHandler start returning ErrConnectionClosed. Other methods keep
+//     working until Close finishes.
+//  2. The LISTEN/NOTIFY listener stops and every consumer stops fetching.
+//  3. Buffered messages that were never delivered to application code are
+//     released without counting the attempt, and the StoppedCtx of delivered
+//     messages is cancelled.
+//  4. Close waits for delivered messages to be acked, nacked or released,
+//     bounded by WithShutdownTimeout if set. Auto-extension and keep-alive keep
+//     running meanwhile.
+//  5. The background goroutines stop, and the pool is closed if the Connection
+//     owns it (Dial, not DialFromPool).
 //
-// Consumer.Stop() behavior:
-//  1. Stops fetching new messages
-//  2. Closes the Messages() channel
-//  3. Releases buffered messages not yet delivered to the application
-//  4. Cancels the StoppedCtx context on all in-flight messages to signal
-//     the application to finish processing
-//  5. Waits for all in-flight messages to complete (Ack/Nack/Release)
+// Consumer.Stop runs the same drain for one consumer: it stops fetching, closes
+// the Messages() channel, releases buffered messages, cancels the StoppedCtx of
+// delivered messages, and waits, without a timeout, until they are settled.
 //
-// Configure shutdown timeout to prevent indefinite waits:
+// Bound the drain with a shutdown timeout:
 //
-//	conn, _ := postgremq.Dial(ctx, cfg,
+//	conn, err := postgremq.Dial(ctx, cfg,
 //		postgremq.WithShutdownTimeout(30*time.Second))
 //
-// Example with graceful shutdown:
+// A worker that reacts to shutdown:
 //
-//	func worker(ctx context.Context, conn *postgremq.Connection) {
-//		consumer, _ := conn.Consume("work-queue", postgremq.WithVT(60))
+//	func worker(ctx context.Context, conn *postgremq.Connection) error {
+//		consumer, err := conn.Consume("work-queue", postgremq.WithVT(60))
+//		if err != nil {
+//			return err
+//		}
 //		defer consumer.Stop()
 //
 //		for msg := range consumer.Messages() {
-//			select {
-//			case <-msg.StoppedCtx.Done():
-//				// Consumer is stopping, release message for reprocessing
-//				_ = msg.Release(context.Background())
-//				return
-//			default:
+//			if msg.StoppedCtx.Err() != nil {
+//				// Stopping: hand the message back without counting the attempt.
+//				_ = msg.Release(context.WithoutCancel(ctx))
+//				continue
 //			}
-//
-//			// Process with awareness of shutdown signal
 //			if err := processWithContext(msg.StoppedCtx, msg.Payload); err != nil {
 //				_ = msg.Nack(ctx)
 //			} else {
 //				_ = msg.Ack(ctx)
 //			}
 //		}
+//		return nil
 //	}
 //
 // # Retry Configuration
 //
-// The client automatically retries transient database errors (connection failures,
-// serialization errors, deadlocks). Configure retry behavior:
+// Non-transactional calls retry transient database errors (serialization
+// failures, deadlocks, lock-not-available, connection errors and server
+// restarts) with exponential backoff. Publish retries only serialization
+// failures and deadlocks, which guarantee a rollback. Configure the policy:
 //
-//	conn, _ := postgremq.Dial(ctx, cfg,
+//	conn, err := postgremq.Dial(ctx, cfg,
 //		postgremq.WithRetryConfig(postgremq.RetryConfig{
 //			MaxAttempts:       5,
 //			InitialBackoff:    100 * time.Millisecond,
@@ -213,60 +234,82 @@
 //
 // Or disable retries:
 //
-//	conn, _ := postgremq.Dial(ctx, cfg, postgremq.WithoutRetries())
+//	conn, err := postgremq.Dial(ctx, cfg, postgremq.WithoutRetries())
 //
-// Note: Methods with "WithTx" suffix (PublishWithTx, AckWithTx) do not use retry logic
-// since transaction boundaries are controlled by the caller.
+// PublishWithTx and AckWithTx never retry, since the caller controls the
+// transaction. A consumer's fetch is never retried in place; the consumer
+// tries again on its next fetch.
 //
 // # Exclusive Queues and Keep-Alive
 //
-// Exclusive queues are automatically deleted when their keep-alive expires. The client
-// automatically maintains keep-alive while the connection is active:
+// CreateQueue with exclusive = true registers the queue with the Connection's
+// keep-alive goroutine, which renews it about every half interval until
+// DeleteQueue on this Connection, a queue-fatal teardown, or Close:
 //
-//	// Create exclusive queue with 5-minute keep-alive
-//	_ = conn.CreateQueue(ctx, "temp-queue", "events", true,
+//	// Exclusive queue with a 5-minute lease.
+//	err := conn.CreateQueue(ctx, "temp-queue", "events", true,
 //		postgremq.WithKeepAliveInterval(5*time.Minute))
 //
-// The client extends keep-alive every 2.5 minutes (half the interval). If the connection
-// closes or the application crashes, the queue will be deleted after 5 minutes of inactivity.
+// If the process exits, the queue expires about 5 minutes after the last
+// renewal. An expired queue receives no messages and serves no consumers;
+// MaintenanceFast or DeleteInactiveQueues deletes it.
+//
+// # Queue-Fatal Teardown
+//
+// When a queue a consumer depends on is gone (deleted, replaced, or an expired
+// exclusive queue), the consumer is torn down: Messages() closes and the reason,
+// a *QueueFatalError matching errors.Is(err, ErrQueueGone), is delivered through
+// Consumer.NotifyClose and the connection-wide WithQueueFatalHandler.
 //
 // # Error Handling
 //
-// Common errors:
-//   - ErrConnectionClosed: Returned when operations are attempted on a closed connection
-//   - Database constraint violations: Topic/queue doesn't exist, token mismatch, etc.
+// Use errors.Is with the sentinels:
+//   - ErrConnectionClosed: the Connection is closing or closed.
+//   - ErrLeaseLost: the delivery is no longer owned by this consumer (expired
+//     and reclaimed, token mismatch, or already settled).
+//   - ErrQueueNotFound: missing topic or queue, or an expired exclusive queue.
+//   - ErrValidation: the request was rejected (invalid name, parameter mismatch,
+//     and similar).
+//   - ErrQueueGone: a consumer's queue is gone (see above).
 //
-// Always check errors from Ack/Nack/Release:
+// Check settle errors:
 //
 //	if err := msg.Ack(ctx); err != nil {
-//		if errors.Is(err, postgremq.ErrConnectionClosed) {
-//			// Connection closed, handle gracefully
-//		} else {
-//			// Other error (token mismatch, message already processed, etc.)
-//			log.Printf("Failed to ack message: %v", err)
+//		switch {
+//		case errors.Is(err, postgremq.ErrLeaseLost):
+//			// Another consumer may have the message; it will be processed again.
+//		case errors.Is(err, postgremq.ErrConnectionClosed):
+//			// The Connection has shut down.
+//		default:
+//			log.Printf("ack failed: %v", err)
 //		}
 //	}
 //
 // # Performance Considerations
 //
-// Batch Size: Larger batches reduce database round-trips but increase memory usage
-// and time to first message. Default is 5.
+// Batch size: larger batches reduce database round-trips but increase memory use
+// and claim more messages ahead of processing. The default is 10, and the
+// Messages() channel buffers one batch.
 //
-//	consumer, _ := conn.Consume("queue", postgremq.WithBatchSize(100))
+//	consumer, err := conn.Consume("queue", postgremq.WithBatchSize(100))
 //
-// Visibility Timeout: Should be longer than typical processing time. Too short causes
-// duplicate processing; too long delays retries on failure.
+// Visibility timeout: the default is 30 seconds. With auto-extension it bounds
+// how long a crashed consumer's messages stay invisible; without it, it must
+// exceed the processing time.
 //
-// Check Timeout: How often to poll for messages when no LISTEN/NOTIFY events arrive.
-// Default is 10 seconds.
+// Check timeout: the longest wait between fetches when no LISTEN/NOTIFY event
+// arrives. The default is 10 seconds.
 //
-//	consumer, _ := conn.Consume("queue", postgremq.WithCheckTimeout(5*time.Second))
+//	consumer, err := conn.Consume("queue", postgremq.WithCheckTimeout(5*time.Second))
 //
 // # Concurrency
 //
-// Connection methods are safe to call from multiple goroutines. Each Consumer spawns
-// internal goroutines for message fetching and auto-extension.
+// Connection methods are safe to call from multiple goroutines. Each Consumer
+// has one goroutine that owns its state (each fetch runs on a short-lived helper
+// goroutine); the Connection runs one LISTEN session for all consumers and one
+// goroutine each for auto-extension and keep-alive.
 //
-// Multiple consumers can consume from the same queue - messages are automatically
-// distributed among them using PostgreSQL's SKIP LOCKED mechanism.
+// Several consumers can consume from the same queue: each claim locks the rows
+// it takes with FOR UPDATE SKIP LOCKED, so a message is claimed by one consumer
+// at a time.
 package postgremq_go

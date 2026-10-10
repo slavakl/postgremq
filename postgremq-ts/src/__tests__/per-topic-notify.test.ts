@@ -194,7 +194,7 @@ describe('Per-topic NOTIFY', () => {
   });
 
   /**
-   * Reproduces REVIEW.md §4.4: a fast subscribe-then-stop sequence
+   * Regression: a fast subscribe-then-stop sequence
    * could leak the notify-listener pg client. Mechanism pre-fix:
    *   1. consume() kicks off startNotificationListener (fire-and-forget).
    *   2. The IIFE awaits pool.connect() — slow, gives the test window.

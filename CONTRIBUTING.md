@@ -1,415 +1,143 @@
 # Contributing to PostgreMQ
 
-Thank you for your interest in contributing to PostgreMQ! We welcome contributions from the community.
+Thank you for your interest in contributing! Bug reports, fixes, documentation
+and new features are all welcome.
 
-## Table of Contents
+This project follows a [Code of Conduct](./CODE_OF_CONDUCT.md). By
+participating you agree to uphold it. Report security issues privately as
+described in [SECURITY.md](./SECURITY.md), not in public issues.
 
-- [Code of Conduct](#code-of-conduct)
-- [Getting Started](#getting-started)
-- [Development Setup](#development-setup)
-- [How to Contribute](#how-to-contribute)
-- [Coding Guidelines](#coding-guidelines)
-- [Testing](#testing)
-- [Pull Request Process](#pull-request-process)
-- [Reporting Bugs](#reporting-bugs)
-- [Suggesting Enhancements](#suggesting-enhancements)
+## Project layout
 
-## Code of Conduct
+| Path | Component |
+|------|-----------|
+| `mq/` | SQL schema and functions (`sql/latest.sql`, `migrations/`), SQL tests (`tests/`) |
+| `postgremq-go/` | Go client |
+| `postgremq-ts/` | TypeScript client |
+| `postgremq-rs/` | Rust client (crate `postgremq`) |
+| `cmd/postgremq/` | CLI (migrations and status) |
+| `observability/` | Metrics contract, Collector config and end-to-end test |
+| `docs/` | Architecture, delivery lifecycle and observability guides |
 
-This project adheres to a Code of Conduct that all contributors are expected to follow. Please read [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) before contributing.
+Start with [docs/architecture.md](./docs/architecture.md). The SQL contract is
+in [mq/README.md](./mq/README.md), and the clients' shared behaviour and their
+differences are in [docs/delivery-lifecycle.md](./docs/delivery-lifecycle.md).
 
-## Getting Started
+## Prerequisites
 
-PostgreMQ consists of three main components:
+- Docker. The test suites start PostgreSQL 15 with testcontainers.
+- Go 1.25+ (the Go workspace and the metrics example need Go 1.26)
+- Node.js 22+ (the test suite needs 22.22+)
+- Rust 1.94+
+- Python 3.10+ (SQL and observability tests)
 
-1. **mq** - Core PostgreSQL schema and functions
-2. **postgremq-go** - Go client library
-3. **postgremq-ts** - TypeScript client library
+## Building and testing
 
-You can contribute to any or all of these components.
+Each component has its own tests. CI runs them on every pull request that
+touches the component.
 
-## Development Setup
-
-### Prerequisites
-
-- PostgreSQL 15 or later
-- Go 1.23 or later
-- Node.js 14 or later
-- Python 3.8+ (for SQL tests)
-- Docker (for testcontainers in tests)
-- Git
-
-### Clone the Repository
-
-```bash
-git clone https://github.com/slavakl/postgremq.git
-cd postgremq
-```
-
-### SQL Schema Development
+### SQL
 
 ```bash
 cd mq
-
-# Install Python dependencies
 pip install -r tests/requirements.txt
-
-# Run tests
 pytest tests/tests.py -v
 ```
 
-The SQL schema is located in `mq/sql/latest.sql`.
-
-### Go Client Development
-
-```bash
-cd postgremq-go
-
-# Download dependencies
-go mod download
-
-# Run tests
-go test -v ./...
-
-# Run tests with coverage
-go test -v -coverprofile=coverage.out ./...
-
-# View coverage
-go tool cover -html=coverage.out
-```
-
-### TypeScript Client Development
-
-```bash
-cd postgremq-ts
-
-# Install dependencies
-npm install
-
-# Build
-npm run build
-
-# Run tests
-npm test
-
-# Run tests with coverage
-npm run test:coverage
-
-# Run tests in watch mode
-npm run test:watch
-```
-
-## How to Contribute
-
-### Types of Contributions
-
-We welcome many types of contributions:
-
-- **Bug fixes**: Fix issues in existing code
-- **New features**: Add new functionality
-- **Documentation**: Improve or add documentation
-- **Tests**: Add or improve test coverage
-- **Performance improvements**: Optimize existing code
-- **Examples**: Add usage examples
-- **Client libraries**: Add support for other languages (Python, Rust, etc.)
-
-### Before You Start
-
-1. **Check existing issues**: Look for existing issues or feature requests
-2. **Create an issue**: If you're working on something new, create an issue first to discuss it
-3. **Get feedback**: Wait for feedback from maintainers before starting large changes
-
-## Coding Guidelines
-
-### SQL (PostgreSQL Functions)
-
-- Use lowercase with underscores for function and table names
-- Add comments explaining complex logic
-- Use proper error handling with `RAISE EXCEPTION`
-- Ensure backward compatibility when modifying existing functions
-- Use transactions where appropriate
-- Follow PostgreSQL best practices
+`mq/sql/latest.sql` is the complete schema. Until the first release,
+`mq/migrations/000001_initial_schema.up.sql` is kept byte-identical to it.
+After a release, schema changes add a new migration and update `latest.sql`
+to match (see [RELEASE.md](./RELEASE.md)). The Go `mq` module embeds both with
+`go:embed`, so there is no code to regenerate.
 
 ### Go
 
-- Follow standard Go conventions and formatting (`gofmt`, `golint`)
-- Write clear, self-documenting code with comments for public APIs
-- Use meaningful variable and function names
-- Add package-level documentation in `doc.go`
-- Handle errors explicitly - never ignore errors
-- Use contexts for cancellation and timeouts
-- Write table-driven tests where appropriate
-- Example format:
-
-```go
-// ExampleConnection_Publish demonstrates how to publish messages.
-func ExampleConnection_Publish() {
-    // Example code here
-}
+```bash
+cd postgremq-go
+GOWORK=off go test -race ./...     # as CI runs it: the module on its own
+go test -short ./...               # skips the long benchmarks
+make check                         # gofmt, go vet, staticcheck if installed
 ```
+
+CI also runs `golangci-lint`. The repository root has a `go.work` that ties
+`mq`, `postgremq-go`, `postgremq-go/examples/metrics` and `cmd/postgremq`
+together for local development.
 
 ### TypeScript
 
-- Use TypeScript's type system - avoid `any` types
-- Follow consistent naming conventions (camelCase for variables/functions)
-- Use async/await for asynchronous operations
-- Add JSDoc comments for public APIs
-- Use meaningful variable and function names
-- Export types for public APIs
-- Write unit tests for all new functionality
-
-### General Guidelines
-
-- Keep pull requests focused on a single concern
-- Write clear commit messages (see below)
-- Add tests for new functionality
-- Update documentation when changing behavior
-- Ensure all tests pass before submitting PR
-
-## Testing
-
-All code changes should include appropriate tests.
-
-### SQL Tests
-
-Tests are located in `mq/tests/tests.py` and use pytest with testcontainers.
-
-```bash
-cd mq
-pytest tests/tests.py -v
-```
-
-### Go Tests
-
-Tests follow Go's standard testing conventions. Integration tests use testcontainers.
-
-```bash
-cd postgremq-go
-
-# All tests
-go test -v ./...
-
-# Specific test
-go test -v -run TestConsumer_BasicFlow
-
-# Parallel tests
-go test -v -parallel 4 ./...
-
-# Short mode (skip long tests)
-go test -short -v ./...
-```
-
-### TypeScript Tests
-
-Tests use Jest and testcontainers.
-
 ```bash
 cd postgremq-ts
-
-# All tests
-npm test
-
-# Watch mode
-npm run test:watch
-
-# Coverage
-npm run test:coverage
-
-# Integration tests only
-npm run test:integration
+npm ci
+npm run build
+npx tsc --noEmit
+npm test                  # Jest; parallel workers, one PostgreSQL container per worker
 ```
 
-### Test Coverage
-
-We aim for high test coverage but prioritize meaningful tests over coverage percentages. Focus on:
-
-- Edge cases
-- Error handling
-- Concurrent access scenarios
-- Transaction behavior
-- Message lifecycle (publish, consume, ack, nack, release)
-
-## Pull Request Process
-
-### 1. Fork and Create a Branch
+### Rust
 
 ```bash
-git checkout -b feature/my-new-feature
-# or
-git checkout -b fix/bug-description
+cd postgremq-rs
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test                         # starts a postgres:15 container, or set
+cargo test --all-features          # POSTGREMQ_TEST_DATABASE_URL to a server whose
+                                   # user can create databases
 ```
 
-### 2. Make Your Changes
+### Observability (end-to-end)
 
-- Write clean, well-documented code
-- Add or update tests
-- Update documentation as needed
-- Ensure all tests pass locally
+```bash
+pip install -r mq/tests/requirements.txt
+pytest observability/test_collector.py -v
+```
 
-### 3. Commit Your Changes
+This runs PostgreSQL, an OpenTelemetry Collector and the metrics example of
+each client, and checks the exported metrics.
 
-Follow conventional commit format:
+## Making changes
+
+1. For anything beyond a small fix, open an issue first to agree on the
+   approach.
+2. Keep pull requests focused on one change.
+3. Add tests. Behaviour shared by the clients (settlement, renewal,
+   keep-alive, shutdown, queue loss, message groups) should be tested in each
+   client it affects, and a change to one client's behaviour usually needs
+   the same change in the others.
+4. Update the documentation that describes the behaviour you changed:
+   READMEs, `docs/`, doc comments.
+5. Add an entry under `Unreleased` in [CHANGELOG.md](./CHANGELOG.md).
+
+### Guidelines
+
+- **SQL**: lowercase names; raise errors with the project's SQLSTATEs (`PMQ01`
+  lease lost, `PMQ02` queue not found, `PMQ03` validation); keep functions
+  safe under concurrency (state the locking argument in a comment).
+- **Go**: `gofmt`; doc comments on exported identifiers; errors are wrapped,
+  never ignored; contexts for cancellation.
+- **TypeScript**: strict types, no `any` in public APIs; TSDoc on exports.
+- **Rust**: `rustfmt`, clippy clean with `-D warnings`; doc comments with
+  `# Errors` sections on public fallible functions; no lock held across
+  `.await`.
+- **Transactions**: functions that accept a caller's transaction or
+  connection never begin, commit or roll it back.
+
+### Commit messages
+
+Use [Conventional Commits](https://www.conventionalcommits.org/):
 
 ```
 <type>(<scope>): <subject>
-
-<body>
-
-<footer>
 ```
 
-Types:
-- `feat`: New feature
-- `fix`: Bug fix
-- `docs`: Documentation changes
-- `test`: Adding or updating tests
-- `refactor`: Code refactoring
-- `perf`: Performance improvements
-- `chore`: Build process or auxiliary tool changes
+Types: `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `chore`. Scopes:
+`sql`, `go`, `ts`, `rs`, `cli`, `docs`, `ci`, or several (`sql,go,ts`).
 
-Examples:
+## Reporting bugs and requesting features
 
-```
-feat(go): add batch publish support
-
-Implemented batch publishing to reduce database round-trips.
-Includes new PublishBatch method with transaction support.
-
-Closes #123
-```
-
-```
-fix(ts): resolve visibility timeout extension race condition
-
-Fixed race condition where messages could timeout during extension.
-Added mutex to protect concurrent extension requests.
-
-Fixes #456
-```
-
-### 4. Push to Your Fork
-
-```bash
-git push origin feature/my-new-feature
-```
-
-### 5. Create Pull Request
-
-- Fill out the pull request template
-- Reference related issues
-- Describe what changed and why
-- Include screenshots for UI changes (if applicable)
-- Ensure CI passes
-
-### 6. Code Review
-
-- Address review feedback promptly
-- Keep discussions focused and professional
-- Be open to suggestions and alternative approaches
-
-### 7. Merge
-
-Once approved, a maintainer will merge your PR.
-
-## Reporting Bugs
-
-### Before Submitting a Bug Report
-
-- Check existing issues to avoid duplicates
-- Verify the bug exists in the latest version
-- Collect relevant information (versions, logs, etc.)
-
-### Submitting a Bug Report
-
-Create an issue with:
-
-- **Clear title**: Summarize the problem
-- **Description**: Detailed description of the issue
-- **Steps to reproduce**: Step-by-step instructions
-- **Expected behavior**: What should happen
-- **Actual behavior**: What actually happens
-- **Environment**:
-  - PostgreSQL version
-  - Go version (if applicable)
-  - Node.js version (if applicable)
-  - Operating system
-- **Logs/Screenshots**: Relevant error messages or screenshots
-- **Possible fix**: If you have ideas on how to fix it
-
-## Suggesting Enhancements
-
-### Before Submitting an Enhancement
-
-- Check if it already exists or is planned
-- Consider if it fits the project's scope and goals
-- Think about backward compatibility
-
-### Submitting an Enhancement
-
-Create an issue with:
-
-- **Clear title**: Summarize the enhancement
-- **Use case**: Describe the problem this solves
-- **Proposed solution**: How you envision it working
-- **Alternatives**: Other approaches you've considered
-- **Additional context**: Any other relevant information
-
-## Development Workflow
-
-### Typical Workflow for SQL Schema Changes
-
-1. Modify `mq/sql/latest.sql`
-2. Update embedded SQL in `mq/sql.go` if needed
-3. Run SQL tests: `pytest tests/tests.py -v`
-4. Update client libraries if schema changes affect them
-5. Run client tests
-6. Update documentation
-
-### Typical Workflow for Go Client Changes
-
-1. Modify Go source files
-2. Update or add tests
-3. Run tests: `go test -v ./...`
-4. Update documentation/examples if needed
-5. Run `gofmt -s -w .`
-6. Verify test coverage
-
-### Typical Workflow for TypeScript Client Changes
-
-1. Modify TypeScript source files
-2. Update or add tests
-3. Run tests: `npm test`
-4. Build: `npm run build`
-5. Update documentation/examples if needed
-6. Verify no type errors: `tsc --noEmit`
-
-## Communication
-
-- **GitHub Issues**: For bugs, features, and discussions
-- **GitHub Discussions**: For questions and general discussions
-- **Pull Requests**: For code review and contributions
-
-## Recognition
-
-Contributors will be recognized in:
-
-- Release notes
-- GitHub contributors list
-- CHANGELOG.md for significant contributions
-
-## Questions?
-
-If you have questions about contributing:
-
-1. Check existing documentation
-2. Search closed issues
-3. Ask in GitHub Discussions
-4. Create an issue with the `question` label
+Use the issue templates. For bugs, include the component and version, the
+PostgreSQL version, a minimal reproduction, and what you expected.
 
 ## License
 
-By contributing to PostgreMQ, you agree that your contributions will be licensed under the MIT License.
-
----
-
-Thank you for contributing to PostgreMQ!
+By contributing, you agree that your contributions are licensed under the
+[MIT License](./LICENSE).

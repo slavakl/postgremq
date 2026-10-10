@@ -217,7 +217,7 @@ describe('Shutdown Behavior', () => {
     });
 
     /**
-     * Reproduces REVIEW.md §4.3 / KNOWN_BUGS.md item 1: a fetch
+     * Regression: a fetch
      * in-flight when stop() runs whose SQL takes longer than the old
      * 1000ms spin cap orphans messages — consume_message has already
      * claimed them server-side, but stop() returns before they reach
@@ -290,7 +290,7 @@ describe('Shutdown Behavior', () => {
     });
 
     /**
-     * Reproduces REVIEW.md §4.7: releaseBufferedMessages used
+     * Regression: releaseBufferedMessages used
      * `Promise.race([Promise.all(...), new Promise((_, reject) =>
      * setTimeout(() => reject(...), 2000))])`. When Promise.all wins,
      * the setTimeout still fires later and rejects a Promise nobody is

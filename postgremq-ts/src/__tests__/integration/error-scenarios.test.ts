@@ -572,7 +572,7 @@ describe('Error Scenarios', () => {
 
   describe('Auto-Extension Error Handling', () => {
     /**
-     * Reproduces REVIEW.md §1.1/§4.1: prior to the fix, a single transient
+     * Regression: prior to the fix, a single transient
      * error from setMessagesVtBatch caused the consumer to permanently
      * drop EVERY in-flight message from extension tracking. The handler
      * kept running, vt eventually expired, another consumer could pick up

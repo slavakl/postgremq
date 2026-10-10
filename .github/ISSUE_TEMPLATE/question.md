@@ -18,6 +18,8 @@ assignees: ''
 - [ ] SQL implementation (mq)
 - [ ] Go client (postgremq-go)
 - [ ] TypeScript client (postgremq-ts)
+- [ ] Rust client (postgremq-rs)
+- [ ] CLI (cmd/postgremq)
 - [ ] General usage
 - [ ] Architecture/design
 - [ ] Other

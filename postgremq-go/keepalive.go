@@ -12,7 +12,7 @@ var _ scheduler[*kaEntry, string, kaResult] = (*keepAliveScheduler)(nil)
 // model with a single goroutine that batches every exclusive queue's keep-alive
 // into one extend_queue_keep_alive_multi round-trip per tick.
 //
-// Lifetime (G7): the actor runs on its own context (NOT conn.ctx), so it
+// Lifetime: the actor runs on its own context (NOT conn.ctx), so it
 // outlives the consumer drain and keeps firing for exclusive queues with zero
 // consumers (producer-only or created-but-unconsumed). It is stopped last in
 // Close().

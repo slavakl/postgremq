@@ -5,14 +5,18 @@ on:
     branches: [ main ]
     paths:
       - 'postgremq-go/**'
-      - 'mq/sql/**'
+      - 'cmd/postgremq/**'
+      - 'mq/**'
+      - 'go.work'
       - 'observability/**'
       - '.github/workflows/go-tests.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'postgremq-go/**'
-      - 'mq/sql/**'
+      - 'cmd/postgremq/**'
+      - 'mq/**'
+      - 'go.work'
       - 'observability/**'
       - '.github/workflows/go-tests.yml'
 
@@ -23,7 +27,7 @@ jobs:
 
     strategy:
       matrix:
-        go-version: ['1.23', '1.24']
+        go-version: ['1.25', '1.26']
 
     steps:
     - name: Checkout code
@@ -46,10 +50,16 @@ jobs:
 
     - name: Download dependencies
       working-directory: ./postgremq-go
+      env:
+        GOWORK: 'off'
       run: go mod download
 
+    # Test the module as published (its own go.mod), not the workspace:
+    # the workspace also holds the metrics example, which needs Go 1.26.
     - name: Run tests
       working-directory: ./postgremq-go
+      env:
+        GOWORK: 'off'
       run: go test -v -race -timeout=20m -coverprofile=coverage.out -covermode=atomic ./...
 
     # Uncomment to enable Codecov (requires CODECOV_TOKEN secret)
@@ -73,11 +83,24 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.23'
+        go-version: '1.26'
 
     - name: golangci-lint
       uses: golangci/golangci-lint-action@v8
+      env:
+        GOWORK: 'off'
       with:
-        version: v2.5
+        version: v2.12
         working-directory: postgremq-go
         args: --timeout=5m
+
+    - name: Build and vet the CLI and examples
+      run: |
+        go build ./cmd/postgremq/... ./postgremq-go/examples/...
+        go vet ./cmd/postgremq/... ./postgremq-go/examples/...
+
+    - name: Test the CLI
+      working-directory: ./cmd/postgremq
+      env:
+        GOWORK: 'off'
+      run: go test ./...

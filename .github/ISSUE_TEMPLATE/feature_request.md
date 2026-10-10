@@ -36,6 +36,10 @@ Provide a concrete use case or example of how you would use this feature.
 // Example usage in TypeScript
 ```
 
+```rust
+// Example usage in Rust
+```
+
 ## Component
 
 Which component(s) would this feature affect?
@@ -43,6 +47,8 @@ Which component(s) would this feature affect?
 - [ ] SQL implementation (mq)
 - [ ] Go client (postgremq-go)
 - [ ] TypeScript client (postgremq-ts)
+- [ ] Rust client (postgremq-rs)
+- [ ] CLI (cmd/postgremq)
 - [ ] Documentation
 - [ ] Other (please specify)
 

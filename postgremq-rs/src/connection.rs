@@ -54,9 +54,9 @@ const POOL_CLOSE: Duration = Duration::from_secs(5);
 
 /// A client handle to a PostgreMQ installation.
 ///
-/// Cheap to clone; clones share one pool, one `LISTEN` session, one lease
-/// lease-renewal scheduler and one keep-alive scheduler. Call [`close`](Self::close) for a
-/// graceful shutdown. Without it, the background tasks stop (without
+/// Cheap to clone; clones share one pool, one `LISTEN` session, one
+/// lease-renewal scheduler and one keep-alive scheduler. Call
+/// [`close`](Self::close) for a graceful shutdown. Without it, the background tasks stop (without
 /// draining) once the last `Connection`, consumer and delivery are dropped.
 #[derive(Clone)]
 pub struct Connection {

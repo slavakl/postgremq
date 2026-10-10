@@ -1,4 +1,4 @@
-// Phase C (single-loop consumer) tests: head-of-line behavior under a slow /
+// Single-loop consumer tests: head-of-line behavior under a slow /
 // non-reading consumer, and Stop()/Close() shutdown races.
 package postgremq_go_test
 

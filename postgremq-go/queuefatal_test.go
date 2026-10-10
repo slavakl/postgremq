@@ -228,7 +228,7 @@ func TestQueueFatalInFlightDeregisteredFromExtender(t *testing.T) {
 
 	// Settle the cancelled message (a well-behaved handler would) so the
 	// consumer's drain completes — the release fails (queue gone) but complete()
-	// untracks unconditionally (G3), draining the in-flight set. Without this the
+	// untracks unconditionally, draining the in-flight set. Without this the
 	// deferred Stop() would wait forever for the held message (existing contract).
 	_ = msg.Release(context.Background())
 }

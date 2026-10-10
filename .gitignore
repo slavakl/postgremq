@@ -100,6 +100,7 @@ cmd/postgremq/postgremq
 postgremq-go/examples/basic/basic
 postgremq-go/examples/transactions/transactions
 postgremq-go/examples/migration/migration
+postgremq-go/examples/metrics/metrics
 
 # Claude Code and AI assistant files
 CLAUDE.md
