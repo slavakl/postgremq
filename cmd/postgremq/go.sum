@@ -188,3 +188,7 @@ gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c/go.mod h1:K4uyk7z7BCEPqu6E+C
 gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
 gotest.tools/v3 v3.5.2 h1:7koQfIKdy+I8UTetycgUqXWSDwpgv193Ka+qRsmBY8Q=
 gotest.tools/v3 v3.5.2/go.mod h1:LtdLGcnqToBH83WByAAi/wiwSFCArdFIUV/xxN4pcjA=
+postgremq.dev/mq v0.2.0-e2e.2 h1:U2FjZJ+DsR8IW28B/LpAJSFhDwm/z1UXMuFqJL+ElFk=
+postgremq.dev/mq v0.2.0-e2e.2/go.mod h1:DkLvYv8L9ZFIc5JhR2QvgH5uOjA6rTYlg7ApsIvPNwk=
+postgremq.dev/postgremq-go v0.2.0-e2e.2 h1:uT54fFitfQzgPreJAsrXPlf+5O6LX0CCiywFlthiWcc=
+postgremq.dev/postgremq-go v0.2.0-e2e.2/go.mod h1:Ncb/NOdZfbQJGG/UgGj+CDYeLNFUPXHdDD3x5DpqS/w=
