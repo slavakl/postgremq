@@ -209,6 +209,12 @@ version that is already published.
 3. Squash-merge it. The next `release.yml` run on that merge commit tags it,
    creates the GitHub release, and publishes.
 
+Merge release PRs one at a time: they all edit
+`.release-please-manifest.json`, so after one merges the others conflict
+until that merge's run rebuilds them (its *Release Please* step, a few
+minutes later). Merging two in quick succession is safe when GitHub allows it
+(the guard waits for and tags both).
+
 Order for a release that spans components: mq → (bump pins) → Go client, Rust,
 TypeScript → (bump the CLI's client requirement) → CLI.
 
