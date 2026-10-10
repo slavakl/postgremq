@@ -17,7 +17,9 @@ automatically.
 | TypeScript client | `postgremq-ts/` | `package.json` | `npm/vX.Y.Z` | npm package `postgremq` |
 
 `release-please-config.json` defines them; `.release-please-manifest.json`
-holds each one's last released version. Release Please assigns commits to
+holds each one's last released version. Release PRs are rebuilt on every
+run (`always-update`), so a release of one component (which edits the shared
+manifest) never leaves the others conflicting. Release Please assigns commits to
 components by the paths they change. Changes outside these directories (docs,
 `observability/`, CI) release nothing.
 
@@ -154,7 +156,8 @@ On every push to `main`, `release.yml`:
    commit that passed validation (this run, or an earlier run's `Validated`
    job on that commit) and must pass `verify_release.py` at that commit.
    Otherwise nothing is tagged and the run fails (see *Correcting a pending
-   release*).
+   release*). A release PR merged after the run's own commit is left to its
+   own run: this run then tags nothing, without failing.
 3. **Tags** each such merge commit and creates its GitHub release with the
    changelog section as notes (Release Please, `skip-github-pull-request`).
 4. **Opens or updates** one release PR per component with unreleased

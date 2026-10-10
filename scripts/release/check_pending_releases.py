@@ -12,8 +12,11 @@ passing commit must not authorize an earlier failed one.
 --validated-sha is the commit this workflow run validated. Any other merge
 commit counts as validated only if an earlier run of this workflow
 (--workflow, default release.yml) finished the `Validated` job successfully on
-it. Needs `gh` authenticated (GH_TOKEN) and GITHUB_REPOSITORY.
-Prints the pending releases; exits 1 if any must not be tagged.
+it. A merge commit newer than --validated-sha belongs to its own, later run:
+this run then tags nothing (Release Please would tag every pending PR) and
+leaves it to that run. Needs `gh` authenticated (GH_TOKEN) and
+GITHUB_REPOSITORY. Writes `tag=true|false` to $GITHUB_OUTPUT when set.
+Exits 1 if a pending release must not be tagged.
 """
 
 from __future__ import annotations
@@ -45,6 +48,21 @@ def gh_json(*args: str):
     return json.loads(run('gh', *args))
 
 
+def newer_than(sha: str, validated: str) -> bool:
+    """Whether `sha` is not in the history of `validated` (a later commit)."""
+    if subprocess.run(['git', '-C', str(ROOT), 'cat-file', '-e', f'{sha}^{{commit}}'],
+                      capture_output=True).returncode != 0:
+        return True  # not fetched: pushed after this run's checkout
+    return subprocess.run(['git', '-C', str(ROOT), 'merge-base', '--is-ancestor', sha, validated],
+                          capture_output=True).returncode != 0
+
+
+def set_output(tag: bool) -> None:
+    if 'GITHUB_OUTPUT' in os.environ:
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+            out.write(f'tag={"true" if tag else "false"}\n')
+
+
 def validated_elsewhere(repo: str, workflow: str, sha: str) -> bool:
     runs = gh_json('api', f'repos/{repo}/actions/workflows/{workflow}/runs?head_sha={sha}&per_page=100')
     for workflow_run in runs.get('workflow_runs', []):
@@ -66,15 +84,20 @@ def main() -> int:
                   '--label', 'autorelease: pending', '--json', 'number,title,headRefName,mergeCommit,url')
     if not prs:
         print('No merged release PRs are waiting to be tagged.')
+        set_output(True)
         return 0
 
     problems = []
+    deferred = []
     for pr in prs:
         sha = (pr.get('mergeCommit') or {}).get('oid')
         component = pr['headRefName'].rpartition('--components--')[2]
         label = f'#{pr["number"]} ({pr["title"]}, {sha and sha[:12]})'
         if component not in COMPONENT_PATHS or not sha:
             problems.append(f'{label}: cannot tell its component or merge commit')
+            continue
+        if sha != args.validated_sha and newer_than(sha, args.validated_sha):
+            deferred.append(f'{label}: merged after this run\'s commit; its own run validates and tags it')
             continue
         if sha != args.validated_sha and not validated_elsewhere(repo, args.workflow, sha):
             problems.append(
@@ -104,7 +127,15 @@ def main() -> int:
         print('Release guard: not tagging. Correct the pending release(s) first:', file=sys.stderr)
         for problem in problems:
             print(f'  - {problem}', file=sys.stderr)
+        set_output(False)
         return 1
+    if deferred:
+        print('Release guard: not tagging in this run (a later run will):')
+        for item in deferred:
+            print(f'  - {item}')
+        set_output(False)
+        return 0
+    set_output(True)
     return 0
 
 

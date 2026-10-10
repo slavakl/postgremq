@@ -83,12 +83,14 @@ jobs:
           fetch-depth: 0
 
       - name: Release guard
+        id: guard
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
         run: python3 scripts/release/check_pending_releases.py --branch "${{ github.ref_name }}" --validated-sha "${{ github.sha }}"
 
       - name: Tag merged release PRs and create GitHub releases
         id: tags
+        if: steps.guard.outputs.tag == 'true'
         uses: googleapis/release-please-action@v4
         with:
           token: ${{ steps.app.outputs.token || github.token }}
