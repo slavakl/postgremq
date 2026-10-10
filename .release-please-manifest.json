@@ -1,5 +1,5 @@
 {
-  "mq": "0.2.0-e2e.1",
+  "mq": "0.1.0",
   "postgremq-go": "0.1.0",
   "cmd/postgremq": "0.1.0",
   "postgremq-rs": "0.1.0",

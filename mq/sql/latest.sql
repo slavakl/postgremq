@@ -99,7 +99,7 @@ CREATE SCHEMA IF NOT EXISTS postgremq;
 CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb
 LANGUAGE sql STABLE
 AS $$
-    SELECT jsonb_build_object('db_version', '0.2.0-e2e.1', 'protocol_major', 1)
+    SELECT jsonb_build_object('db_version', '0.1.0', 'protocol_major', 1)
 $$;
 
 -- Topics table.
@@ -1835,4 +1835,4 @@ $$;
  */
 CREATE TABLE postgremq.postgremq_migrations (version bigint not null primary key, dirty boolean not null);
 
-INSERT INTO postgremq.postgremq_migrations (version, dirty) VALUES (2, false);
+INSERT INTO postgremq.postgremq_migrations (version, dirty) VALUES (1, false);
