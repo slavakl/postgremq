@@ -10,7 +10,7 @@ require (
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/metric v1.46.0
 	go.opentelemetry.io/otel/sdk/metric v1.46.0
-	postgremq.dev/mq v0.2.0
+	postgremq.dev/mq v0.2.0-e2e.2
 )
 
 require (

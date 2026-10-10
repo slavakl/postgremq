@@ -1,0 +1,22 @@
+name: E2E publish retry
+
+# Throwaway (e2e branches only): workflow_dispatch works only for workflows on
+# the default branch, so this push trigger stands in for "Actions > Publish >
+# Run workflow" to exercise the manual retry path.
+on:
+  push:
+    branches: [ e2e/retry2 ]
+
+permissions:
+  contents: read
+
+jobs:
+  retry:
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: rust/v0.2.0-e2e.2
+      run-tests: true
+    permissions:
+      contents: read
+      id-token: write
+    secrets: inherit

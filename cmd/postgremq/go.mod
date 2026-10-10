@@ -7,7 +7,7 @@ require (
 	github.com/spf13/cobra v1.8.1
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.40.0
-	postgremq.dev/postgremq-go v0.2.0
+	postgremq.dev/postgremq-go v0.2.0-e2e.2
 )
 
 require (
@@ -70,5 +70,5 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
-	postgremq.dev/mq v0.2.0 // indirect
+	postgremq.dev/mq v0.2.0-e2e.2 // indirect
 )
