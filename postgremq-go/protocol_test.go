@@ -8,9 +8,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"postgremq.dev/postgremq-go"
 )
 
 func TestProtocol_SupportedMajors(t *testing.T) {

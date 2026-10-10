@@ -14,9 +14,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"postgremq.dev/postgremq-go"
 )
 
 // qid is a (queue, id) pair recorded from a set_vt_batch_multi call.

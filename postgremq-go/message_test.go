@@ -12,8 +12,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
+	"postgremq.dev/postgremq-go"
 )
 
 // -----------------------------------------------------------------------

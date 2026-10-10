@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"postgremq.dev/postgremq-go"
 )
 
 // TestErrLeaseLost_AckTwice verifies that a second ack on the same message

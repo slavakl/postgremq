@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"postgremq.dev/postgremq-go"
 )
 
 // setupEmptyTestDatabase creates a database WITHOUT the PostgreMQ schema
@@ -83,7 +83,7 @@ func TestMigration_MigrateEmptyDatabase(t *testing.T) {
 	status, err := postgremq.GetMigrationStatus(pool)
 	require.NoError(t, err)
 
-	assert.Equal(t, uint(1), status.CurrentVersion, "Should be at version 1 after migration")
+	assert.Equal(t, status.LatestVersion, status.CurrentVersion, "Should be at the latest version after migration")
 	assert.False(t, status.Dirty, "Should not be dirty after successful migration")
 	assert.False(t, status.NeedsMigration, "Should not need migration after migrating")
 }
@@ -103,7 +103,7 @@ func TestMigration_Idempotency(t *testing.T) {
 	status, err := postgremq.GetMigrationStatus(pool)
 	require.NoError(t, err)
 
-	assert.Equal(t, uint(1), status.CurrentVersion)
+	assert.Equal(t, status.LatestVersion, status.CurrentVersion)
 	assert.False(t, status.NeedsMigration)
 }
 
@@ -206,7 +206,9 @@ func TestMigration_DirtyDatabaseFails(t *testing.T) {
 
 	err = postgremq.Migrate(pool)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "Dirty database version 1")
+	status, statusErr := postgremq.GetMigrationStatus(pool)
+	require.NoError(t, statusErr)
+	assert.Contains(t, err.Error(), fmt.Sprintf("Dirty database version %d", status.LatestVersion))
 }
 
 func TestMigration_Concurrent(t *testing.T) {

@@ -5,8 +5,8 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"postgremq.dev/postgremq-go"
 	"github.com/spf13/cobra"
+	"postgremq.dev/postgremq-go"
 )
 
 var dsn string

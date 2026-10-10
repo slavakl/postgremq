@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/require"
+	"postgremq.dev/postgremq-go"
 )
 
 // Run explicitly: POSTGREMQ_SOAK_SECONDS=60 go test -race -run TestProductionTopologySoak -timeout=3m -v
