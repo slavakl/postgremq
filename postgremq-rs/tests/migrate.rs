@@ -223,16 +223,17 @@ async fn a_migrate_dropped_while_applying_still_finishes_cleanly() {
     assert_eq!((status.current_version, status.dirty), (1, true));
     blocker.rollback().await.unwrap();
 
-    // The apply phase keeps running without its caller.
+    // The apply phase keeps running without its caller, through every
+    // migration.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let status = migration_status(&db.pool).await.unwrap();
-        if (status.current_version, status.dirty) == (1, false) {
+        if (status.current_version, status.dirty) == (status.latest_version, false) {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "migration 1 left dirty"
+            "migrations left unfinished: {status:?}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
