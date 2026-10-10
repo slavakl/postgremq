@@ -11,7 +11,7 @@ name: Release
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, e2e/release ]
 
 # No workflow-level concurrency: every pushed commit is validated (the guard
 # needs the Validated job of each release PR's merge commit). Only the jobs
