@@ -99,6 +99,21 @@ jobs:
           manifest-file: .release-please-manifest.json
           skip-github-pull-request: true
 
+      # postgremq.info() reports the schema version (the last migration), not
+      # the mq release; say in the release notes which one it ships.
+      - name: Note the schema version in the mq release
+        if: steps.tags.outputs['mq--tag_name'] != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          TAG: ${{ steps.tags.outputs['mq--tag_name'] }}
+        run: |
+          git fetch -q origin "refs/tags/$TAG:refs/tags/$TAG"
+          schema=$(git show "$TAG:mq/sql/latest.sql" |
+            sed -nE 's/^INSERT INTO postgremq\.postgremq_migrations \(version, dirty\) VALUES \(([0-9]+), false\);$/\1/p')
+          notes=$(gh release view "$TAG" --json body --jq .body)
+          header="Schema version: **$schema** (what postgremq.info() reports as schema_version after installing or upgrading to this release)."
+          gh release edit "$TAG" --notes "$(printf '%s\n\n%s' "$header" "$notes")"
+
       - name: Open or update release PRs
         uses: googleapis/release-please-action@v4
         with:
@@ -107,55 +122,6 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
           skip-github-release: true
-
-  # The mq release PR also needs the release stamp: a migration that makes
-  # postgremq.info() report the new version, mirrored in latest.sql.
-  # Release Please rewrites its branch on every update, so this re-applies it.
-  stamp-mq:
-    name: Stamp the mq release PR
-    needs: release
-    runs-on: ubuntu-latest
-    concurrency:
-      group: release-stamp-${{ github.ref }}
-      cancel-in-progress: false
-    permissions:
-      contents: write
-      pull-requests: read
-    steps:
-      - name: GitHub App token
-        id: app
-        if: vars.RELEASE_APP_ID != ''
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ vars.RELEASE_APP_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-      - name: Find the mq release PR
-        id: pr
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
-        run: |
-          branch="release-please--branches--${{ github.ref_name }}--components--mq"
-          number=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq '.[0].number // empty')
-          if [ -n "$number" ]; then
-            echo "branch=$branch" >> "$GITHUB_OUTPUT"
-          fi
-      - uses: actions/checkout@v4
-        if: steps.pr.outputs.branch != ''
-        with:
-          ref: ${{ steps.pr.outputs.branch }}
-          token: ${{ steps.app.outputs.token || github.token }}
-      - name: Stamp and push
-        if: steps.pr.outputs.branch != ''
-        run: |
-          version=$(cat mq/VERSION)
-          python3 mq/scripts/stamp_release.py "$version"
-          if [ -n "$(git status --porcelain)" ]; then
-            git config user.name "postgremq-release[bot]"
-            git config user.email "postgremq-release[bot]@users.noreply.github.com"
-            git add mq
-            git commit -m "chore(mq): stamp release $version"
-            git push origin "HEAD:${{ steps.pr.outputs.branch }}"
-          fi
 
   publish-mq:
     needs: release

@@ -108,8 +108,8 @@ export class ConnectionClosedError extends Error {
  * discovery is missing, `cause` is the database error.
  */
 export class CompatibilityError extends Error {
-  /** The installed implementation version; undefined when discovery is missing. */
-  readonly dbVersion?: string;
+  /** The installed schema version (the last migration applied); undefined when discovery is missing. */
+  readonly schemaVersion?: number;
   /** The installation's protocol major; undefined when discovery is missing. */
   readonly protocolMajor?: number;
   /** The protocol majors this client supports. */
@@ -117,7 +117,7 @@ export class CompatibilityError extends Error {
   /** The database error when discovery is missing. */
   readonly cause?: Error;
   constructor(details: {
-    dbVersion?: string;
+    schemaVersion?: number;
     protocolMajor?: number;
     supportedMajors: readonly number[];
     cause?: Error;
@@ -126,10 +126,10 @@ export class CompatibilityError extends Error {
     super(
       details.cause
         ? `postgremq: postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports protocol majors ${supported}): ${details.cause.message}`
-        : `postgremq: the database's PostgreMQ ${details.dbVersion} uses protocol major ${details.protocolMajor}; this client supports ${supported}`
+        : `postgremq: the database's PostgreMQ schema (version ${details.schemaVersion ?? 'unknown'}) uses protocol major ${details.protocolMajor}; this client supports ${supported}`
     );
     this.name = 'CompatibilityError';
-    this.dbVersion = details.dbVersion;
+    this.schemaVersion = details.schemaVersion;
     this.protocolMajor = details.protocolMajor;
     this.supportedMajors = details.supportedMajors;
     this.cause = details.cause;

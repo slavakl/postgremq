@@ -51,7 +51,7 @@
     "pg": "^8.23.1"
   },
   "postgremq": {
-    "mq": "0.2.0"
+    "mq-schema": 1
   },
   "engines": {
     "node": ">=22"

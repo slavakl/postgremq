@@ -11,13 +11,13 @@ publish workflow on the release tag. Checks, for the component and version:
   (mq/VERSION, Cargo.toml/Cargo.lock, package.json/package-lock.json; Go
   modules are versioned by their tag only);
 - the component's CHANGELOG.md has an entry for the version;
-- mq: sql/latest.sql reports the version through postgremq.info(), and the
-  version's release stamp is the latest migration, recorded by latest.sql;
+- mq: sql/latest.sql records the latest migration (the schema version
+  postgremq.info() reports for a fresh install);
 - dependencies are released, explicit versions: the Go client's
   postgremq.dev/mq, the CLI's postgremq.dev/postgremq-go (tags in this
-  branch's history, with go.sum hashes), and the mq version the Rust and
-  TypeScript clients pin, whose migrations must be byte-identical to the ones
-  they embed;
+  branch's history, with go.sum hashes), and the mq schema version N the Rust
+  and TypeScript clients pin: migrations 1..N must be part of a released mq
+  version and byte-identical to the ones they embed;
 - with --tag-exists, the tag exists and points at HEAD.
 """
 
@@ -57,10 +57,6 @@ def released(tag: str) -> bool:
         return False
     return subprocess.run(['git', '-C', str(ROOT), 'merge-base', '--is-ancestor', tag, 'HEAD'],
                           capture_output=True).returncode == 0
-
-
-def stamp_name(version: str) -> str:
-    return 'release_v' + re.sub(r'[^0-9A-Za-z]', '_', version)
 
 
 def migrations(directory: Path) -> list[tuple[int, str, str]]:
@@ -114,19 +110,13 @@ class Checker:
         self.go_license('mq')
         recorded = (mq / 'VERSION').read_text().strip()
         self.expect(recorded == version, f'mq/VERSION is {recorded!r}, not {version!r}')
-        latest = (mq / 'sql' / 'latest.sql').read_text()
-        info = re.findall(r"jsonb_build_object\('db_version', '([^']*)'", latest)
-        self.expect(info == [version], f'mq/sql/latest.sql info() reports {info}, not [{version!r}]')
         found = migrations(mq / 'migrations')
-        stamp = [m for m in found if m[1] == stamp_name(version)]
-        self.expect(bool(stamp), f'no release stamp migration *_{stamp_name(version)}.up.sql '
-                                 '(run mq/scripts/stamp_release.py)')
-        if stamp and found:
-            self.expect(stamp[0] == found[-1], f'{stamp[0][2]} is not the latest migration')
-            number = re.search(r'INSERT INTO postgremq\.postgremq_migrations \(version, dirty\) VALUES \((\d+), false\);',
-                               latest)
-            self.expect(number is not None and int(number.group(1)) == stamp[0][0],
-                        f'mq/sql/latest.sql records migration {number and number.group(1)}, not {stamp[0][0]}')
+        latest_sql = (mq / 'sql' / 'latest.sql').read_text()
+        number = re.search(r'INSERT INTO postgremq\.postgremq_migrations \(version, dirty\) VALUES \((\d+), false\);',
+                           latest_sql)
+        self.expect(found and number is not None and int(number.group(1)) == found[-1][0],
+                    f'mq/sql/latest.sql records migration {number and number.group(1)}, '
+                    f'not the latest ({found and found[-1][0]})')
 
     def go_dependency(self, module_dir: str, dependency: str, dependency_dir: str) -> None:
         self.go_license(module_dir)
@@ -143,26 +133,31 @@ class Checker:
             self.expect(entry in sums, f'{module_dir}/go.sum lacks "{entry}..."; '
                                        f'run scripts/release/go-standalone.sh --write {module_dir} go mod tidy after the release')
 
-    def pinned_mq(self, package: str, pin: str | None) -> None:
+    def pinned_schema(self, package: str, pin: int | None) -> None:
         if not pin:
-            self.errors.append(f'{package}: no mq version pin')
-            return
-        tag = f'mq/v{pin}'
-        if not released(tag):
-            self.errors.append(f'{package} pins mq {pin}, which is not released (no tag {tag} in this history); '
-                               'release mq first, then pin a released version')
+            self.errors.append(f'{package}: no mq schema pin')
             return
         found = migrations(ROOT / 'mq' / 'migrations')
-        stamp = [m for m in found if m[1] == stamp_name(pin)]
-        bundled = [m for m in found if stamp and m[0] <= stamp[0][0]]
-        at_tag = sorted(name for name in git('ls-tree', '--name-only', f'{tag}:mq/migrations').split()
-                        if UP.match(name))
-        self.expect([m[2] for m in bundled] == at_tag,
-                    f'{package} would embed {[m[2] for m in bundled]}, but mq {pin} has {at_tag}')
+        bundled = [m for m in found if m[0] <= pin]
+        if not any(m[0] == pin for m in found):
+            self.errors.append(f'{package} pins mq schema {pin}, but mq/migrations has no migration {pin}')
+            return
+        released_in = None
+        for tag in git('tag', '--merged', 'HEAD', '--list', 'mq/v*').split():
+            at_tag = {name for name in git('ls-tree', '--name-only', f'{tag}:mq/migrations').split() if UP.match(name)}
+            if any(UP.match(name) and int(UP.match(name).group(1)) == pin for name in at_tag):
+                released_in = (tag, at_tag)
+                break
+        if released_in is None:
+            self.errors.append(f'{package} pins mq schema {pin}, which no mq release in this history contains; '
+                               'release mq first, then pin a released schema version')
+            return
+        tag, at_tag = released_in
         for _, _, name in bundled:
+            self.expect(name in at_tag, f'{package} would embed {name}, which {tag} does not contain')
             if name in at_tag:
                 self.expect((ROOT / 'mq' / 'migrations' / name).read_text() == git('show', f'{tag}:mq/migrations/{name}'),
-                            f'mq/migrations/{name} differs from the released mq {pin}')
+                            f'mq/migrations/{name} differs from the released {tag}')
 
     def rust(self, version: str) -> None:
         cargo = (ROOT / 'postgremq-rs' / 'Cargo.toml').read_text()
@@ -172,8 +167,8 @@ class Checker:
         lock = (ROOT / 'postgremq-rs' / 'Cargo.lock').read_text()
         self.expect(f'name = "postgremq"\nversion = "{version}"' in lock,
                     f'postgremq-rs/Cargo.lock does not record postgremq {version}')
-        pin = re.search(r'^\[package\.metadata\.postgremq\]\s*\nmq = "([^"]+)"', cargo, re.M)
-        self.pinned_mq('postgremq-rs', pin and pin.group(1))
+        pin = re.search(r'^\[package\.metadata\.postgremq\]\s*\nmq-schema = (\d+)$', cargo, re.M)
+        self.pinned_schema('postgremq-rs', pin and int(pin.group(1)))
 
     def npm(self, version: str) -> None:
         package = json.loads((ROOT / 'postgremq-ts' / 'package.json').read_text())
@@ -182,7 +177,8 @@ class Checker:
         lock = json.loads((ROOT / 'postgremq-ts' / 'package-lock.json').read_text())
         self.expect(lock.get('version') == version and lock.get('packages', {}).get('', {}).get('version') == version,
                     f'postgremq-ts/package-lock.json does not record {version}')
-        self.pinned_mq('postgremq-ts', package.get('postgremq', {}).get('mq'))
+        pin = package.get('postgremq', {}).get('mq-schema')
+        self.pinned_schema('postgremq-ts', pin if isinstance(pin, int) else None)
 
 
 def main() -> int:

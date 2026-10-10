@@ -34,7 +34,7 @@ func TestProtocol_InstalledSchemaIsSupported(t *testing.T) {
 func TestProtocol_UnsupportedMajorIsRejected(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	_, err := pool.Exec(ctx, `CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb
-		LANGUAGE sql STABLE AS $$ SELECT jsonb_build_object('db_version', '9.0.0', 'protocol_major', 99) $$`)
+		LANGUAGE sql STABLE AS $$ SELECT jsonb_build_object('schema_version', 42, 'protocol_major', 99) $$`)
 	require.NoError(t, err)
 
 	_, err = postgremq.DialFromPool(ctx, pool)
@@ -42,17 +42,17 @@ func TestProtocol_UnsupportedMajorIsRejected(t *testing.T) {
 	require.ErrorIs(t, err, postgremq.ErrIncompatibleSchema)
 	var compat *postgremq.CompatibilityError
 	require.ErrorAs(t, err, &compat)
-	assert.Equal(t, "9.0.0", compat.DBVersion)
+	assert.Equal(t, int64(42), compat.SchemaVersion)
 	assert.Equal(t, 99, compat.ProtocolMajor)
 	assert.Equal(t, []int{1}, compat.SupportedMajors)
-	assert.Contains(t, err.Error(), "9.0.0")
+	assert.Contains(t, err.Error(), "version 42")
 	assert.Contains(t, err.Error(), "99")
 }
 
 func TestProtocol_DialRejectsAndClosesItsPool(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	_, err := pool.Exec(ctx, `CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb
-		LANGUAGE sql STABLE AS $$ SELECT jsonb_build_object('db_version', '9.0.0', 'protocol_major', 99) $$`)
+		LANGUAGE sql STABLE AS $$ SELECT jsonb_build_object('schema_version', 42, 'protocol_major', 99) $$`)
 	require.NoError(t, err)
 
 	conn, err := postgremq.Dial(ctx, pool.Config())

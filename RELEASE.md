@@ -48,14 +48,21 @@ need a new major.
 
 ```sql
 SELECT postgremq.info();
--- {"db_version": "0.2.0", "protocol_major": 1}
+-- {"schema_version": 7, "protocol_major": 1}
 ```
+
+`schema_version` is the number of the last migration applied: the exact
+schema and function state of the database. `info()` reads it from the version
+table that every install path maintains (the migrators and `latest.sql`), so
+nothing has to write it at release time. The mq release version is a
+packaging version (the Go module tag and the changelog); each mq GitHub
+release states the schema version it ships.
 
 `postgremq.info()` and its two fields are stable across protocol majors;
 fields may be added. Each client declares the majors it implements
 (`SupportedProtocolMajors()` in Go, `SUPPORTED_PROTOCOL_MAJORS` in TypeScript
 and Rust), checks `info()` when it connects, and rejects any other major with
-a typed compatibility error that names the database version, its major and the
+a typed compatibility error that names the schema version, its major and the
 supported majors (Go `*CompatibilityError` / `ErrIncompatibleSchema`,
 TypeScript `CompatibilityError`, Rust `Error::Incompatible`). A database
 without `info()` gets the same error saying it needs an installation or
@@ -65,29 +72,28 @@ an older installation fails with the database's own error (SQLSTATE 42883),
 through normal error handling. A client may declare a second major only when
 it implements and tests both contracts.
 
-### Migrations, latest.sql and the release stamp
+### Migrations and latest.sql
 
 - `mq/migrations/` holds numbered [golang-migrate](https://github.com/golang-migrate/migrate)
-  migrations. Released migrations are immutable: a schema or function change
-  adds a new migration. Migration numbers track installation progress, not
-  protocol versions.
+  migrations. A migration's number is a schema version, so **a migration
+  never changes once it is on `main`**: a schema or function change adds a
+  new migration. CI fails a PR that modifies, deletes or renames an existing
+  migration (`scripts/release/check_migrations_immutable.sh`); until the first
+  mq release, `000001_initial_schema` may still be edited.
+- The protocol major is a literal in `info()`; only a migration that breaks
+  the client contract redefines `info()` with a new major (a breaking change
+  for every client).
 - `mq/sql/latest.sql` is the fresh-install script: everything the migrations
   produce, in one file. A guard at the top refuses to run when the version
   table `postgremq.postgremq_migrations` exists (an existing installation is
-  upgraded with the migrations), and the end records the migration number it
-  equals. Change it in the same PR as the migration.
-- `info()`'s `db_version` is the mq release. Feature PRs never set it: when
-  Release Please opens or updates the mq release PR, release.yml's
-  `stamp-mq` job runs `mq/scripts/stamp_release.py X.Y.Z`, which adds the
-  migration `NNNNNN_release_vX_Y_Z.up.sql` (redefining `info()` with the
-  version) and updates `latest.sql` to match. The job re-applies it whenever
-  Release Please rewrites the branch.
+  upgraded with the migrations), and the end records the latest migration's
+  number. Change it in the same PR as the migration.
 - The SQL test suite (`mq/tests/tests.py`) checks that a fresh `latest.sql`
   install and a database migrated through every migration have identical
-  schema dumps, version rows and `info()`; that `info()` reports
-  `mq/VERSION`; that stamping keeps both paths equal; that every migration at
-  an `mq/v*` tag in the branch's history is unchanged; and that upgrading from
-  each such release's `latest.sql` equals a fresh install.
+  schema dumps, version rows and `info()`; that `info()` reports the latest
+  migration; that every migration at an `mq/v*` tag in the branch's history is
+  unchanged; and that upgrading from each such release's `latest.sql` equals
+  a fresh install.
 
 ## Dependencies between components
 
@@ -98,19 +104,20 @@ explicit in the client's source:
 |--------|-----------|-------|
 | Go client | `postgremq.dev/mq` | `postgremq-go/go.mod` (`require`), hashes in `go.sum` |
 | CLI | `postgremq.dev/postgremq-go` | `cmd/postgremq/go.mod` (`require`), hashes in `go.sum` |
-| Rust client | mq version | `[package.metadata.postgremq] mq` in `postgremq-rs/Cargo.toml` |
-| TypeScript client | mq version | `"postgremq": { "mq": … }` in `postgremq-ts/package.json` |
+| Rust client | mq schema version | `[package.metadata.postgremq] mq-schema` in `postgremq-rs/Cargo.toml` |
+| TypeScript client | mq schema version | `"postgremq": { "mq-schema": … }` in `postgremq-ts/package.json` |
 
-The Rust and TypeScript clients embed the migrations up to and including the
-pinned version's release stamp (`postgremq-rs/build.rs`,
-`postgremq-ts/scripts/embed-migrations.js`); an unreleased pin embeds them all,
-for development. Published modules have no `replace` directives; locally
-`go.work` resolves the Go modules from the working tree.
+The Rust and TypeScript clients embed migrations 1..N for their pinned schema
+version N (`postgremq-rs/build.rs`, `postgremq-ts/scripts/embed-migrations.js`);
+newer migrations on the branch are not embedded until the pin moves.
+Published modules have no `replace` directives; locally `go.work` resolves the
+Go modules from the working tree.
 
 A release is refused (`scripts/release/verify_release.py`, on the release PR
 and again before tagging) unless its dependency is a released version in the
 branch's history, the Go `go.sum` has its hashes, and the Rust/TypeScript
-embedded migrations are byte-identical to the pinned mq release. So when a
+pinned migrations are part of an mq release in the branch's history and
+byte-identical to it. So when a
 client needs new SQL: release mq first, then bump the client's dependency in a
 commit that touches the client (which also queues its release):
 
@@ -122,8 +129,8 @@ scripts/release/go-standalone.sh --write postgremq-go go mod tidy
 # CLI, after postgremq-go/vX.Y.Z
 scripts/release/go-standalone.sh --write cmd/postgremq go get postgremq.dev/postgremq-go@vX.Y.Z
 scripts/release/go-standalone.sh --write cmd/postgremq go mod tidy
-# Rust / TypeScript: edit the pin, then commit, e.g.
-#   feat(rs): bundle mq X.Y.Z
+# Rust / TypeScript: set the pin to the released schema version, then commit,
+# e.g. feat(rs): bundle mq schema 7
 ```
 
 A SQL change does not release the clients by itself. A breaking SQL change
@@ -137,7 +144,7 @@ updates.
   (checked by `.github/workflows/pr-title.yml`); see CONTRIBUTING.md for the
   types and scopes.
 - Feature PRs never change versions, `.release-please-manifest.json`, the
-  component changelogs, or `info()`'s `db_version`.
+  component changelogs, or existing migrations.
 - `feat` and `fix` (and `perf`, `revert`, `deps`) appear in release notes;
   `docs`, `test`, `ci`, `refactor`, `build` and `chore` do not, and do not
   trigger a release on their own.
@@ -162,8 +169,8 @@ On every push to `main`, `release.yml`:
    changelog section as notes (Release Please, `skip-github-pull-request`).
 4. **Opens or updates** one release PR per component with unreleased
    `feat`/`fix` changes: version bump, `CHANGELOG.md` entry, manifest update
-   (Release Please, `skip-github-release`). `stamp-mq` adds the release stamp
-   to the mq release PR.
+   (Release Please, `skip-github-release`). For an mq tag, the release notes
+   also state the schema version it ships.
 5. **Publishes** each new tag through `publish.yml`.
 
 A failed run tags nothing and opens no PRs. Release boundaries come from the
@@ -195,9 +202,7 @@ version that is already published.
 
 1. Wait for its release PR (`chore(main): release <component> X.Y.Z`). Edit
    nothing in it except, if needed, the changelog wording; Release Please
-   rewrites the branch on the next push to `main`. For mq, wait for the
-   `chore(mq): stamp release X.Y.Z` commit, which `stamp-mq` pushes right
-   after each rewrite (*Release PR consistency* fails until then).
+   rewrites the branch on the next push to `main`.
 2. Make sure its checks pass. A client release PR fails `Release PR
    consistency` until its mq (or client) dependency is released and pinned;
    release that first.
@@ -232,9 +237,10 @@ nothing else was published), with `bootstrap-sha` limiting history to commits
 after the switch. The first release notes' compare link points at the
 never-created `<component>/v0.1.0` tag; edit it out of the release PR's
 changelog if you like. The first release of each
-component is therefore `0.2.0` (its commits include `feat`s). The clients pin
-mq `0.2.0` and the CLI requires the Go client `0.2.0`, so release mq first,
-then the clients (after adding the Go `go.sum` hashes), then the CLI.
+component is therefore `0.2.0` (its commits include `feat`s). The Go client
+requires mq `0.2.0` and the CLI the Go client `0.2.0`, so release mq first,
+then the clients (after adding the Go `go.sum` hashes; the Rust and TypeScript
+clients already pin schema 1), then the CLI.
 
 ## One-time setup
 
@@ -271,7 +277,7 @@ then the clients (after adding the Go `go.sum` hashes), then the CLI.
 
 | Script | Purpose |
 |--------|---------|
-| `mq/scripts/stamp_release.py X.Y.Z` | Adds the mq release stamp (run by release.yml) |
+| `scripts/release/check_migrations_immutable.sh [BASE]` | Fails if a migration already on BASE changed (run on PRs) |
 | `scripts/release/verify_release.py <tag>` / `--component <c>` | Checks a release's consistency |
 | `scripts/release/check_pending_releases.py` | The release guard |
 | `scripts/release/go-proxy.sh DIR` | Builds a GOPROXY tree of this repo's Go modules (from tags when released) |

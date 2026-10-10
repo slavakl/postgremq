@@ -46,16 +46,18 @@ pytest tests/tests.py -v
 
 `mq/sql/latest.sql` is the fresh-install script and `mq/migrations/` the
 upgrade path; a schema or function change adds a new migration and makes the
-same change in `latest.sql` (released migrations are never edited). The SQL
-tests check that both produce the same schema. Do not change `mq/VERSION` or
-the `db_version` that `postgremq.info()` reports: the mq release PR does (see
+same change in `latest.sql`, which records the new migration's number. A
+migration never changes once merged to `main` (its number is the schema
+version `postgremq.info()` reports; CI checks it): fix a merged migration
+with a new one. The SQL tests check that both paths produce the same schema.
+Do not change `mq/VERSION`: the mq release PR does (see
 [RELEASE.md](./RELEASE.md)). Every client embeds the migrations at build
 time, so there is nothing to copy by hand: the Go `postgremq.dev/mq` module
 uses `go:embed`, `npm ci`, the TypeScript build and Jest generate
 `postgremq-ts/src/migrations.generated.ts`, and `postgremq-rs/build.rs` reads
 `postgremq-rs/migrations`, a symlink to `mq/migrations` (on Windows, clone
 with `git config core.symlinks true`). The TypeScript and Rust clients embed
-the migrations of the mq release they pin.
+migrations 1..N for the mq schema version N they pin.
 
 ### Go
 

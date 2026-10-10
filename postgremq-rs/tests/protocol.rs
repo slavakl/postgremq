@@ -44,7 +44,7 @@ async fn an_unsupported_major_is_rejected_with_the_versions_involved() {
     execute(
         &db.pool,
         "CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb LANGUAGE sql STABLE \
-         AS $$ SELECT jsonb_build_object('db_version', '9.0.0', 'protocol_major', 99) $$",
+         AS $$ SELECT jsonb_build_object('schema_version', 42, 'protocol_major', 99) $$",
     )
     .await;
 
@@ -53,12 +53,12 @@ async fn an_unsupported_major_is_rejected_with_the_versions_involved() {
     assert_eq!(err.kind(), ErrorKind::Incompatible);
     match &err {
         Error::Incompatible {
-            db_version,
+            schema_version,
             protocol_major,
             source,
             ..
         } => {
-            assert_eq!(db_version.as_deref(), Some("9.0.0"));
+            assert_eq!(*schema_version, Some(42));
             assert_eq!(*protocol_major, Some(99));
             assert!(source.is_none());
         }
@@ -66,7 +66,7 @@ async fn an_unsupported_major_is_rejected_with_the_versions_involved() {
     }
     let message = err.to_string();
     assert!(
-        message.contains("9.0.0") && message.contains("99") && message.contains("[1]"),
+        message.contains("version 42") && message.contains("99") && message.contains("[1]"),
         "{message}"
     );
     assert!(std::error::Error::source(&err).is_none());
@@ -75,10 +75,10 @@ async fn an_unsupported_major_is_rejected_with_the_versions_involved() {
 #[tokio::test]
 async fn malformed_discovery_is_incompatible() {
     for body in [
-        "SELECT jsonb_build_object('db_version', '9.0.0', 'protocol_major', 'one')",
-        "SELECT jsonb_build_object('db_version', '9.0.0', 'protocol_major', -1)",
-        "SELECT jsonb_build_object('db_version', '9.0.0', 'protocol_major', 1e30)",
-        "SELECT jsonb_build_object('db_version', '9.0.0')",
+        "SELECT jsonb_build_object('schema_version', 42, 'protocol_major', 'one')",
+        "SELECT jsonb_build_object('schema_version', 42, 'protocol_major', -1)",
+        "SELECT jsonb_build_object('schema_version', 42, 'protocol_major', 1e30)",
+        "SELECT jsonb_build_object('schema_version', 42)",
         "SELECT NULL::jsonb",
     ] {
         let db = TestDb::new().await;
@@ -127,7 +127,7 @@ async fn connect_rejects_an_unsupported_major() {
     execute(
         &db.pool,
         "CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb LANGUAGE sql STABLE \
-         AS $$ SELECT jsonb_build_object('db_version', '9.0.0', 'protocol_major', 99) $$",
+         AS $$ SELECT jsonb_build_object('schema_version', 42, 'protocol_major', 99) $$",
     )
     .await;
 

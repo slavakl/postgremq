@@ -51,13 +51,13 @@ describe('protocol compatibility', () => {
   test('an unsupported major is rejected with the versions involved', async () => {
     const iso = await installed();
     await iso.pool.query(`CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb
-      LANGUAGE sql STABLE AS $$ SELECT jsonb_build_object('db_version', '9.0.0', 'protocol_major', 99) $$`);
+      LANGUAGE sql STABLE AS $$ SELECT jsonb_build_object('schema_version', 42, 'protocol_major', 99) $$`);
 
     const err = await connectTo(iso.connectionString);
 
     expect(err).toBeInstanceOf(CompatibilityError);
-    expect(err).toMatchObject({ dbVersion: '9.0.0', protocolMajor: 99, supportedMajors: [1] });
-    expect((err as Error).message).toMatch(/9\.0\.0.*99/);
+    expect(err).toMatchObject({ schemaVersion: 42, protocolMajor: 99, supportedMajors: [1] });
+    expect((err as Error).message).toMatch(/version 42.*99/);
   });
 
   test('missing discovery means the installation needs an upgrade', async () => {

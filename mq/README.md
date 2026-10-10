@@ -66,7 +66,7 @@ data, run `DROP SCHEMA postgremq CASCADE`.
 
 Every table, sequence, index, trigger and function belongs to the `postgremq`
 schema. All object references are schema-qualified, so neither installation nor
-runtime depends on `search_path`. All functions are `SECURITY INVOKER`: they run
+runtime depends on `search_path`. All functions except `info()` are `SECURITY INVOKER`: they run
 with the privileges of the caller.
 
 A runtime role other than the installer needs:
@@ -413,12 +413,17 @@ row.
 
 ```sql
 SELECT postgremq.info();
--- {"db_version": "0.2.0", "protocol_major": 1}
+-- {"schema_version": 7, "protocol_major": 1}
 ```
 
-`db_version` is the installed implementation version, the mq release. Fresh
-installs (`latest.sql`) and upgrades (the migrations) both set it: each mq
-release adds a stamp migration that redefines `info()`. `protocol_major` is
+`schema_version` is the number of the last migration applied, the exact
+schema and function state of the database, read from the version table
+`postgremq.postgremq_migrations` that fresh installs (`latest.sql`) and
+upgrades (the migrations) both maintain; `null` without that table. A
+migration never changes once merged, so equal numbers mean equal schemas. The
+mq release notes state which schema version each release ships. `info()` is
+the one `SECURITY DEFINER` function, so runtime roles need no privilege on the
+version table to call it. `protocol_major` is
 the contract clients rely on: function signatures, result types, error codes,
 ownership rules and delivery semantics. Additive changes keep the major;
 incompatible changes get a new one. Each client checks it when connecting and

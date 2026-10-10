@@ -73,22 +73,33 @@ CREATE SCHEMA IF NOT EXISTS postgremq;
  *   - extend_queue_keep_alive_multi / delete_inactive_queues for exclusive queues.
  *   - pmq_maintenance_fast: bundled cron entry — retires crashed-final-attempt
  *     rows to DLQ, reaps expired exclusive queues; returns counters.
- *   - info: discovery of the installed version and the client protocol major.
+ *   - info: discovery of the installed schema version and the protocol major.
  *   - Management: create_topic, create_queue, delete_topic, delete_queue,
  *     list_topics, list_queues, get_queue_statistics, clean_up_* helpers,
  *     list_messages, get_message, get_next_visible_time, cleanup_completed_messages.
  */
 
 
--- Discovery. Returns the installed implementation version (db_version, the mq
--- release) and the protocol major clients check at connect. The signature and
--- these two fields stay stable across protocol majors; fields may be added.
--- Each mq release adds a stamp migration that redefines it with the release's
--- version (mq/scripts/stamp_release.py).
+-- Discovery: the installed schema version and the protocol major that
+-- clients check when they connect. schema_version is the number of the last
+-- migration applied, read from the version table the migrators and
+-- latest.sql maintain (NULL without it); protocol_major changes only with a
+-- migration that breaks the client contract. The signature and these two
+-- fields stay stable across protocol majors; fields may be added.
+-- SECURITY DEFINER, unlike every other function, so that runtime roles need
+-- no privilege on the version table to connect.
 CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb
-LANGUAGE sql STABLE
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
 AS $$
-    SELECT jsonb_build_object('db_version', '0.1.0', 'protocol_major', 1)
+DECLARE
+    v_schema_version bigint;
+BEGIN
+    IF to_regclass('postgremq.postgremq_migrations') IS NOT NULL THEN
+        SELECT version INTO v_schema_version FROM postgremq.postgremq_migrations LIMIT 1;
+    END IF;
+    RETURN jsonb_build_object('schema_version', v_schema_version, 'protocol_major', 1);
+END;
 $$;
 
 -- Topics table.

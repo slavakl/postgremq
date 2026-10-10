@@ -3282,7 +3282,7 @@ def _schema_dump(postgres_container, db_config, dbname: str) -> str:
 def _assert_install_equals_migrations(postgres_container, db_config, admin_conn,
                                       latest_sql: str, migrations: list[Path]) -> str:
     """Installs latest_sql and, separately, every migration as a migrator does;
-    asserts identical schemas and version rows. Returns info()'s db_version."""
+    asserts identical schemas, version rows and info(). Returns info()."""
     by_script, by_migrations = f"mq_latest_{uuid.uuid4().hex[:8]}", f"mq_migrated_{uuid.uuid4().hex[:8]}"
     for name in (by_script, by_migrations):
         _fresh_database(admin_conn, name)
@@ -3311,7 +3311,7 @@ def _assert_install_equals_migrations(postgres_container, db_config, admin_conn,
             with psycopg2.connect(**{**db_config, 'dbname': name}) as c, c.cursor() as cur:
                 cur.execute('SELECT version, dirty FROM postgremq.postgremq_migrations')
                 rows.append(cur.fetchall())
-                cur.execute("SELECT postgremq.info()->>'db_version'")
+                cur.execute('SELECT postgremq.info()')
                 versions.append(cur.fetchone()[0])
         assert rows[0] == rows[1]
         assert versions[0] == versions[1]
@@ -3328,32 +3328,37 @@ def test_latest_sql_install_equals_the_migrations(postgres_container, db_config,
                                       SQL_FILE.read_text(), list(MIGRATIONS_DIR.glob('*.up.sql')))
 
 
-def test_info_reports_the_mq_version_and_protocol_major(cur):
+def test_info_reports_the_schema_version_and_protocol_major(cur):
+    latest = max(int(p.name.split('_', 1)[0]) for p in MIGRATIONS_DIR.glob('*.up.sql'))
     cur.execute('SELECT postgremq.info()')
-    info = cur.fetchone()[0]
-    assert info['db_version'] == (MIGRATIONS_DIR.parent / 'VERSION').read_text().strip()
-    assert info['protocol_major'] == 1
+    assert cur.fetchone()[0] == {'schema_version': latest, 'protocol_major': 1}
 
 
-def test_release_stamp_keeps_install_and_upgrade_equal(postgres_container, db_config, admin_conn, tmp_path):
-    """The release PR's stamp makes both install paths report the new version."""
-    import shutil
-    import subprocess
-    mq = MIGRATIONS_DIR.parent
-    shutil.copytree(mq / 'migrations', tmp_path / 'migrations')
-    shutil.copytree(mq / 'sql', tmp_path / 'sql')
-    (tmp_path / 'VERSION').write_text('9.9.9-rc.1\n')
-    script = [sys.executable, str(mq / 'scripts' / 'stamp_release.py'), '--mq-dir', str(tmp_path), '9.9.9-rc.1']
-    first = subprocess.run(script, check=True, capture_output=True, text=True).stdout
-    assert 'release_v9_9_9_rc_1.up.sql' in first
-    again = subprocess.run(script, check=True, capture_output=True, text=True).stdout
-    assert 'already stamped' in again
+def test_info_follows_the_version_table(cur):
+    """schema_version is whatever the migrators last recorded; NULL without the table."""
+    cur.execute('UPDATE postgremq.postgremq_migrations SET version = 7')
+    cur.execute("SELECT postgremq.info()->'schema_version'")
+    assert cur.fetchone()[0] == 7
+    cur.execute('DROP TABLE postgremq.postgremq_migrations')
+    cur.execute('SELECT postgremq.info()')
+    assert cur.fetchone()[0] == {'schema_version': None, 'protocol_major': 1}
 
-    migrations = list((tmp_path / 'migrations').glob('*.up.sql'))
-    assert len(migrations) == len(list(MIGRATIONS_DIR.glob('*.up.sql'))) + 1
-    version = _assert_install_equals_migrations(postgres_container, db_config, admin_conn,
-                                                (tmp_path / 'sql' / 'latest.sql').read_text(), migrations)
-    assert version == '9.9.9-rc.1'
+
+def test_info_needs_no_privilege_on_the_version_table(cur):
+    """Runtime roles call info() when connecting; they get no grant on the version table."""
+    role = f"pmq_info_{uuid.uuid4().hex[:8]}"
+    cur.execute(f"CREATE ROLE {role}")
+    try:
+        cur.execute(f"GRANT USAGE ON SCHEMA postgremq TO {role}")
+        cur.execute(f"SET ROLE {role}")
+        cur.execute('SELECT postgremq.info()')
+        assert cur.fetchone()[0]['protocol_major'] == 1
+        with pytest.raises(psycopg2.errors.InsufficientPrivilege):
+            cur.execute('SELECT version FROM postgremq.postgremq_migrations')
+    finally:
+        cur.execute('RESET ROLE')
+        cur.execute(f"REVOKE USAGE ON SCHEMA postgremq FROM {role}")
+        cur.execute(f"DROP ROLE {role}")
 
 
 REPO_ROOT = MIGRATIONS_DIR.parent.parent

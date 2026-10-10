@@ -27,9 +27,9 @@ var ErrIncompatibleSchema = errors.New("postgremq: incompatible database install
 // or has no discovery function (postgremq.info()) and needs an installation or
 // upgrade. It matches errors.Is(err, ErrIncompatibleSchema).
 type CompatibilityError struct {
-	// DBVersion is the installed implementation version; empty when
-	// discovery is missing.
-	DBVersion string
+	// SchemaVersion is the installed schema version (the number of the last
+	// migration applied); 0 when discovery is missing or reports none.
+	SchemaVersion int64
 	// ProtocolMajor is the installation's protocol major; 0 when discovery
 	// is missing.
 	ProtocolMajor int
@@ -44,8 +44,8 @@ func (e *CompatibilityError) Error() string {
 		return fmt.Sprintf("postgremq: postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports protocol majors %v): %v",
 			e.SupportedMajors, e.Err)
 	}
-	return fmt.Sprintf("postgremq: the database's PostgreMQ %s uses protocol major %d; this client supports %v",
-		e.DBVersion, e.ProtocolMajor, e.SupportedMajors)
+	return fmt.Sprintf("postgremq: the database's PostgreMQ schema (version %d) uses protocol major %d; this client supports %v",
+		e.SchemaVersion, e.ProtocolMajor, e.SupportedMajors)
 }
 
 // Unwrap exposes the database error when discovery is missing.
@@ -73,15 +73,15 @@ func checkProtocol(ctx context.Context, pool Pool) error {
 		return fmt.Errorf("postgremq: read postgremq.info(): %w", err)
 	}
 	var info struct {
-		DBVersion     string `json:"db_version"`
-		ProtocolMajor int    `json:"protocol_major"`
+		SchemaVersion int64 `json:"schema_version"`
+		ProtocolMajor int   `json:"protocol_major"`
 	}
 	if err := json.Unmarshal(raw, &info); err != nil {
 		return fmt.Errorf("postgremq: decode postgremq.info(): %w", err)
 	}
 	if !slices.Contains(supportedProtocolMajors, info.ProtocolMajor) {
 		return &CompatibilityError{
-			DBVersion:       info.DBVersion,
+			SchemaVersion:   info.SchemaVersion,
 			ProtocolMajor:   info.ProtocolMajor,
 			SupportedMajors: SupportedProtocolMajors(),
 		}

@@ -28,10 +28,10 @@ uuid = "1"
 # application owns the SDK, readers and exporters.
 opentelemetry = { version = "0.33", default-features = false, features = ["metrics"], optional = true }
 
-# The released mq version whose migrations `migrate` embeds (see build.rs).
-# Bump it, after that mq release, to ship newer SQL.
+# The mq schema version `migrate` embeds: migrations 1..N (see build.rs).
+# Bump it, once those migrations are in an mq release, to ship newer SQL.
 [package.metadata.postgremq]
-mq = "0.2.0"
+mq-schema = 1
 
 [package.metadata.docs.rs]
 all-features = true

@@ -1,7 +1,7 @@
 /**
  * Protocol compatibility. Every PostgreMQ installation reports, through
- * `postgremq.info()`, its implementation version (`db_version`) and the
- * protocol major clients speak. `Connection.connect()` rejects a major this
+ * `postgremq.info()`, its schema version (`schema_version`, the last migration
+ * applied) and the protocol major clients speak. `Connection.connect()` rejects a major this
  * client does not implement.
  */
 
@@ -22,7 +22,7 @@ const INVALID_SCHEMA_NAME = '3F000';
  * @internal
  */
 export async function checkProtocol(client: PoolClient): Promise<void> {
-  let info: { db_version?: unknown; protocol_major?: unknown };
+  let info: { schema_version?: unknown; protocol_major?: unknown };
   try {
     const { rows } = await client.query<{ info: typeof info }>('SELECT postgremq.info() AS info');
     info = rows[0].info;
@@ -35,7 +35,7 @@ export async function checkProtocol(client: PoolClient): Promise<void> {
   const major = typeof info.protocol_major === 'number' ? info.protocol_major : NaN;
   if (!SUPPORTED_PROTOCOL_MAJORS.includes(major)) {
     throw new CompatibilityError({
-      dbVersion: String(info.db_version ?? ''),
+      schemaVersion: typeof info.schema_version === 'number' ? info.schema_version : undefined,
       protocolMajor: major,
       supportedMajors: SUPPORTED_PROTOCOL_MAJORS,
     });

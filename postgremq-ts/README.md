@@ -90,7 +90,7 @@ main().catch(console.error);
 
 `connect(options)` creates a connection, checks the installation's protocol, and returns it.
 
-The check reads `postgremq.info()`: the installation must speak a protocol major this client implements (`SUPPORTED_PROTOCOL_MAJORS`, currently `[1]`). Otherwise `connect` throws a `CompatibilityError` with `dbVersion`, `protocolMajor` and `supportedMajors`; a database without `info()` (not installed, or older than discovery) throws it too, with the database error as `cause`, meaning it needs an installation or upgrade. Connection and permission errors are thrown as they are. Within a supported major, a function the installation lacks fails with the database's error (`code` `42883`) like any other.
+The check reads `postgremq.info()`: the installation must speak a protocol major this client implements (`SUPPORTED_PROTOCOL_MAJORS`, currently `[1]`). Otherwise `connect` throws a `CompatibilityError` with `schemaVersion`, `protocolMajor` and `supportedMajors`; a database without `info()` (not installed, or older than discovery) throws it too, with the database error as `cause`, meaning it needs an installation or upgrade. Connection and permission errors are thrown as they are. Within a supported major, a function the installation lacks fails with the database's error (`code` `42883`) like any other.
 
 ```typescript
 import { connect } from 'postgremq';

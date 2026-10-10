@@ -88,7 +88,7 @@ runtime.
 Both read `postgremq.info()` and check that the installation speaks a
 protocol major this client implements (`postgremq::SUPPORTED_PROTOCOL_MAJORS`,
 currently `[1]`). Otherwise they return `Error::Incompatible` with the
-database version, its protocol major and the supported majors; a database
+schema version, its protocol major and the supported majors; a database
 without `info()` (not installed, or older than discovery) gets it too, with
 the database error as its source, meaning it needs an installation or
 upgrade. Connection and permission errors are returned as they are. Within a

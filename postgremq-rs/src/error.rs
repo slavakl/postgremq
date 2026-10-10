@@ -132,12 +132,12 @@ pub enum Error {
     /// message lists them), or it has no discovery function
     /// (`postgremq.info()`) and needs an installation or upgrade (then
     /// `source` is the database error).
-    #[error("{}", incompatible_message(db_version.as_deref(), *protocol_major, source.is_some()))]
+    #[error("{}", incompatible_message(*schema_version, *protocol_major, source.is_some()))]
     #[non_exhaustive]
     Incompatible {
-        /// The installed implementation version; `None` when discovery is
-        /// missing.
-        db_version: Option<String>,
+        /// The installed schema version (the last migration applied); `None`
+        /// when discovery is missing or reports none.
+        schema_version: Option<u64>,
         /// The installation's protocol major; `None` when discovery is
         /// missing or reports none, or not a valid major.
         protocol_major: Option<u32>,
@@ -301,7 +301,7 @@ impl Error {
 }
 
 fn incompatible_message(
-    db_version: Option<&str>,
+    schema_version: Option<u64>,
     protocol_major: Option<u32>,
     discovery_missing: bool,
 ) -> String {
@@ -312,9 +312,9 @@ fn incompatible_message(
         );
     }
     let major = protocol_major.map_or_else(|| "none".to_owned(), |major| major.to_string());
+    let schema = schema_version.map_or_else(|| "unknown".to_owned(), |version| version.to_string());
     format!(
-        "the database's PostgreMQ {} uses protocol major {major}; this client supports {supported:?}",
-        db_version.unwrap_or("(unknown version)")
+        "the database's PostgreMQ schema (version {schema}) uses protocol major {major}; this client supports {supported:?}"
     )
 }
 

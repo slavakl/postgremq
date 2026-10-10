@@ -1,6 +1,6 @@
 //! Protocol compatibility: every PostgreMQ installation reports, through
-//! `postgremq.info()`, its implementation version (`db_version`) and the
-//! protocol major clients speak. Connecting rejects a major this client does
+//! `postgremq.info()`, its schema version (`schema_version`, the last
+//! migration applied) and the protocol major clients speak. Connecting rejects a major this client does
 //! not implement.
 
 use sqlx::PgPool;
@@ -34,7 +34,7 @@ pub(crate) async fn check(pool: &PgPool) -> Result<()> {
                 );
                 return Err(if missing {
                     Error::Incompatible {
-                        db_version: None,
+                        schema_version: None,
                         protocol_major: None,
                         source: Some(err),
                     }
@@ -44,10 +44,9 @@ pub(crate) async fn check(pool: &PgPool) -> Result<()> {
             }
         };
     let info = info.flatten().unwrap_or_default();
-    let db_version = info
-        .get("db_version")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
+    let schema_version = info
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64);
     let protocol_major = info
         .get("protocol_major")
         .and_then(serde_json::Value::as_u64)
@@ -56,7 +55,7 @@ pub(crate) async fn check(pool: &PgPool) -> Result<()> {
         return Ok(());
     }
     Err(Error::Incompatible {
-        db_version,
+        schema_version,
         protocol_major,
         source: None,
     })

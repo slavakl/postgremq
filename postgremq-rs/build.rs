@@ -1,11 +1,11 @@
-//! Embeds the schema migrations of the pinned mq release.
+//! Embeds the schema migrations this crate bundles.
 //!
-//! The pin is `[package.metadata.postgremq] mq` in Cargo.toml. Once that mq
-//! version is released its stamp migration (`NNNNNN_release_v<version>.up.sql`)
-//! exists, and only the migrations up to and including it are embedded. Before
-//! then (an unreleased pin) every migration is embedded; release checks refuse
-//! to publish the crate in that state. `migrations/` is a symlink to
-//! `../mq/migrations`, which `cargo package` follows.
+//! The pin is `[package.metadata.postgremq] mq-schema` in Cargo.toml: a schema
+//! version, the number of the last migration to bundle. Migrations 1..N are
+//! embedded; a newer migration on the branch is not, until the pin moves.
+//! Release checks require those migrations to be part of a released mq
+//! version. `migrations/` is a symlink to `../mq/migrations`, which
+//! `cargo package` follows.
 
 use std::error::Error;
 use std::fmt::Write as _;
@@ -18,67 +18,46 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=migrations");
 
-    let pin = mq_pin(&std::fs::read_to_string(manifest_dir.join("Cargo.toml"))?)?;
+    let pin = mq_schema_pin(&std::fs::read_to_string(manifest_dir.join("Cargo.toml"))?)?;
     let mut migrations = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
         let name = entry?.file_name().to_string_lossy().into_owned();
         let Some(stem) = name.strip_suffix(".up.sql") else {
             continue;
         };
-        let Some((number, label)) = stem.split_once('_') else {
+        let Some((number, _)) = stem.split_once('_') else {
             continue;
         };
         if let Ok(number) = number.parse::<u64>() {
-            migrations.push((number, label.to_owned(), name));
+            migrations.push((number, name));
         }
     }
     migrations.sort();
     if let Some(pair) = migrations.windows(2).find(|pair| pair[0].0 == pair[1].0) {
         return Err(format!(
             "two migrations numbered {}: {} and {}",
-            pair[0].0, pair[0].2, pair[1].2
+            pair[0].0, pair[0].1, pair[1].1
         )
         .into());
     }
-    if migrations.is_empty() {
-        return Err(format!("no migrations in {}", dir.display()).into());
+    if !migrations.iter().any(|(number, _)| *number == pin) {
+        return Err(format!(
+            "Cargo.toml pins mq schema {pin}, but {} has no migration {pin}",
+            dir.display()
+        )
+        .into());
     }
-    // As mq/scripts/stamp_release.py names it.
-    let stamp: String = format!("release_v{pin}")
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let released = migrations
-        .iter()
-        .find(|(_, label, _)| *label == stamp)
-        .map(|(number, _, _)| *number);
-    if let Some(last) = released {
-        migrations.retain(|(number, _, _)| *number <= last);
-    } else {
-        // Development builds only: release checks refuse to publish this.
-        println!(
-            "cargo:warning=mq {pin} is not released (no {stamp} migration): embedding every migration"
-        );
-    }
+    migrations.retain(|(number, _)| *number <= pin);
 
     let mut out = String::new();
     writeln!(
         out,
-        "/// The pinned mq version (Cargo.toml `[package.metadata.postgremq] mq`)."
+        "/// The pinned mq schema version (Cargo.toml `[package.metadata.postgremq] mq-schema`)."
     )?;
-    writeln!(out, "#[cfg(test)]\nconst MQ_VERSION: &str = {pin:?};")?;
-    writeln!(
-        out,
-        "/// Whether the pinned mq version is released (its stamp migration exists)."
-    )?;
-    writeln!(
-        out,
-        "#[cfg(test)]\nconst MQ_RELEASED: bool = {};",
-        released.is_some()
-    )?;
+    writeln!(out, "#[cfg(test)]\nconst MQ_SCHEMA: u64 = {pin};")?;
     writeln!(out, "/// The embedded migrations, in version order.")?;
     writeln!(out, "const MIGRATIONS: &[Migration] = &[")?;
-    for (number, _, name) in &migrations {
+    for (number, name) in &migrations {
         let path = dir.join(name);
         writeln!(
             out,
@@ -94,32 +73,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// The `mq` value of `[package.metadata.postgremq]`. Strict on purpose: the
-/// line must be exactly `mq = "<version>"`, so this and the release checks
-/// (scripts/release/verify_release.py) read the same pin.
-fn mq_pin(manifest: &str) -> Result<String, Box<dyn Error>> {
+/// The `mq-schema` value of `[package.metadata.postgremq]`. Strict on
+/// purpose: the line must be exactly `mq-schema = <number>`, so this and the
+/// release checks (scripts/release/verify_release.py) read the same pin.
+fn mq_schema_pin(manifest: &str) -> Result<u64, Box<dyn Error>> {
     let mut in_table = false;
     for line in manifest.lines() {
         let line = line.trim();
         if line.starts_with('[') {
             in_table = line == "[package.metadata.postgremq]";
-        } else if in_table && line.starts_with("mq") {
-            let pin = line
-                .strip_prefix("mq = \"")
-                .and_then(|rest| rest.strip_suffix('"'))
-                .filter(|pin| {
-                    !pin.is_empty()
-                        && pin
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
-                })
+        } else if in_table && line.starts_with("mq-schema") {
+            return line
+                .strip_prefix("mq-schema = ")
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|pin| *pin > 0)
                 .ok_or_else(|| {
-                    format!(
-                        "Cargo.toml: write the mq pin exactly as mq = \"<version>\", not `{line}`"
-                    )
-                })?;
-            return Ok(pin.to_owned());
+                    format!("Cargo.toml: write the pin exactly as mq-schema = <migration number>, not `{line}`").into()
+                });
         }
     }
-    Err("Cargo.toml: missing [package.metadata.postgremq] mq = \"<version>\"".into())
+    Err("Cargo.toml: missing [package.metadata.postgremq] mq-schema = <migration number>".into())
 }

@@ -5,6 +5,7 @@ on:
     branches: [ main ]
     paths:
       - 'mq/**'
+      - 'scripts/release/check_migrations_immutable.sh'
       - '.github/workflows/sql-tests.yml'
   workflow_call:
     inputs:
@@ -24,6 +25,12 @@ jobs:
       with:
         ref: ${{ inputs.ref }}
         fetch-depth: 0
+
+    # A migration's number is the schema version postgremq.info() reports, so
+    # migrations already on the base branch never change.
+    - name: Existing migrations are unchanged
+      if: github.event_name == 'pull_request'
+      run: scripts/release/check_migrations_immutable.sh "origin/${{ github.base_ref }}"
 
     - name: Set up Python
       uses: actions/setup-python@v5

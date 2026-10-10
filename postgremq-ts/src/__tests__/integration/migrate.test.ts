@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
 import { migrate, getMigrationStatus, migrationLockId } from '../../migrate';
-import { MIGRATIONS, MQ_VERSION } from '../../migrations.generated';
+import { MIGRATIONS, MQ_SCHEMA } from '../../migrations.generated';
 import { DirtySchemaError } from '../../errors';
 import { Connection } from '../../connection';
 import { createEmptyTestDatabase, createIsolatedTestConnection, getSharedTestDatabase, TestDatabase } from '../helpers';
@@ -37,19 +37,17 @@ async function advisoryLocksHeld(pool: Pool): Promise<number> {
 const latest = Math.max(...MIGRATIONS.map((m) => m.version));
 
 describe('embedded migrations', () => {
-  test('are the pinned mq release\'s migrations, byte for byte', () => {
-    const { bundledMigrations } = require('../../../scripts/embed-migrations.js');
-    const { migrations } = bundledMigrations();
+  test('are migrations 1..N for the pinned schema version N, byte for byte', () => {
+    const pin = JSON.parse(fs.readFileSync(path.join(__dirname, '../../../package.json'), 'utf8')).postgremq['mq-schema'];
+    expect(MQ_SCHEMA).toBe(pin);
     const dir = path.join(__dirname, '../../../../mq/migrations');
-    expect(MIGRATIONS.map((m) => m.version)).toEqual(migrations.map((m: { version: number }) => m.version));
-    for (const m of migrations) {
-      const embedded = MIGRATIONS.find((e) => e.version === m.version)!;
-      expect(embedded.sql).toBe(fs.readFileSync(path.join(dir, m.file), 'utf8'));
+    const files = fs.readdirSync(dir).filter((f) => /^\d+_.+\.up\.sql$/.test(f)).sort();
+    const expected = files.filter((f) => Number(f.split('_')[0]) <= pin);
+    expect(MIGRATIONS.map((m) => `${String(m.version).padStart(6, '0')}_${m.name}.up.sql`)).toEqual(expected);
+    for (const m of MIGRATIONS) {
+      const file = expected.find((f) => Number(f.split('_')[0]) === m.version)!;
+      expect(m.sql).toBe(fs.readFileSync(path.join(dir, file), 'utf8'));
     }
-    const all = fs.readdirSync(dir).filter((f) => /^\d+_.+\.up\.sql$/.test(f));
-    const stamp = all.find((f) => f.endsWith(`_release_v${MQ_VERSION.replace(/[^0-9A-Za-z]/g, '_')}.up.sql`));
-    // Released pin: up to its stamp. Unreleased pin: every migration.
-    expect(MIGRATIONS.length).toBe(stamp ? Number(stamp.split('_')[0]) : all.length);
   });
 
   test('the advisory lock id matches golang-migrate', () => {
