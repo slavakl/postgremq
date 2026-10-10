@@ -5,12 +5,12 @@ go 1.25.0
 require (
 	github.com/golang-migrate/migrate/v4 v4.19.0
 	github.com/jackc/pgx/v5 v5.11.0
-	postgremq.dev/mq v0.2.0-e2e.1
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.35.0
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/metric v1.46.0
 	go.opentelemetry.io/otel/sdk/metric v1.46.0
+	postgremq.dev/mq v0.2.0-e2e.1
 )
 
 require (
