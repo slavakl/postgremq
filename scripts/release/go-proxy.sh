@@ -61,6 +61,18 @@ done
 
 (cd "$root/scripts/release/gomodproxy" && GOWORK=off go run . -out "$out" "${args[@]}")
 
+# The module cache treats a version as immutable, but an unreleased version
+# built from the working tree changes, and a cached dev build could shadow a
+# later tag of the same version. Drop this repository's modules from it so
+# the proxy's copies are used (they are small).
+modcache=$(go env GOMODCACHE)
+for dir in "$modcache/postgremq.dev" "$modcache/cache/download/postgremq.dev"; do
+  if [ -e "$dir" ]; then
+    chmod -R u+w "$dir"
+    rm -rf "$dir"
+  fi
+done
+
 echo "GOPROXY=file://$out,https://proxy.golang.org,direct"
 echo "GONOSUMDB=postgremq.dev"
 echo "GOWORK=off"

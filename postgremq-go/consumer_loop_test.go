@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"postgremq.dev/postgremq-go"
 )
 
 // TestConsumerStopWhenDeliveryBlocked verifies the head-of-line guarantee: when

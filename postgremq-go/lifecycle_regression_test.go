@@ -4,8 +4,8 @@ import (
 	"context"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"postgremq.dev/postgremq-go"
 	"github.com/stretchr/testify/require"
+	"postgremq.dev/postgremq-go"
 	"testing"
 	"time"
 )

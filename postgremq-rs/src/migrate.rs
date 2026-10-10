@@ -385,12 +385,26 @@ mod tests {
 
     #[tokio::test]
     async fn upgrades_a_latest_sql_install() -> Result<()> {
-        let db = common::TestDb::new().await; // installs latest.sql (version 1)
-        assert_eq!(version_row(&db.pool).await, (1, false));
+        let db = common::TestDb::new().await; // installs latest.sql
+        let (installed, dirty) = version_row(&db.pool).await;
+        assert!(!dirty && installed >= 1);
+        // The installed migrations plus one more, as a later release adds.
+        let next = u64::try_from(installed).unwrap_or_else(|err| unreachable!("{err}")) + 1;
+        let mut upgrade: Vec<Migration> = MIGRATIONS
+            .iter()
+            .map(|m| Migration {
+                version: m.version,
+                sql: m.sql,
+            })
+            .collect();
+        upgrade.push(Migration {
+            version: next,
+            sql: "CREATE TABLE postgremq.upgraded (id int);",
+        });
 
-        run(&db.pool, UPGRADE).await?;
+        run(&db.pool, Box::leak(upgrade.into_boxed_slice())).await?;
 
-        assert_eq!(version_row(&db.pool).await, (2, false));
+        assert_eq!(version_row(&db.pool).await, (installed + 1, false));
         assert!(exists(&db.pool, "postgremq.upgraded").await);
         Ok(())
     }
