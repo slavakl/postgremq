@@ -1,9 +1,10 @@
 name: Packages
 
 # What would be published, built and used from outside the repository: the Go
-# modules through a module proxy (GOWORK=off), the packed npm package, and the
-# packaged crate. Each smoke test runs against a fresh database. On a release
-# PR it also checks that the release is consistent (verify_release.py).
+# module and its CLI through a module proxy (GOWORK=off), the packed npm
+# package, and the packaged crate. Each smoke test runs against a fresh
+# database. On a release PR it also checks that the release is consistent
+# (verify_release.py --all).
 
 on:
   pull_request:
@@ -11,7 +12,6 @@ on:
     paths:
       - 'mq/**'
       - 'postgremq-go/**'
-      - 'cmd/postgremq/**'
       - 'postgremq-rs/**'
       - 'postgremq-ts/**'
       - 'scripts/release/**'
@@ -44,9 +44,7 @@ jobs:
       # The release this PR proposes must be consistent before it is merged
       # (the release guard checks it again before tagging).
       - name: Verify the proposed release
-        run: |
-          component="${GITHUB_HEAD_REF##*--components--}"
-          python3 scripts/release/verify_release.py --component "$component"
+        run: python3 scripts/release/verify_release.py --all
 
   go:
     name: Go modules (external install)
@@ -70,10 +68,9 @@ jobs:
           go-version: '1.26'
       - name: Install the client and CLI from a module proxy and run them
         run: |
-          # At a release tag, install that exact version of the tagged module.
-          at_tag() { git describe --exact-match --tags --match "$1/v*" 2>/dev/null | sed "s#^$1/##"; }
-          cli=$(at_tag cmd/postgremq); client=$(at_tag postgremq-go); mq=$(at_tag mq)
-          scripts/release/smoke-go.sh "${cli:-v0.0.0-smoke}" "${client:-}" "${mq:-}"
+          # At a release tag, install that exact version from the tag.
+          version=$(git describe --exact-match --tags --match 'postgremq-go/v*' 2>/dev/null | sed 's#^postgremq-go/##' || true)
+          scripts/release/smoke-go.sh "${version:-v0.0.0-smoke}"
 
   npm:
     name: npm package

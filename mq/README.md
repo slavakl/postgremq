@@ -28,6 +28,10 @@ equivalent to, so the migrators upgrade a database installed from it like one
 they installed. Run it with `ON_ERROR_STOP` (as below), so psql stops at the
 first error instead of running the rest of the file.
 
+Each mq release (`mq/vN`, N the last migration) attaches the files to its
+[GitHub release](https://github.com/postgremq/postgremq/releases):
+`postgremq-vN.sql` (`latest.sql`) and `postgremq-migrations-vN.tar.gz`.
+
 **psql**
 
 ```sh
@@ -35,7 +39,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f mq/sql/latest.sql
 ```
 
 **Migrations.** `mq/migrations/` uses the golang-migrate file layout. The
-[PostgreMQ CLI](../cmd/postgremq/README.md) (`postgremq migrate --dsn …`) and
+[PostgreMQ CLI](../postgremq-go/cmd/postgremq/README.md) (`postgremq migrate --dsn …`) and
 every client apply the files: Go `postgremq.Migrate(pool)`, TypeScript
 `migrate(pool)` and Rust `postgremq::migrate(&pool)`. They share one protocol,
 golang-migrate's: the version table `postgremq.postgremq_migrations` (one row,
@@ -58,9 +62,9 @@ migrate -path mq/migrations \
 Down migrations are not supported. To remove an installation and all of its queue
 data, run `DROP SCHEMA postgremq CASCADE`.
 
-**Embedding (Go).** The module `postgremq.dev/mq` embeds the SQL:
-`mq.LatestSQL` (string) and `mq.MigrationsFS` (an `embed.FS` holding
-`migrations/*.sql`).
+Every client embeds all of these migrations: at any commit the Go client's
+copy (`postgremq-go/migrations/`) and the Rust and TypeScript pins point at
+the last one (`make sync`, checked by CI).
 
 ## Schema, roles and transactions
 
@@ -421,7 +425,7 @@ schema and function state of the database, read from the version table
 `postgremq.postgremq_migrations` that fresh installs (`latest.sql`) and
 upgrades (the migrations) both maintain; `null` without that table. A
 migration never changes once merged, so equal numbers mean equal schemas. The
-mq release notes state which schema version each release ships. `info()` is
+mq release `mq/vN` is schema version N. `info()` is
 the one `SECURITY DEFINER` function, so runtime roles need no privilege on the
 version table to call it. `protocol_major` is
 the contract clients rely on: function signatures, result types, error codes,

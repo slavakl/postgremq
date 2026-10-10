@@ -1,14 +1,13 @@
 /**
  * Embeds the schema migrations this package bundles into
- * src/migrations.generated.ts, the way the Go client embeds them through its
- * postgremq.dev/mq dependency. Runs on `npm ci` / `npm install` (prepare),
+ * src/migrations.generated.ts. Runs on `npm ci` / `npm install` (prepare),
  * before `tsc` (npm run build) and as Jest's globalSetup. The generated file
  * is not committed.
  *
  * The pin is `postgremq["mq-schema"]` in package.json: a schema version, the
- * number of the last migration to bundle. Migrations 1..N are embedded; a
- * newer migration on the branch is not, until the pin moves. Release checks
- * require those migrations to be part of a released mq version.
+ * number of the last migration to bundle. Migrations 1..N are embedded.
+ * `make sync` keeps the pin at the last migration (CI checks it), so a commit
+ * adding a migration also changes this package and releases it.
  */
 const fs = require('fs');
 const path = require('path');

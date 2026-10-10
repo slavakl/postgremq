@@ -11,7 +11,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
-	"postgremq.dev/mq"
 )
 
 type postgresContainer struct {
@@ -202,7 +201,7 @@ func setupTestConnection(t *testing.T) (*pgxpool.Pool, context.Context) {
 
 	t.Logf("Created test database: %s", dbName)
 	// Now initialize the database schema with more robust error handling
-	_, err = testPool.Exec(ctx, mq.LatestSQL)
+	_, err = testPool.Exec(ctx, latestSQL(t))
 	if err != nil {
 		testPool.Close()
 		t.Fatalf("failed to initialize schema: %v", err)
@@ -255,4 +254,15 @@ type TestLogger struct {
 
 func (t TestLogger) Printf(format string, v ...interface{}) {
 	t.t.Logf(format, v...)
+}
+
+// latestSQL is the fresh-install schema, read from the repository (tests run
+// in it; the module does not ship latest.sql).
+func latestSQL(t *testing.T) string {
+	t.Helper()
+	sql, err := os.ReadFile("../mq/sql/latest.sql")
+	if err != nil {
+		t.Fatalf("read latest.sql: %v", err)
+	}
+	return string(sql)
 }

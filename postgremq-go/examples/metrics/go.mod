@@ -38,9 +38,6 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260928230214-8a89bd6388cc // indirect
 	google.golang.org/grpc v1.84.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
-	postgremq.dev/mq v0.2.0 // indirect
 )
 
 replace postgremq.dev/postgremq-go => ../..
-
-replace postgremq.dev/mq => ../../../mq

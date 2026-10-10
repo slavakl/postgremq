@@ -5,7 +5,12 @@ on:
     branches: [ main ]
     paths:
       - 'mq/**'
+      - 'postgremq-go/migrations/**'
+      - 'postgremq-rs/Cargo.toml'
+      - 'postgremq-ts/package.json'
+      - 'scripts/schema.py'
       - 'scripts/release/check_migrations_immutable.sh'
+      - 'Makefile'
       - '.github/workflows/sql-tests.yml'
   workflow_call:
     inputs:
@@ -25,6 +30,11 @@ jobs:
       with:
         ref: ${{ inputs.ref }}
         fetch-depth: 0
+
+    # Every client points at the last migration (the Go copy, the Rust and
+    # TypeScript pins, latest.sql's recorded version): `make sync`.
+    - name: Clients in sync with the last migration
+      run: python3 scripts/schema.py check
 
     # A migration's number is the schema version postgremq.info() reports, so
     # migrations already on the base branch never change.

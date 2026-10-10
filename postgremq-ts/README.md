@@ -34,7 +34,7 @@ await migrate(pool); // no-op when the schema is current
 console.log(await getMigrationStatus(pool)); // { currentVersion, dirty, latestVersion, needsMigration }
 ```
 
-`migrate` only goes up, to the latest version in this package. It uses the same version table and advisory lock as the Go client and the [PostgreMQ CLI](https://github.com/postgremq/postgremq/blob/main/cmd/postgremq/README.md), so concurrent callers are safe and any of them can upgrade a database another one installed. A database already at a newer version (migrated by a newer release) is left unchanged. A dirty database (a migration failed partway) throws `DirtySchemaError`. `migrate` creates the `postgremq` schema when it is missing, which needs the `CREATE` privilege on the database.
+`migrate` only goes up, to the latest version in this package. It uses the same version table and advisory lock as the Go client and the [PostgreMQ CLI](https://github.com/postgremq/postgremq/blob/main/postgremq-go/cmd/postgremq/README.md), so concurrent callers are safe and any of them can upgrade a database another one installed. A database already at a newer version (migrated by a newer release) is left unchanged. A dirty database (a migration failed partway) throws `DirtySchemaError`. `migrate` creates the `postgremq` schema when it is missing, which needs the `CREATE` privilege on the database.
 
 You can also install the schema with the CLI (`postgremq migrate --dsn "$DATABASE_URL"`) or directly from [`mq/sql/latest.sql`](https://github.com/postgremq/postgremq/blob/main/mq/sql/latest.sql). `latest.sql` is for fresh databases only (it refuses to run on an existing installation) and records the version it installs, so `migrate` can upgrade it later.
 

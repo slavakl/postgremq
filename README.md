@@ -42,7 +42,7 @@ transactions.
 | Go client | [`postgremq-go/`](./postgremq-go/README.md) | `go get postgremq.dev/postgremq-go` |
 | TypeScript client | [`postgremq-ts/`](./postgremq-ts/README.md) | `npm install postgremq` |
 | Rust client | [`postgremq-rs/`](./postgremq-rs/README.md) | `cargo add postgremq` |
-| CLI (migrations) | [`cmd/postgremq/`](./cmd/postgremq/README.md) | `go install postgremq.dev/cmd/postgremq@latest` |
+| CLI (migrations) | [`postgremq-go/cmd/postgremq/`](./postgremq-go/cmd/postgremq/README.md) | `go install postgremq.dev/postgremq-go/cmd/postgremq@latest` |
 
 Requirements: PostgreSQL 15+. Go 1.25+, Node.js 22+ or Rust 1.94+ for the
 clients.
@@ -192,7 +192,7 @@ complex routing.
 - [SQL reference and delivery contract](./mq/README.md)
 - [Delivery lifecycle (client contract)](./docs/delivery-lifecycle.md)
 - [Observability](./docs/observability.md)
-- Clients: [Go](./postgremq-go/README.md) · [TypeScript](./postgremq-ts/README.md) · [Rust](./postgremq-rs/README.md) · [CLI](./cmd/postgremq/README.md)
+- Clients: [Go](./postgremq-go/README.md) · [TypeScript](./postgremq-ts/README.md) · [Rust](./postgremq-rs/README.md) · [CLI](./postgremq-go/cmd/postgremq/README.md)
 
 ## Contributing
 

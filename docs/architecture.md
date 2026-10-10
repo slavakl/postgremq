@@ -24,7 +24,7 @@ This document describes how the pieces fit. The details are in:
 | `postgremq-go/` | Go client (pgx v5) |
 | `postgremq-ts/` | TypeScript client for Node.js (node-postgres) |
 | `postgremq-rs/` | Rust client, crate `postgremq` (sqlx + Tokio) |
-| `cmd/postgremq/` | CLI that applies and reports schema migrations, built on the Go client |
+| `postgremq-go/cmd/postgremq/` | CLI that applies and reports schema migrations, part of the Go client module |
 | `observability/` | Client metrics contract, Collector configuration and its end-to-end test |
 
 ## The SQL layer

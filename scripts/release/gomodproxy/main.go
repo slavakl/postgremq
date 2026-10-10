@@ -2,7 +2,7 @@
 // builds and installs resolve postgremq.dev modules without the vanity domain
 // or a published version:
 //
-//	gomodproxy -out DIR postgremq.dev/mq@v0.2.0=SRC_DIR ...
+//	gomodproxy -out DIR postgremq.dev/postgremq-go@v0.2.0=SRC_DIR ...
 //
 // Module zips are built with golang.org/x/mod/zip, the algorithm the Go
 // module proxy uses, so their go.sum hashes equal the published ones when

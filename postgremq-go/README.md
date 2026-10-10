@@ -18,7 +18,7 @@ import "postgremq.dev/postgremq-go"
 
 Install the SQL schema in the same database as your application. All queue objects live in the fixed `postgremq` schema, and the client schema-qualifies every call, so your `search_path` is never changed. Install it with one of:
 
-- the CLI: `postgremq migrate --dsn "$DATABASE_URL"` (see [cmd/postgremq](../cmd/postgremq/README.md));
+- the CLI: `postgremq migrate --dsn "$DATABASE_URL"` (see [cmd/postgremq](cmd/postgremq/README.md); `go install postgremq.dev/postgremq-go/cmd/postgremq@latest`);
 - `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f mq/sql/latest.sql`;
 - the Go API: `postgremq.Migrate(pool)` and `postgremq.GetMigrationStatus(pool)` (see [examples/migration](examples/migration/main.go)).
 

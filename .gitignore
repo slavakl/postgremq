@@ -94,7 +94,7 @@ postgremq-go/coverage.out
 *.out
 
 # CLI binary
-cmd/postgremq/postgremq
+postgremq-go/bin/
 
 # Example binaries
 postgremq-go/examples/basic/basic

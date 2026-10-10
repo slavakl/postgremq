@@ -22,7 +22,7 @@ Choose one method. The paths below are relative to this directory.
 
 ```bash
 # CLI
-go run ../../cmd/postgremq migrate --dsn "postgres://user:password@localhost:5432/dbname?sslmode=disable"
+go run ../cmd/postgremq migrate --dsn "postgres://user:password@localhost:5432/dbname?sslmode=disable"
 
 # psql
 psql "postgres://user:password@localhost:5432/dbname" -v ON_ERROR_STOP=1 -f ../../mq/sql/latest.sql

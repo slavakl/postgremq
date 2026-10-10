@@ -1,11 +1,11 @@
 name: Release
 
-# Every push to main: validate, then let Release Please tag merged release PRs
-# and open or update one release PR per component, then publish what was
-# tagged. See RELEASE.md.
+# Every push to main: validate, then let Release Please tag a merged release
+# PR (with mq/vN on the same commit when it brings a new migration), open or
+# update the one release PR, and publish what was tagged. See RELEASE.md.
 #
 # A failed run creates no tags and opens no PRs; the next passing run picks up
-# every unreleased change. Tags are created only for release PRs whose merge
+# every unreleased change. Tags are created only for a release PR whose merge
 # commit passed validation (scripts/release/check_pending_releases.py), so a
 # later passing commit never authorizes tagging an earlier failed one.
 
@@ -58,9 +58,8 @@ jobs:
       issues: write
       actions: read
     outputs:
-      mq-tag: ${{ steps.tags.outputs['mq--tag_name'] }}
+      mq-tag: ${{ steps.mq.outputs.tag }}
       go-tag: ${{ steps.tags.outputs['postgremq-go--tag_name'] }}
-      cli-tag: ${{ steps.tags.outputs['cmd/postgremq--tag_name'] }}
       rust-tag: ${{ steps.tags.outputs['postgremq-rs--tag_name'] }}
       npm-tag: ${{ steps.tags.outputs['postgremq-ts--tag_name'] }}
     steps:
@@ -99,22 +98,18 @@ jobs:
           manifest-file: .release-please-manifest.json
           skip-github-pull-request: true
 
-      # postgremq.info() reports the schema version (the last migration), not
-      # the mq release; say in the release notes which one it ships.
-      - name: Note the schema version in the mq release
-        if: steps.tags.outputs['mq--tag_name'] != ''
+      # mq is versioned by its last migration, not by Release Please: tag
+      # mq/vN on the newest client release commit when that commit brings a
+      # migration not released yet (also repairs a run that failed after
+      # tagging the clients).
+      - name: Release mq with a new migration
+        id: mq
+        if: steps.guard.outputs.tag == 'true'
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
-          TAG: ${{ steps.tags.outputs['mq--tag_name'] }}
-        run: |
-          git fetch -q origin "refs/tags/$TAG:refs/tags/$TAG"
-          schema=$(git show "$TAG:mq/sql/latest.sql" |
-            sed -nE 's/^INSERT INTO postgremq\.postgremq_migrations \(version, dirty\) VALUES \(([0-9]+), false\);$/\1/p')
-          notes=$(gh release view "$TAG" --json body --jq .body)
-          header="Schema version: **$schema** (what postgremq.info() reports as schema_version after installing or upgrading to this release)."
-          gh release edit "$TAG" --notes "$(printf '%s\n\n%s' "$header" "$notes")"
+        run: python3 scripts/release/mq_release.py release
 
-      - name: Open or update release PRs
+      - name: Open or update the release PR
         uses: googleapis/release-please-action@v4
         with:
           token: ${{ steps.app.outputs.token || github.token }}
@@ -123,6 +118,11 @@ jobs:
           manifest-file: .release-please-manifest.json
           skip-github-release: true
 
+      - name: Say on the release PR which mq release it brings
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+        run: python3 scripts/release/mq_release.py comment --branch "${{ github.ref_name }}"
+
   publish-mq:
     needs: release
     if: needs.release.outputs.mq-tag != ''
@@ -130,7 +130,7 @@ jobs:
     with:
       tag: ${{ needs.release.outputs.mq-tag }}
     permissions:
-      contents: read
+      contents: write
       id-token: write
     secrets: inherit
   publish-go:
@@ -140,17 +140,7 @@ jobs:
     with:
       tag: ${{ needs.release.outputs.go-tag }}
     permissions:
-      contents: read
-      id-token: write
-    secrets: inherit
-  publish-cli:
-    needs: release
-    if: needs.release.outputs.cli-tag != ''
-    uses: ./.github/workflows/publish.yml
-    with:
-      tag: ${{ needs.release.outputs.cli-tag }}
-    permissions:
-      contents: read
+      contents: write
       id-token: write
     secrets: inherit
   publish-rust:
@@ -160,7 +150,7 @@ jobs:
     with:
       tag: ${{ needs.release.outputs.rust-tag }}
     permissions:
-      contents: read
+      contents: write
       id-token: write
     secrets: inherit
   publish-npm:
@@ -170,6 +160,6 @@ jobs:
     with:
       tag: ${{ needs.release.outputs.npm-tag }}
     permissions:
-      contents: read
+      contents: write
       id-token: write
     secrets: inherit

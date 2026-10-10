@@ -7,7 +7,7 @@
 //   - Running migrations as part of your deployment process
 //   - Integrating schema management into your application lifecycle
 //
-// For CLI-based migrations, see the postgremq CLI tool in cmd/postgremq/.
+// For CLI-based migrations, see the postgremq CLI in postgremq-go/cmd/postgremq/.
 package main
 
 import (

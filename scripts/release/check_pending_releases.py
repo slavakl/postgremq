@@ -2,10 +2,12 @@
 """Release guard: run before Release Please creates tags and GitHub releases.
 
 Release Please tags the merge commit of every merged release PR still
-labelled `autorelease: pending`. A tag publishes (Go modules are published by
-the tag alone), so each such commit must already have passed validation, and
-must be a consistent release (scripts/release/verify_release.py). A later
-passing commit must not authorize an earlier failed one.
+labelled `autorelease: pending` (normally the one combined release PR), and
+the release workflow then tags mq/vN on the same commit. A tag publishes (the
+Go module is published by the tag alone), so each such commit must already
+have passed validation, and must be a consistent release
+(scripts/release/verify_release.py --all). A later passing commit must not
+authorize an earlier failed one.
 
     check_pending_releases.py --branch main --validated-sha "$GITHUB_SHA"
 
@@ -31,13 +33,6 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-COMPONENT_PATHS = {
-    'mq': 'mq',
-    'postgremq-go': 'postgremq-go',
-    'cmd/postgremq': 'cmd/postgremq',
-    'rust': 'postgremq-rs',
-    'npm': 'postgremq-ts',
-}
 VALIDATED_JOB = 'Validated'
 
 
@@ -106,10 +101,9 @@ def main() -> int:
     deferred = []
     for pr in prs:
         sha = (pr.get('mergeCommit') or {}).get('oid')
-        component = pr['headRefName'].rpartition('--components--')[2]
         label = f'#{pr["number"]} ({pr["title"]}, {sha and sha[:12]})'
-        if component not in COMPONENT_PATHS or not sha:
-            problems.append(f'{label}: cannot tell its component or merge commit')
+        if not sha:
+            problems.append(f'{label}: cannot tell its merge commit')
             continue
         if sha != args.validated_sha and newer_than(sha, args.validated_sha):
             deferred.append(f'{label}: merged after this run\'s commit; its own run validates and tags it')
@@ -126,15 +120,13 @@ def main() -> int:
             worktree = Path(tmp) / 'source'
             run('git', 'worktree', 'add', '--detach', str(worktree), sha)
             try:
-                manifest = json.loads((worktree / '.release-please-manifest.json').read_text())
-                version = manifest[COMPONENT_PATHS[component]]
-                check = subprocess.run([sys.executable, 'scripts/release/verify_release.py', f'{component}/v{version}'],
+                check = subprocess.run([sys.executable, 'scripts/release/verify_release.py', '--all'],
                                        cwd=worktree, capture_output=True, text=True)
                 print(check.stdout, end='')
                 if check.returncode != 0:
-                    problems.append(f'{label}: {component} {version} is not a consistent release:\n{check.stderr}')
+                    problems.append(f'{label}: not a consistent release:\n{check.stderr}')
                 else:
-                    print(f'{label}: validated; will be tagged {component}/v{version}')
+                    print(f'{label}: validated and consistent; will be tagged')
             finally:
                 run('git', 'worktree', 'remove', '--force', str(worktree))
 

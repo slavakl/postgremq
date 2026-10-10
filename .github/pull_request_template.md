@@ -23,7 +23,7 @@
 - [ ] Go client (postgremq-go)
 - [ ] TypeScript client (postgremq-ts)
 - [ ] Rust client (postgremq-rs)
-- [ ] CLI (cmd/postgremq)
+- [ ] CLI (postgremq-go/cmd/postgremq)
 - [ ] Documentation
 - [ ] CI/CD
 - [ ] Other (please specify)

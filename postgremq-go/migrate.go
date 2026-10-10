@@ -3,6 +3,7 @@ package postgremq
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"errors"
 	"fmt"
 	"os"
@@ -15,10 +16,16 @@ import (
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
-	"postgremq.dev/mq"
 )
 
 const MigrationsTable = "postgremq_migrations"
+
+// migrationsFS holds the schema migrations: a copy of mq/migrations that
+// `make sync` keeps identical to it (a module cannot embed files outside its
+// directory). Do not edit them here.
+//
+//go:embed migrations/*.up.sql
+var migrationsFS embed.FS
 
 // MigrationStatus represents the current state of migrations
 type MigrationStatus struct {
@@ -38,7 +45,7 @@ type MigrationStatus struct {
 // No ctx parameter: golang-migrate's API doesn't accept one, so a ctx
 // would be ignored anyway.
 func Migrate(pool *pgxpool.Pool) error {
-	source, err := iofs.New(mq.MigrationsFS, "migrations")
+	source, err := iofs.New(migrationsFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("failed to create migration source: %w", err)
 	}
@@ -156,7 +163,7 @@ func openMigrationDB(pool *pgxpool.Pool) *sql.DB {
 
 // getLatestMigrationVersion returns the highest migration version from embedded files
 func getLatestMigrationVersion() uint {
-	entries, err := mq.MigrationsFS.ReadDir("migrations")
+	entries, err := migrationsFS.ReadDir("migrations")
 	if err != nil {
 		return 0
 	}
