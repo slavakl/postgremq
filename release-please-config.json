@@ -66,21 +66,20 @@
       "package-name": "postgremq.dev/postgremq-go",
       "exclude-paths": [
         "postgremq-go/examples"
-      ],
-      "release-as": "0.2.0-e2e.3"
+      ]
     },
     "postgremq-rs": {
       "component": "rust",
       "release-type": "rust",
-      "package-name": "postgremq",
-      "release-as": "0.2.0-e2e.3"
+      "package-name": "postgremq"
     },
     "postgremq-ts": {
       "component": "npm",
       "release-type": "node",
-      "package-name": "postgremq",
-      "release-as": "0.2.0-e2e.3"
+      "package-name": "postgremq"
     }
   },
-  "prerelease": true
+  "prerelease": true,
+  "versioning": "prerelease",
+  "prerelease-type": "e2e"
 }
