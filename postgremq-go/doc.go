@@ -313,3 +313,5 @@
 // it takes with FOR UPDATE SKIP LOCKED, so a message is claimed by one consumer
 // at a time.
 package postgremq
+
+// e2e round 3: a Go-only change.
