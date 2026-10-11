@@ -1,5 +1,5 @@
 {
-  "postgremq-go": "0.2.0-e2e.3",
-  "postgremq-rs": "0.2.0-e2e.3",
-  "postgremq-ts": "0.2.0-e2e.3"
+  "postgremq-go": "0.2.0-e2e.4",
+  "postgremq-rs": "0.2.0-e2e.4",
+  "postgremq-ts": "0.2.0-e2e.4"
 }
