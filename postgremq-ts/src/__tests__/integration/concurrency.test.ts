@@ -13,6 +13,8 @@ import {
   waitFor
 } from '../helpers';
 import { Connection } from '../../connection';
+import { Consumer } from '../../consumer';
+import { Message } from '../../message';
 
 describe('Concurrency', () => {
   let testDb: TestDatabase;
@@ -68,74 +70,50 @@ describe('Concurrency', () => {
 
       await sleep(200);
 
-      // Create 4 consumers
-      const consumer1 = connection.consume('distribute-queue', {
-        batchSize: 5,
-        visibilityTimeoutSec: 30
-      });
+      // Start the consumers one at a time, each taking its first message
+      // before the next starts. A consumer's first pull fetches a full batch
+      // (5) and it fetches again only when its buffer runs low, so the four
+      // first fetches split the 20 messages whatever the timing. (Waiting
+      // for exactly 5 per consumer would hang whenever one fetched more.)
+      const consumers: Consumer[] = [];
+      const iterators: AsyncIterableIterator<Message>[] = [];
+      const received: Message[][] = [];
+      for (let i = 0; i < 4; i++) {
+        const consumer = connection.consume('distribute-queue', {
+          batchSize: 5,
+          visibilityTimeoutSec: 30
+        });
+        const iterator = consumer.messages();
+        const { value: message } = await iterator.next();
+        await message.ack();
+        consumers.push(consumer);
+        iterators.push(iterator);
+        received.push([message]);
+      }
 
-      const consumer2 = connection.consume('distribute-queue', {
-        batchSize: 5,
-        visibilityTimeoutSec: 30
-      });
-
-      const consumer3 = connection.consume('distribute-queue', {
-        batchSize: 5,
-        visibilityTimeoutSec: 30
-      });
-
-      const consumer4 = connection.consume('distribute-queue', {
-        batchSize: 5,
-        visibilityTimeoutSec: 30
-      });
-
-      const received1: any[] = [];
-      const received2: any[] = [];
-      const received3: any[] = [];
-      const received4: any[] = [];
-
-      // Consume concurrently
-      const consume = async (consumer: any, receivedArray: any[], count: number) => {
-        const messages = consumer.messages();
-        for (let i = 0; i < count; i++) {
-          const { value: message } = await messages.next();
-          receivedArray.push(message);
+      // Drain the rest concurrently, however it ends up spread.
+      let total = received.length;
+      const drain = async (iterator: AsyncIterableIterator<Message>, into: Message[]) => {
+        for (;;) {
+          const { done, value: message } = await iterator.next();
+          if (done) return;
+          into.push(message);
           await message.ack();
+          total++;
         }
       };
+      const draining = iterators.map((iterator, i) => drain(iterator, received[i]));
+      await waitFor(() => total === 20, 30000);
+      await Promise.all(consumers.map(consumer => consumer.stop()));
+      await Promise.all(draining);
 
-      await Promise.all([
-        consume(consumer1, received1, 5),
-        consume(consumer2, received2, 5),
-        consume(consumer3, received3, 5),
-        consume(consumer4, received4, 5)
-      ]);
-
-      await Promise.all([
-        consumer1.stop(),
-        consumer2.stop(),
-        consumer3.stop(),
-        consumer4.stop()
-      ]);
-
-      // Verify all messages consumed
-      expect(received1.length + received2.length + received3.length + received4.length).toBe(20);
-
-      // Verify no duplicates
-      const allIds = [
-        ...received1.map(m => m.id),
-        ...received2.map(m => m.id),
-        ...received3.map(m => m.id),
-        ...received4.map(m => m.id)
-      ];
-      const uniqueIds = new Set(allIds);
-      expect(uniqueIds.size).toBe(20);
-
-      // Verify distribution (each consumer should have received some messages)
-      expect(received1.length).toBeGreaterThan(0);
-      expect(received2.length).toBeGreaterThan(0);
-      expect(received3.length).toBeGreaterThan(0);
-      expect(received4.length).toBeGreaterThan(0);
+      // All messages consumed, none twice, by every consumer
+      const allIds = received.flat().map(m => m.id);
+      expect(allIds).toHaveLength(20);
+      expect(new Set(allIds).size).toBe(20);
+      for (const share of received) {
+        expect(share.length).toBeGreaterThan(0);
+      }
 
       // Cleanup
       await connection.deleteQueue('distribute-queue');
