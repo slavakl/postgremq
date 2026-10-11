@@ -64,3 +64,5 @@ mod tests {
         assert_send_sync::<Error>();
     }
 }
+
+// e2e round 3: a Rust-only change.
