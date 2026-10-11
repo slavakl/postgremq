@@ -48,7 +48,7 @@ Which component(s) would this feature affect?
 - [ ] Go client (postgremq-go)
 - [ ] TypeScript client (postgremq-ts)
 - [ ] Rust client (postgremq-rs)
-- [ ] CLI (cmd/postgremq)
+- [ ] CLI (postgremq-go/cmd/postgremq)
 - [ ] Documentation
 - [ ] Other (please specify)
 

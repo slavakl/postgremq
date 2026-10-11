@@ -52,8 +52,8 @@ clean:
 ## build-cli: Build the postgremq CLI tool
 build-cli:
 	@echo "Building postgremq CLI..."
-	@cd ../cmd/postgremq && go build -o postgremq .
-	@echo "✓ CLI built at cmd/postgremq/postgremq"
+	@go build -o bin/postgremq ./cmd/postgremq
+	@echo "✓ CLI built at bin/postgremq"
 
 ## help: Show this help message
 help:

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -158,6 +159,15 @@ func createTestDatabase(t *testing.T) string {
 	return strings.Replace(sharedContainer.dsn, "/postgres?", "/"+dbName+"?", 1)
 }
 
+// exitCode is the CLI's exit status in a runCLI error.
+func exitCode(err error) int {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return -1
+}
+
 func runCLI(args ...string) (string, string, error) {
 	cmd := exec.Command(cliBinary, args...)
 	var stdout, stderr bytes.Buffer
@@ -238,12 +248,28 @@ func TestCLI_MigrateIdempotent(t *testing.T) {
 func TestCLI_MissingDSN(t *testing.T) {
 	_, stderr, err := runCLI("migrate")
 	require.Error(t, err)
-	assert.Contains(t, stderr, "required flag")
+	assert.Equal(t, 2, exitCode(err), "usage error")
+	assert.Contains(t, stderr, "--dsn is required")
+}
+
+func TestCLI_UnknownCommand(t *testing.T) {
+	_, stderr, err := runCLI("upgrade", "--dsn", "postgres://localhost/x")
+	require.Error(t, err)
+	assert.Equal(t, 2, exitCode(err), "usage error")
+	assert.Contains(t, stderr, `unknown command "upgrade"`)
+}
+
+func TestCLI_NoCommand(t *testing.T) {
+	_, stderr, err := runCLI()
+	require.Error(t, err)
+	assert.Equal(t, 2, exitCode(err), "usage error")
+	assert.Contains(t, stderr, "Commands:")
 }
 
 func TestCLI_InvalidDSN(t *testing.T) {
 	_, stderr, err := runCLI("migrate", "--dsn", "invalid://dsn")
 	require.Error(t, err)
+	assert.Equal(t, 1, exitCode(err))
 	assert.Contains(t, stderr, "failed to connect")
 }
 
@@ -266,6 +292,7 @@ func TestCLI_MigrateHelp(t *testing.T) {
 	stdout, _, err := runCLI("migrate", "--help")
 	require.NoError(t, err)
 
+	assert.Contains(t, stdout, "Usage: postgremq migrate")
 	assert.Contains(t, stdout, "--dsn")
 	assert.NotContains(t, stdout, "--target")
 }

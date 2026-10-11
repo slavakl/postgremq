@@ -18,4 +18,6 @@ published as 0.1.0; the first release is the next version above.
   exponential backoff for transient errors.
 - Schema migrations (`Migrate`, `GetMigrationStatus`), up only, to the latest
   embedded version.
+- The `postgremq` CLI (`postgremq-go/cmd/postgremq`, until then the separate
+  module `cmd/postgremq`): `migrate` and `status`.
 - Optional OpenTelemetry metrics.

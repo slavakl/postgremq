@@ -5,7 +5,7 @@ name: Publish
 # workflow, with the existing tag).
 #
 # Every run checks out the tag, verifies that its manifest, version files,
-# changelog and pins agree with the tag, and smoke-tests the package built from
+# changelog and schema sync agree with the tag, and smoke-tests the package built from
 # it; a manual run also re-runs the component's tests on the tag. A version
 # already in its registry is skipped. Registry uploads happen only when the
 # repository variable PUBLISH_ENABLED is "true"; otherwise each step is a dry
@@ -13,9 +13,10 @@ name: Publish
 #
 # Credentials: crates.io and npm trusted publishing (OIDC) when the variables
 # CRATES_IO_TRUSTED_PUBLISHING / NPM_TRUSTED_PUBLISHING are "true", otherwise
-# the CARGO_REGISTRY_TOKEN / NPM_TOKEN secrets. Go modules (mq, postgremq-go,
-# cmd/postgremq) are published by their tag; this only asks the Go module proxy
-# to fetch them.
+# the CARGO_REGISTRY_TOKEN / NPM_TOKEN secrets. The Go module (with its CLI) is
+# published by its tag; this only asks the Go module proxy to fetch it. mq
+# (mq/vN) has no registry: its GitHub release gets latest.sql and the
+# migrations as assets.
 
 on:
   workflow_call:
@@ -29,7 +30,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag, e.g. rust/v0.2.0
+        description: Existing release tag, e.g. rust/v0.2.0 or mq/v3
         type: string
         required: true
       run-tests:
@@ -60,8 +61,8 @@ jobs:
           component=${tag%/v*}
           version=${tag##*/v}
           case "$component" in
-            mq) smoke='go' ;;
-            postgremq-go|cmd/postgremq) smoke='go' ;;
+            mq) smoke='' ;;
+            postgremq-go) smoke='go' ;;
             rust) smoke='rust' ;;
             npm) smoke='npm' ;;
             *) echo "::error::$tag is not a release tag"; exit 1 ;;
@@ -71,7 +72,7 @@ jobs:
             echo "version=$version"
             echo "smoke=$smoke"
           } >> "$GITHUB_OUTPUT"
-      - name: Verify manifest, version files, changelog and pins against the tag
+      - name: Verify versions, changelog and schema sync against the tag
         run: python3 scripts/release/verify_release.py '${{ inputs.tag }}' --tag-exists
 
   test-sql:
@@ -82,7 +83,7 @@ jobs:
       ref: refs/tags/${{ inputs.tag }}
   test-go:
     needs: resolve
-    if: inputs.run-tests && (needs.resolve.outputs.component == 'postgremq-go' || needs.resolve.outputs.component == 'cmd/postgremq')
+    if: inputs.run-tests && needs.resolve.outputs.component == 'postgremq-go'
     uses: ./.github/workflows/go-tests.yml
     with:
       ref: refs/tags/${{ inputs.tag }}
@@ -101,6 +102,7 @@ jobs:
 
   smoke:
     needs: resolve
+    if: needs.resolve.outputs.smoke != ''
     uses: ./.github/workflows/packages.yml
     with:
       ref: refs/tags/${{ inputs.tag }}
@@ -112,7 +114,7 @@ jobs:
     if: ${{ !cancelled() && !failure() && needs.resolve.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write   # mq: release assets
       id-token: write
     env:
       COMPONENT: ${{ needs.resolve.outputs.component }}
@@ -183,18 +185,29 @@ jobs:
             npm publish --dry-run --access public --tag "$tag"
           fi
 
-      # --- Go modules: published by their tag ---
+      # --- Go module: published by its tag ---
       - uses: actions/setup-go@v5
-        if: env.COMPONENT == 'mq' || env.COMPONENT == 'postgremq-go' || env.COMPONENT == 'cmd/postgremq'
+        if: env.COMPONENT == 'postgremq-go'
         with:
           go-version: '1.26'
       - name: Ask the Go module proxy to fetch the module
-        if: env.COMPONENT == 'mq' || env.COMPONENT == 'postgremq-go' || env.COMPONENT == 'cmd/postgremq'
+        if: env.COMPONENT == 'postgremq-go'
         run: |
-          module=$(awk '$1 == "module" { print $2; exit }' "$COMPONENT/go.mod")
           if [ "$PUBLISH" = true ]; then
             # Needs working postgremq.dev discovery (the website repository).
-            GOWORK=off GOPROXY=https://proxy.golang.org go list -m "$module@v$VERSION"
+            GOWORK=off GOPROXY=https://proxy.golang.org go list -m "postgremq.dev/postgremq-go@v$VERSION"
           else
-            echo "PUBLISH_ENABLED is not true: $module@v$VERSION is published by its tag; not asking the proxy."
+            echo "PUBLISH_ENABLED is not true: postgremq.dev/postgremq-go@v$VERSION is published by its tag; not asking the proxy."
           fi
+
+      # --- mq: GitHub release assets (no registry) ---
+      - name: Attach latest.sql and the migrations to the mq release
+        if: env.COMPONENT == 'mq'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          assets=$(mktemp -d)
+          cp mq/sql/latest.sql "$assets/postgremq-v$VERSION.sql"
+          tar -czf "$assets/postgremq-migrations-v$VERSION.tar.gz" -C mq migrations
+          gh release upload "$TAG" "$assets"/* --clobber

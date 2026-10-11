@@ -1,13 +1,12 @@
 # Changelog
 
 Each component is versioned and released on its own (see
-[RELEASE.md](./RELEASE.md)), with its own changelog:
+[RELEASE.md](./RELEASE.md)):
 
 | Component | Changelog | Tags |
 |-----------|-----------|------|
-| SQL implementation and Go `mq` module | [mq/CHANGELOG.md](./mq/CHANGELOG.md) | `mq/vX.Y.Z` |
-| Go client | [postgremq-go/CHANGELOG.md](./postgremq-go/CHANGELOG.md) | `postgremq-go/vX.Y.Z` |
-| CLI | [cmd/postgremq/CHANGELOG.md](./cmd/postgremq/CHANGELOG.md) | `cmd/postgremq/vX.Y.Z` |
+| SQL schema (mq) | the `mq/vN` [GitHub releases](https://github.com/postgremq/postgremq/releases) | `mq/vN` (N = last migration) |
+| Go client and CLI | [postgremq-go/CHANGELOG.md](./postgremq-go/CHANGELOG.md) | `postgremq-go/vX.Y.Z` |
 | Rust client | [postgremq-rs/CHANGELOG.md](./postgremq-rs/CHANGELOG.md) | `rust/vX.Y.Z` |
 | TypeScript client | [postgremq-ts/CHANGELOG.md](./postgremq-ts/CHANGELOG.md) | `npm/vX.Y.Z` |
 

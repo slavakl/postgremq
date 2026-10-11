@@ -2,10 +2,10 @@
 //!
 //! The pin is `[package.metadata.postgremq] mq-schema` in Cargo.toml: a schema
 //! version, the number of the last migration to bundle. Migrations 1..N are
-//! embedded; a newer migration on the branch is not, until the pin moves.
-//! Release checks require those migrations to be part of a released mq
-//! version. `migrations/` is a symlink to `../mq/migrations`, which
-//! `cargo package` follows.
+//! embedded. `make sync` keeps the pin at the last migration (CI checks it),
+//! so a commit adding a migration also changes this crate and releases it.
+//! `migrations/` is a symlink to `../mq/migrations`, which `cargo package`
+//! follows.
 
 use std::error::Error;
 use std::fmt::Write as _;

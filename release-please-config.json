@@ -1,8 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "bootstrap-sha": "c398691f4cb58a8e37e73a20ca53d748370d400f",
-  "separate-pull-requests": true,
-  "always-update": true,
+  "separate-pull-requests": false,
   "include-component-in-tag": true,
   "include-v-in-tag": true,
   "tag-separator": "/",
@@ -22,22 +21,11 @@
     { "type": "chore", "section": "Miscellaneous Chores", "hidden": true }
   ],
   "packages": {
-    "mq": {
-      "component": "mq",
-      "release-type": "simple",
-      "version-file": "VERSION",
-      "package-name": "mq"
-    },
     "postgremq-go": {
       "component": "postgremq-go",
       "release-type": "go",
       "package-name": "postgremq.dev/postgremq-go",
       "exclude-paths": ["postgremq-go/examples"]
-    },
-    "cmd/postgremq": {
-      "component": "cmd/postgremq",
-      "release-type": "go",
-      "package-name": "postgremq.dev/cmd/postgremq"
     },
     "postgremq-rs": {
       "component": "rust",

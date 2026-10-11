@@ -41,7 +41,7 @@ assert!(!status.needs_migration);
 
 `migrate` only goes up, to the latest version in this crate. It uses the same
 version table and advisory lock as the Go client and the
-[migration CLI](https://github.com/postgremq/postgremq/blob/main/cmd/postgremq/README.md),
+[migration CLI](https://github.com/postgremq/postgremq/blob/main/postgremq-go/cmd/postgremq/README.md),
 so concurrent callers are safe and any of them can upgrade a database another
 one installed. A database already at a newer version (migrated by a newer
 release) is left unchanged. A dirty database (a migration failed partway) is

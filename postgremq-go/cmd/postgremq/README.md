@@ -6,38 +6,40 @@ All PostgreMQ objects live in the fixed `postgremq` schema. The CLI does not cha
 
 ## Installation
 
-Requires Go 1.25 or later. From a release:
+Requires Go 1.25 or later. The CLI is part of the Go client module and has
+its version (tags `postgremq-go/vX.Y.Z`). From a release:
 
 ```bash
-go install postgremq.dev/cmd/postgremq@latest
+go install postgremq.dev/postgremq-go/cmd/postgremq@latest
 ```
 
 Or build it from a clone:
 
 ```bash
 git clone https://github.com/postgremq/postgremq.git
-cd postgremq/cmd/postgremq
-go build -o postgremq .
+cd postgremq/postgremq-go
+go build -o postgremq ./cmd/postgremq
 
 # Optional: put it on your PATH
 mv postgremq /usr/local/bin/
 ```
 
-The migrations are embedded in the binary, so it needs no other files at runtime.
+The migrations are embedded in the binary, so it needs no other files at
+runtime. It applies the migrations of the Go client it is built with, which
+always include the latest schema version of that release.
 
 ## Usage
 
 ```
-postgremq [command]
+Usage: postgremq <command> --dsn <connection-string>
 
-Available Commands:
-  completion  Generate the autocompletion script for the specified shell
-  help        Help about any command
-  migrate     Run database migrations
-  status      Show migration status
+Commands:
+  migrate   Apply pending migrations up to the latest embedded version
+  status    Show the migration status
 ```
 
-`-h` / `--help` is available on every command.
+`postgremq -h` prints this; `postgremq <command> -h` prints the command's
+flags. Flags take one or two dashes (`-dsn` or `--dsn`).
 
 ### Connection string (`--dsn`)
 
@@ -133,16 +135,6 @@ Dirty:           false
 
 `status` exits with code 0 whenever it can read the status, including when migrations are pending or the database is dirty. The last line depends only on the version: a dirty database shows `Dirty:           true` and then the pending or up-to-date line as usual, so a dirty database at the latest version prints `✓ Database is up to date`. Check the `Dirty` line, or run `migrate`, which refuses a dirty database.
 
-### `completion`
-
-Cobra's standard shell completion generator:
-
-```bash
-postgremq completion bash|zsh|fish|powershell
-```
-
-Run `postgremq completion <shell> --help` for instructions on loading the script.
-
 ## Migration tracking
 
 The version is stored in the single-row table `postgremq.postgremq_migrations`, which `migrate` creates:
@@ -152,7 +144,7 @@ The version is stored in the single-row table `postgremq.postgremq_migrations`, 
 | `version` | `bigint` (primary key) | Last applied migration version |
 | `dirty` | `boolean` | `true` if that migration started but did not finish |
 
-Migrations are applied with [golang-migrate](https://github.com/golang-migrate/migrate) from the SQL files embedded from `mq/migrations/`.
+Migrations are applied with [golang-migrate](https://github.com/golang-migrate/migrate) from the SQL files embedded from the Go client's copy of `mq/migrations/`.
 
 ## Required privileges
 
@@ -175,27 +167,29 @@ Applying migrations to an existing schema needs the privileges the migrations' D
 | Code | Meaning |
 |------|---------|
 | 0 | Success. For `status`, this includes pending migrations and a dirty database |
-| 1 | Any error: missing `--dsn`, unparsable DSN, connection failure, dirty database (`migrate`), migration failure |
+| 1 | An error: unparsable DSN, connection failure, dirty database (`migrate`), migration failure |
+| 2 | A usage error: unknown command or flag, missing `--dsn`, extra arguments |
 
-On an error, stderr gets `Error: <message>`, then the command's usage text, then `<message>` again on its own line. For example:
+On an error, stderr gets `Error: <message>`; a usage error is followed by the
+command's usage. For example:
 
 ```
-Error: required flag(s) "dsn" not set
-Usage:
-  postgremq status [flags]
+Error: --dsn is required
+
+Usage: postgremq status --dsn <connection-string>
+
+Show the migration status.
 
 Flags:
-      --dsn string   Database connection string (required)
-  -h, --help         help for status
-
-required flag(s) "dsn" not set
+  -dsn string
+    	Database connection string (required)
 ```
 
 Common messages:
 
 | Message | Cause |
 |---------|-------|
-| `required flag(s) "dsn" not set` | `--dsn` missing |
+| `--dsn is required` | `--dsn` missing |
 | `failed to connect: cannot parse ...` | The DSN is malformed |
 | `failed to get migration status: failed to connect to ...` | The server cannot be reached, or authentication failed |
 | `failed to get migration status: ERROR: permission denied for schema postgremq ...` | The role cannot use the `postgremq` schema |
