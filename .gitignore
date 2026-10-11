@@ -102,10 +102,9 @@ postgremq-go/examples/transactions/transactions
 postgremq-go/examples/migration/migration
 postgremq-go/examples/metrics/metrics
 
-# Claude Code and AI assistant files
-CLAUDE.md
-.claude/
-*.claude
+# Claude Code: personal settings and notes stay local
+.claude/settings.local.json
+CLAUDE.local.md
 
 # TypeScript build and coverage
 postgremq-ts/dist/
