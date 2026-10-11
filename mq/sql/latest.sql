@@ -1836,6 +1836,8 @@ LANGUAGE sql STABLE AS $$
     LEFT JOIN dead d ON d.queue_name = q.name;
 $$;
 
+COMMENT ON SCHEMA postgremq IS 'PostgreMQ message queue (e2e round 3)';
+
 /*
  * Schema version
  * --------------
@@ -1847,4 +1849,4 @@ $$;
  */
 CREATE TABLE postgremq.postgremq_migrations (version bigint not null primary key, dirty boolean not null);
 
-INSERT INTO postgremq.postgremq_migrations (version, dirty) VALUES (1, false);
+INSERT INTO postgremq.postgremq_migrations (version, dirty) VALUES (2, false);

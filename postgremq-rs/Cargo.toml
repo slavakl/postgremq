@@ -31,7 +31,7 @@ opentelemetry = { version = "0.33", default-features = false, features = ["metri
 # The mq schema version `migrate` embeds: migrations 1..N (see build.rs).
 # Bump it, once those migrations are in an mq release, to ship newer SQL.
 [package.metadata.postgremq]
-mq-schema = 1
+mq-schema = 2
 
 [package.metadata.docs.rs]
 all-features = true
